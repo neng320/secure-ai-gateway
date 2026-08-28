@@ -5,6 +5,17 @@ server:
     enabled: false
     cert_file: ""
     key_file: ""
+    # P1-01F 监听面隔离：
+    #   admin   —— 管理面（默认 127.0.0.1，生产经 SSH 隧道 / Tailscale 访问）
+    #   metrics —— /metrics（默认 127.0.0.1，仅 prometheus.enabled=true 时启动）
+    # 两个面绝不默认公网；如需改动，自行承担暴露风险。
+    admin:
+        host: 127.0.0.1
+        port: 8091
+    metrics:
+        host: 127.0.0.1
+        port: 9090
+
 
 admin:
   username: admin

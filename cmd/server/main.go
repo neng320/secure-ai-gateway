@@ -8,7 +8,7 @@
 // @license.name MIT
 // @license.url https://github.com/DatanoiseTV/aigateway/blob/main/LICENSE
 
-// @host localhost:8099
+// @host localhost:8090
 // @BasePath /
 // @schemes http https
 // @securityDefinitions.apikey ApiKeyAuth
@@ -19,28 +19,20 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
-	"ai-gateway/internal/handlers"
 	"ai-gateway/internal/logger"
-	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
-	"ai-gateway/internal/providers"
-	"ai-gateway/internal/services"
-	"ai-gateway/internal/templates"
 
 	_ "ai-gateway/docs"
-	"github.com/go-chi/chi/v5"
-	"github.com/swaggo/http-swagger/v2"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -56,7 +48,7 @@ var (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to config file")
-	port := flag.Int("port", 0, "Port to listen on (overrides config)")
+	port := flag.Int("port", 0, "Port to listen on (overrides API port from config)")
 	flag.Parse()
 
 	printBanner()
@@ -73,7 +65,7 @@ func main() {
 		if err := config.SaveConfig(cfg, *configPath); err != nil {
 			log.Fatalf("Failed to save config: %v", err)
 		}
-		fmt.Printf("Admin password has been reset to: %s\n", *resetPw)
+		fmt.Printf("Admin password has been reset\n")
 		return
 	}
 
@@ -99,121 +91,46 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-
 	if err := autoMigrate(db); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
 
-	clientService := services.NewClientService(db)
-	geminiService := services.NewGeminiService(db, cfg)
-	statsService := services.NewStatsService(db)
-	toolService := services.NewToolService(cfg.ServerTools.Tools)
-	sessionStore := auth.NewSQLiteStore(db)
-
-	// Build the multi-backend provider registry from config
-	providerRegistry := providers.BuildRegistry(cfg)
-
-	// Set up the real-time dashboard WebSocket hub
-	dashboardHub := services.NewDashboardHub(statsService)
-	geminiService.SetOnRequestLogged(dashboardHub.NotifyUpdate)
-
-	router := chi.NewRouter()
-
-	router.Use(middleware.Recovery)
-	router.Use(middleware.SecurityHeaders)
-	router.Use(middleware.MaxRequestSize(10 << 20))
-
-	proxyHandler := handlers.NewProxyHandler(geminiService, statsService)
-	healthHandler := handlers.NewHealthHandler(db)
-	healthHandler.RegisterRoutes(router)
-	openaiHandler := handlers.NewOpenAIHandler(geminiService, clientService, statsService, providerRegistry, toolService)
-
-	rateLimiter := middleware.NewRateLimiter()
-	authMiddleware := middleware.NewAuthMiddleware(clientService)
-
-	router.Group(func(r chi.Router) {
-		r.Use(authMiddleware.Handler)
-		r.Use(rateLimiter.Middleware)
-		proxyHandler.RegisterRoutes(r)
-		openaiHandler.RegisterRoutes(r)
-	})
-
-	adminHandler, err := handlers.NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, sessionStore)
+	deps := newGatewayDeps(cfg, db, *setupMode)
+	apiMux := buildAPIRouter(deps)
+	adminMux, err := buildAdminRouter(deps)
 	if err != nil {
-		log.Fatalf("Failed to initialize admin handler: %v", err)
+		log.Fatalf("Failed to build admin router: %v", err)
 	}
+	metricsMux := buildMetricsRouter(deps)
 
-	// Setup wizard - runs if password is not set or -setup flag is provided
-	setupHandler := handlers.NewSetupHandler(cfg, *setupMode)
-	if setupHandler.IsSetupRequired() {
-		setupHandler.RegisterRoutes(router)
-		router.Get("/", func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/setup", http.StatusFound)
-		})
-		log.Printf("Setup wizard enabled at /setup")
-	} else {
-		router.Get("/", func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/admin/dashboard", http.StatusFound)
-		})
-	}
-
-	adminHandler.RegisterRoutes(router)
-
-	// Prometheus metrics endpoint
-	if cfg.Prometheus.Enabled {
-		metricsHandler := handlers.NewMetricsHandler(statsService, cfg.Prometheus.Username, cfg.Prometheus.Password)
-		metricsHandler.RegisterRoutes(router)
-		log.Printf("Prometheus metrics enabled at /metrics (auth: %s)", cfg.Prometheus.Username)
-	}
-
-	router.Handle("/static/*", http.FileServer(http.FS(templates.Static)))
-
-	// Swagger docs
-	router.Get("/swagger", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/swagger/", http.StatusMovedPermanently)
-	})
-	router.Get("/swagger/", httpSwagger.Handler(
-		httpSwagger.URL("/swagger/doc.json"),
-	))
-	router.Get("/swagger/doc.json", httpSwagger.Handler(
-		httpSwagger.URL("/swagger/doc.json"),
-	))
-
-	serverPort := cfg.Server.Port
 	if *port > 0 {
-		serverPort = *port
+		cfg.Server.Port = *port
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, serverPort)
-	server := &http.Server{
-		Addr:         addr,
-		Handler:      router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  60 * time.Second,
+	// 同步绑定全部端口：任一失败即整体失败，不留半启动状态
+	servers, err := startListeners(cfg, apiMux, adminMux, metricsMux)
+	if err != nil {
+		log.Fatalf("Failed to start listeners: %v", err)
+	}
+	for _, s := range servers {
+		log.Printf("%s listening on %s", s.name, s.ln.Addr())
 	}
 
-	go func() {
-		log.Printf("Server starting on %s", addr)
-		if cfg.Server.HTTPS.Enabled && cfg.Server.HTTPS.CertFile != "" && cfg.Server.HTTPS.KeyFile != "" {
-			log.Fatal(server.ListenAndServeTLS(cfg.Server.HTTPS.CertFile, cfg.Server.HTTPS.KeyFile))
-		} else {
-			log.Fatal(server.ListenAndServe())
-		}
-	}()
+	errCh := make(chan error, 1)
+	serveAll(servers, errCh)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Println("Shutting down server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown:", err)
+	select {
+	case sig := <-quit:
+		log.Printf("Received %s, shutting down...", sig)
+	case err := <-errCh:
+		log.Printf("Listener error: %v — shutting down remaining listeners", err)
 	}
 
+	if err := shutdownAll(servers, 10*time.Second); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		log.Printf("Shutdown completed with error: %v", err)
+	}
 	log.Println("Server exited")
 }
 
