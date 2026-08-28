@@ -72,6 +72,10 @@ type AdminConfig struct {
 	Username      string `yaml:"username"`
 	PasswordHash  string `yaml:"password_hash"`
 	SessionSecret string `yaml:"session_secret"`
+	// CookieSecure: Admin 会话 Cookie 的 Secure 属性（P1-02A），与已废弃的
+	// server.https 完全解耦。生产经 HTTPS 访问 Admin 面时必须显式设为 true；
+	// 默认 false 以支持 loopback / SSH 隧道的纯 HTTP 开发访问。
+	CookieSecure bool `yaml:"cookie_secure"`
 }
 
 type DefaultsConfig struct {
@@ -258,6 +262,7 @@ func createDefaultConfig(path string) (*Config, error) {
 			Username:      "admin",
 			PasswordHash:  string(hash),
 			SessionSecret: secret,
+			CookieSecure:  false, // 默认支持 loopback/SSH 隧道 HTTP 开发；生产走 HTTPS 访问 Admin 面时显式置 true
 		},
 		Providers: map[string]ProviderConfig{
 			"gemini": {

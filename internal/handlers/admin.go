@@ -186,7 +186,7 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    rawToken,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   h.cfg.Server.HTTPS.Enabled,
+		Secure:   h.cfg.Admin.CookieSecure, // P1-02A：显式配置，与已废弃的 server.https 解耦
 		SameSite: http.SameSiteStrictMode,
 		Expires:  expiresAt, // 与服务端 expires_at 一致（权威在服务端）
 	}
@@ -206,13 +206,18 @@ func (h *AdminHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cookie := &http.Cookie{
-		Name:   auth.SessionCookieName,
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+	// 清理 Cookie 的属性必须与登录时一致（P1-02A），并明确置为过去时间
+	clearCookie := &http.Cookie{
+		Name:     auth.SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cfg.Admin.CookieSecure,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+		Expires:  time.Now().Add(-time.Hour),
 	}
-	http.SetCookie(w, cookie)
+	http.SetCookie(w, clearCookie)
 	http.Redirect(w, r, "/admin/login", http.StatusFound)
 }
 

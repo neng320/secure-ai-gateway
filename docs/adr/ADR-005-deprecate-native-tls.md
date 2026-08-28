@@ -16,7 +16,7 @@ P1-01F 将单端口"全家桶"拆分为 Public API / Private Admin / Private Met
 2. `server.https` **正式废弃**：
    - 字段保留（旧配置可解析，`enabled=false` 照常工作）；
    - `enabled=true` 时 **Load 拒绝启动**并给出明确错误与迁移说明——绝不静默以 HTTP 启动让用户误以为流量已加密。
-3. Admin 会话 Cookie 的 `Secure` 属性暂维持 `cfg.Server.HTTPS.Enabled`（废弃路径下恒为 false）；P1-02 将引入显式的 `admin.cookie_secure` 配置，彻底解耦。
+3. ~~Admin 会话 Cookie 的 `Secure` 属性暂维持 `cfg.Server.HTTPS.Enabled`~~ **已于 P1-02A 解除耦合**：引入显式 `admin.cookie_secure` 配置（默认 false 支持 loopback/SSH 隧道 HTTP 开发；生产经 HTTPS 访问 Admin 面时显式置 true），登录/登出 Cookie 属性保持一致。
 4. Swagger 与管理静态资源已归属私有 Admin 监听面（P1-01F），生产不经公网暴露。
 
 ## 备选方案
