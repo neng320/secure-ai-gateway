@@ -15,7 +15,7 @@ package handlers
 // 本文件不修复任何漏洞、不触碰 Provider Key / 日志 / 限流代码。
 
 import (
-	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -58,6 +58,7 @@ type authEnv struct {
 	cfg    *config.Config
 	router http.Handler
 	db     *gorm.DB
+	store  *auth.SQLiteStore
 }
 
 func newAuthEnv(t *testing.T) *authEnv {
@@ -95,13 +96,14 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	hub := services.NewDashboardHub(statsSvc)
 	toolSvc := services.NewToolService(nil)
 
-	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, auth.NewSQLiteStore(db))
+	store := auth.NewSQLiteStore(db)
+	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store)
 	if err != nil {
 		t.Fatalf("NewAdminHandler: %v", err)
 	}
 	r := chi.NewRouter()
 	adminH.RegisterRoutes(r)
-	return &authEnv{cfg: cfg, router: r, db: db}
+	return &authEnv{cfg: cfg, router: r, db: db, store: store}
 }
 
 func doReq(r http.Handler, method, target string, cookies []*http.Cookie) *http.Response {
@@ -237,68 +239,69 @@ func TestAuthChar_Protected_EmptyCookieValue_RedirectsToLogin(t *testing.T) {
 	}
 }
 
-// [KNOWN-VULN: SEC-001] ★漏洞复现★ 任意非空 Cookie 值即可通过管理认证。
-// 当前 RequireAuth 仅检查 Cookie 存在性与非空（admin.go:126-143），
-// 因此伪造 `Cookie: admin_session=x` 即可获得全部管理能力。
-// 断言精确到当前已实证的行为：HTTP 200。
-// P1-01D 修复为 302/401/403 任意一种时，本测试都会 FAIL 并提示改写。
-func TestSEC001_VULN_ForgedCookieValue_GrantsAdminAccess(t *testing.T) {
+// [P1-01D 修复后回归]（反转自 KNOWN-VULN "任意非空 Cookie 放行"）
+// 伪造/随机/历史静态值一律 302 → /admin/login。
+func TestSEC001_Fixed_ForgedCookieValue_Denied(t *testing.T) {
 	env := newAuthEnv(t)
-	forgeries := []string{"x", "totally-forged", "authenticated", "anything-goes"}
+	forgeries := []string{"x", "totally-forged", "authenticated", "anything-goes", strings.Repeat("ab", 32)}
 	for _, v := range forgeries {
 		resp := doReq(env.router, "GET", "/admin/clients",
 			[]*http.Cookie{{Name: sessionCookieName, Value: v}})
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("[CURRENT BEHAVIOR CHANGED] 期望漏洞状态 HTTP 200，伪造 Cookie %q 实际 %d —— 认证行为已变化，请核对 P1-01D 是否完成并将本测试改写为安全回归断言", v, resp.StatusCode)
+		if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/admin/login" {
+			t.Fatalf("[安全回归失败] 伪造 Cookie %q 期望 302 → /admin/login，实际 %d %q", v, resp.StatusCode, resp.Header.Get("Location"))
 		}
-		t.Logf("复现 SEC-001：伪造 Cookie %q → HTTP 200（绕过认证访问 /admin/clients）", v)
 	}
 }
 
-// [KNOWN-VULN: SEC-001] 代表性受保护路由之二：JSON API 面同样可被伪造 Cookie 绕过。
-// 三重验证确保"真的进入了受保护资源"而非碰巧的 200 错误页：
-// 状态码 200 + Content-Type: application/json + 响应体含固定字段 total_requests。
-func TestSEC001_VULN_ForgedCookie_AccessStatsAPI(t *testing.T) {
+// [P1-01D 修复后回归]（反转自 KNOWN-VULN "伪造 Cookie 读到 JSON 统计"）
+func TestSEC001_Fixed_ForgedCookie_StatsAPIDenied(t *testing.T) {
 	env := newAuthEnv(t)
 	resp := doReq(env.router, "GET", "/admin/stats/api",
 		[]*http.Cookie{{Name: sessionCookieName, Value: "forged"}})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 期望漏洞状态 HTTP 200，实际 %d —— 认证行为已变化，请核对 P1-01D 是否完成并将本测试改写为安全回归断言", resp.StatusCode)
+	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/admin/login" {
+		t.Fatalf("[安全回归失败] 伪造 Cookie 期望 302 → /admin/login，实际 %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	}
-	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 期望 application/json，实际 %q", ct)
-	}
-	body := new(bytes.Buffer)
-	if _, err := body.ReadFrom(resp.Body); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(body.String(), `"total_requests":`) {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 响应体缺少受保护资源特征字段 total_requests: %s", body.String())
-	}
-	t.Log("复现 SEC-001：伪造 Cookie → HTTP 200 + JSON 统计数据（/admin/stats/api 泄露面）")
 }
 
-// [KNOWN-VULN: SEC-001] 服务端不校验任何过期时间：浏览器侧 Expires 已过期仍放行。
-func TestSEC001_VULN_ExpiredCookieAttribute_StillAccepted(t *testing.T) {
+// [P1-01D 修复后回归]（反转自 KNOWN-VULN "过期 Cookie 仍放行"）
+// 两层语义：
+//
+//	a) 服务端已过期的真实 token → 拒绝（服务端权威）
+//	b) Cookie Expires 已过期但服务端仍有效 → 放行（同样证明权威在服务端）
+func TestSEC001_Fixed_SessionExpiry_ServerAuthoritative(t *testing.T) {
 	env := newAuthEnv(t)
-	expired := &http.Cookie{
-		Name:    sessionCookieName,
-		Value:   "expired-long-ago",
-		Expires: time.Now().Add(-72 * time.Hour), // 明确过期
+	ctx := context.Background()
+
+	// a) 服务端过期
+	expiredToken, err := env.store.Create(ctx, "admin", time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
 	}
-	resp := doReq(env.router, "GET", "/admin/clients", []*http.Cookie{expired})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 期望漏洞状态 HTTP 200，实际 %d —— 认证行为已变化，请核对 P1-01D 是否完成并将本测试改写为安全回归断言", resp.StatusCode)
+	resp := doReq(env.router, "GET", "/admin/clients",
+		[]*http.Cookie{{Name: sessionCookieName, Value: expiredToken}})
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("[安全回归失败] 服务端过期会话期望 302，实际 %d", resp.StatusCode)
 	}
-	t.Log("复现 SEC-001：Expires 已过期 72h 的 Cookie → HTTP 200（服务端从不校验有效期）")
+
+	// b) 服务端有效、Cookie 侧 Expires 过期 → 放行
+	validToken, err := env.store.Create(ctx, "admin", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleCookie := &http.Cookie{Name: sessionCookieName, Value: validToken, Expires: time.Now().Add(-72 * time.Hour)}
+	resp2 := doReq(env.router, "GET", "/admin/clients", []*http.Cookie{staleCookie})
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("[安全回归失败] 服务端有效会话应放行（Cookie 过期属性无权威性），实际 %d", resp2.StatusCode)
+	}
 }
 
 // ---------------------------------------------------------------------------
 // 登出
 // ---------------------------------------------------------------------------
 
-// [NORMAL + KNOWN-VULN] 登出只清浏览器 Cookie，无服务端吊销：
-// 持有旧 Cookie 的一方在"他人登出"后仍可继续访问。
+// [KNOWN-VULN: SEC-001 收尾待 P1-01E] 登出只清浏览器 Cookie，无服务端吊销：
+// 持有真实会话 token 的一方在"登出"后仍可继续访问（用真实 token 重放验证）。
+// P1-01E 完成后本测试必须反转为：登出后重放真实 token → 302。
 func TestAuthChar_VULN_Logout_DoesNotRevokeServerSide(t *testing.T) {
 	env := newAuthEnv(t)
 	loginResp := login(t, env.router, testAdminUser, testAdminPassword)
@@ -318,14 +321,13 @@ func TestAuthChar_VULN_Logout_DoesNotRevokeServerSide(t *testing.T) {
 		t.Errorf("[NORMAL] 期望登出时下发清空 Cookie，实际 %v", clearCookie)
 	}
 
-	// [KNOWN-VULN] 旧值依旧有效——因为服务端根本没有会话存储。
-	// 精确断言漏洞状态 HTTP 200：修复为 302/401/403 时本测试 FAIL。
+	// [KNOWN-VULN] 用真实 token 重放——服务端未吊销，应仍可访问（直到 P1-01E）
 	after := doReq(env.router, "GET", "/admin/clients",
-		[]*http.Cookie{{Name: sessionCookieName, Value: staticSessionValue}})
+		[]*http.Cookie{{Name: sessionCookieName, Value: c.Value}})
 	if after.StatusCode != http.StatusOK {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 期望漏洞状态 HTTP 200，实际 %d —— 认证行为已变化，请核对 P1-01D 是否完成并将本测试改写为安全回归断言", after.StatusCode)
+		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 期望漏洞状态 HTTP 200（登出不吊销），实际 %d —— 若 P1-01E 已完成，请将本测试改写为吊销回归断言", after.StatusCode)
 	}
-	t.Log("复现 SEC-001：登出后旧 Cookie 仍可访问（HTTP 200），无服务端吊销")
+	t.Log("复现 SEC-001 收尾项：登出后真实 token 仍可访问（HTTP 200），无服务端吊销")
 }
 
 // ---------------------------------------------------------------------------
