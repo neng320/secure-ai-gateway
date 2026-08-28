@@ -299,17 +299,26 @@ func TestSEC001_Fixed_SessionExpiry_ServerAuthoritative(t *testing.T) {
 // 登出
 // ---------------------------------------------------------------------------
 
-// [KNOWN-VULN: SEC-001 收尾待 P1-01E] 登出只清浏览器 Cookie，无服务端吊销：
-// 持有真实会话 token 的一方在"登出"后仍可继续访问（用真实 token 重放验证）。
-// P1-01E 完成后本测试必须反转为：登出后重放真实 token → 302。
-func TestAuthChar_VULN_Logout_DoesNotRevokeServerSide(t *testing.T) {
+// [P1-01E 修复后回归]（反转自 KNOWN-VULN "登出不吊销"）
+// 登出必须：服务端吊销会话 + 清浏览器 Cookie；登出后重放真实 token 一律拒绝。
+func TestAuthChar_Fixed_Logout_RevokesServerSide(t *testing.T) {
 	env := newAuthEnv(t)
+	ctx := context.Background()
+
 	loginResp := login(t, env.router, testAdminUser, testAdminPassword)
 	c := getSessionCookie(loginResp)
 	if c == nil {
 		t.Fatal("登录未获得 Cookie")
 	}
 
+	// 登出前真实 token 可访问
+	before := doReq(env.router, "GET", "/admin/clients",
+		[]*http.Cookie{{Name: sessionCookieName, Value: c.Value}})
+	if before.StatusCode != http.StatusOK {
+		t.Fatalf("[NORMAL] 登出前合法会话应可访问，实际 %d", before.StatusCode)
+	}
+
+	// 登出
 	logoutReq := httptest.NewRequest("POST", "/admin/logout", nil)
 	logoutReq.AddCookie(c)
 	w := httptest.NewRecorder()
@@ -321,13 +330,30 @@ func TestAuthChar_VULN_Logout_DoesNotRevokeServerSide(t *testing.T) {
 		t.Errorf("[NORMAL] 期望登出时下发清空 Cookie，实际 %v", clearCookie)
 	}
 
-	// [KNOWN-VULN] 用真实 token 重放——服务端未吊销，应仍可访问（直到 P1-01E）
+	// 重放真实 token → 拒绝
 	after := doReq(env.router, "GET", "/admin/clients",
 		[]*http.Cookie{{Name: sessionCookieName, Value: c.Value}})
-	if after.StatusCode != http.StatusOK {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 期望漏洞状态 HTTP 200（登出不吊销），实际 %d —— 若 P1-01E 已完成，请将本测试改写为吊销回归断言", after.StatusCode)
+	if after.StatusCode != http.StatusFound || after.Header.Get("Location") != "/admin/login" {
+		t.Fatalf("[安全回归失败] 登出后重放会话期望 302 → /admin/login，实际 %d %q", after.StatusCode, after.Header.Get("Location"))
 	}
-	t.Log("复现 SEC-001 收尾项：登出后真实 token 仍可访问（HTTP 200），无服务端吊销")
+
+	// DB 权威状态为已吊销
+	if _, err := env.store.Validate(ctx, c.Value); err != auth.ErrSessionRevoked {
+		t.Fatalf("[安全回归失败] 服务端会话状态期望 ErrSessionRevoked，实际 %v", err)
+	}
+}
+
+// [P1-01E 回归] 登出携带未知/伪造 token：不得 500，正常重定向。
+func TestAuthChar_Fixed_Logout_UnknownToken_NoError(t *testing.T) {
+	env := newAuthEnv(t)
+	req := httptest.NewRequest("POST", "/admin/logout", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: strings.Repeat("ff", 32)})
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+	resp := w.Result()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("[NORMAL] 未知 token 登出期望 302，实际 %d", resp.StatusCode)
+	}
 }
 
 // ---------------------------------------------------------------------------
