@@ -47,10 +47,18 @@ type LegacyGeminiConfig struct {
 type ServerConfig struct {
 	Host  string         `yaml:"host"`
 	Port  int            `yaml:"port"`
-	HTTPS HTTPSConfig    `yaml:"https"`
+	HTTPS HTTPSConfig    `yaml:"https"` // Deprecated (P1-01F.1)：enabled=true 时拒绝启动，字段仅为旧配置兼容解析
 	Admin ListenerConfig `yaml:"admin"`
 	// Metrics 监听面仅在 prometheus.enabled=true 时启动
 	Metrics ListenerConfig `yaml:"metrics"`
+}
+
+// HTTPSConfig Deprecated（P1-01F.1）：网关不再内建 TLS，仅保留字段使旧配置可解析。
+// TLS 由反向代理终止；Cookie Secure 将在 P1-02 改为独立的 admin.cookie_secure 配置。
+type HTTPSConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
 }
 
 // ListenerConfig: 独立监听面地址（P1-01F）。
@@ -58,12 +66,6 @@ type ServerConfig struct {
 type ListenerConfig struct {
 	Host string `yaml:"host"`
 	Port int    `yaml:"port"`
-}
-
-type HTTPSConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	CertFile string `yaml:"cert_file"`
-	KeyFile  string `yaml:"key_file"`
 }
 
 type AdminConfig struct {
@@ -130,6 +132,17 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// P1-01F.1：网关内建 TLS 已废弃（配置真实性）。
+	// https.enabled=true 时必须拒绝启动——静默降级为明文 HTTP 会让用户误以为
+	// 流量已加密，从而泄露管理会话与 Provider Key。TLS 一律由反向代理（Caddy 等）终止。
+	if cfg.Server.HTTPS.Enabled {
+		return nil, fmt.Errorf(
+			"server.https is DEPRECATED and unsupported since P1-01F.1: " +
+				"the gateway serves plain HTTP on loopback/private listeners; " +
+				"terminate TLS at a reverse proxy (e.g. Caddy) in front of it. " +
+				"Remove the server.https section (or set enabled: false) from the config and restart")
 	}
 
 	// 监听面默认值（P1-01F）：API 默认 loopback（生产由反代同机转发）；

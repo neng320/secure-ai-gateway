@@ -1,22 +1,23 @@
 server:
+  # 监听面隔离（P1-01F）：
+  #   host/port —— Public API（仅 API+health；生产置于反向代理之后，推荐 127.0.0.1）
+  #   admin     —— 管理面 /admin /setup /swagger（默认 127.0.0.1:8091，经 SSH 隧道 / Tailscale 访问）
+  #   metrics   —— /metrics（默认 127.0.0.1:9090，仅 prometheus.enabled=true 时启动）
+  # Admin/Metrics 绝不默认公网；如需改动，自行承担暴露风险。
   host: 0.0.0.0
   port: 8090
+  # ⚠️ Deprecated (ADR-005)：网关不再内建 TLS，此段仅为旧配置兼容。
+  # enabled=true 将拒绝启动。TLS 由反向代理（Caddy）终止：Caddy HTTPS → 127.0.0.1:<api port> HTTP
   https:
     enabled: false
     cert_file: ""
     key_file: ""
-    # P1-01F 监听面隔离：
-    #   admin   —— 管理面（默认 127.0.0.1，生产经 SSH 隧道 / Tailscale 访问）
-    #   metrics —— /metrics（默认 127.0.0.1，仅 prometheus.enabled=true 时启动）
-    # 两个面绝不默认公网；如需改动，自行承担暴露风险。
-    admin:
-        host: 127.0.0.1
-        port: 8091
-    metrics:
-        host: 127.0.0.1
-        port: 9090
-
-
+  admin:
+    host: 127.0.0.1
+    port: 8091
+  metrics:
+    host: 127.0.0.1
+    port: 9090
 admin:
   username: admin
   # Bcrypt hash of the admin password.

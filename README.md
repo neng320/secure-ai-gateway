@@ -42,6 +42,8 @@ go test ./...
 
 > 安全增强方案的完整执行文档见 `docs/superpowers/specs/`。上游文档继续适用于原有功能；安全增强相关文档位于 `docs/` 下的 `adr/`、`runbooks/` 子目录。
 
+> **TLS 拓扑（ADR-005）**：网关各监听面只提供 HTTP（默认 loopback），TLS 一律由反向代理（Caddy 等）终止——`Caddy HTTPS → 127.0.0.1:8090`。网关内建 TLS 已废弃：`server.https.enabled=true` 会拒绝启动。
+
 ---
 
 # Screenshots
