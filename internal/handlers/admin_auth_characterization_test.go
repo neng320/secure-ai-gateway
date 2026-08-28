@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/services"
@@ -70,7 +71,7 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	// Windows 下 TempDir 清理需要先释放 SQLite 文件句柄
@@ -94,7 +95,7 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	hub := services.NewDashboardHub(statsSvc)
 	toolSvc := services.NewToolService(nil)
 
-	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc)
+	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, auth.NewSQLiteStore(db))
 	if err != nil {
 		t.Fatalf("NewAdminHandler: %v", err)
 	}
@@ -162,9 +163,10 @@ func TestAuthChar_Login_ValidCredentials_SetsSessionCookie(t *testing.T) {
 	}
 }
 
-// [KNOWN-VULN: SEC-001] 会话值是静态字面量 "authenticated"，与凭据/随机性无关。
-// 重构后此断言必须反转：会话 ID 必须是每次登录随机生成、服务端可校验的值。
-func TestAuthChar_VULN_SessionValueIsStaticLiteral(t *testing.T) {
+// [P1-01C 修复后回归]（反转自 KNOWN-VULN "会话值为静态字面量"）
+// 会话值必须是每次登录随机生成的高熵 token：64 位小写 hex，两次登录必不相同，
+// 且绝不可能是旧的静态 "authenticated"。
+func TestAuthChar_Fixed_SessionTokenIsRandomPerLogin(t *testing.T) {
 	env1 := newAuthEnv(t)
 	env2 := newAuthEnvWithHash(t, func() string {
 		h, _ := bcrypt.GenerateFromPassword([]byte("Another-Password-42"), bcrypt.DefaultCost)
@@ -178,13 +180,17 @@ func TestAuthChar_VULN_SessionValueIsStaticLiteral(t *testing.T) {
 	if c1 == nil || c2 == nil {
 		t.Fatal("两个环境登录均未获得 Cookie")
 	}
-	if c1.Value != staticSessionValue {
-		t.Fatalf("[当前行为变化] Cookie 值不再是静态 %q，而是 %q —— SEC-001 相关代码已被改动，请核对 P1-01B/01D 是否完成", staticSessionValue, c1.Value)
+	if c1.Value == staticSessionValue || c2.Value == staticSessionValue {
+		t.Fatal("[SEC-001 回退?] 会话值又变成了静态字面量")
 	}
-	if c2.Value != c1.Value {
-		t.Fatalf("[当前行为变化] 不同实例登录获得不同 Cookie 值（%q vs %q）—— 会话机制已被改动", c1.Value, c2.Value)
+	if c1.Value == c2.Value {
+		t.Fatal("[安全回归失败] 不同实例两次登录得到相同会话值")
 	}
-	t.Logf("确认现状：两个独立实例、不同密码，Cookie 值均为静态 %q（SessionSecret 未参与会话标识）", c1.Value)
+	if len(c1.Value) != 64 || strings.ToLower(c1.Value) != c1.Value ||
+		strings.ContainsAny(c1.Value, "ghijklmnopqrstuvwxyz") {
+		t.Fatalf("[安全回归失败] 会话值应为 64 位小写 hex（256-bit），实际 %q（len=%d）", c1.Value, len(c1.Value))
+	}
+	t.Logf("会话 token 已随机化：%s... / %s...", c1.Value[:8], c2.Value[:8])
 }
 
 // [NORMAL] 错误密码拒绝。
@@ -396,8 +402,11 @@ func TestSetupChar_CompletesAndThenLoginWorks(t *testing.T) {
 			t.Fatalf("[NORMAL] setup 后新凭据登录期望 302，实际 %d", resp.StatusCode)
 		}
 		c := getSessionCookie(resp)
-		if c == nil || c.Value != staticSessionValue {
-			t.Errorf("[当前行为变化] setup 后登录 Cookie 非静态值 —— 会话机制已被改动")
+		if c == nil {
+			t.Fatal("setup 后登录未获得 Cookie")
+		}
+		if c.Value == staticSessionValue || len(c.Value) != 64 {
+			t.Fatalf("[安全回归失败] setup 后登录应获得 64 位随机会话 token，实际 %q", c.Value)
 		}
 	})
 }
