@@ -240,6 +240,7 @@ func autoMigrate(db *gorm.DB) error {
 		&models.Client{},
 		&models.RequestLog{},
 		&models.DailyUsage{},
+		&models.AdminSession{},
 	)
 }
 
