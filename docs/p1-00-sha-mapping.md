@@ -35,3 +35,11 @@ scope 建议在隔离 clone 中执行；实际在**本地工作仓**以 `--force
 1. **上游仓库 DatanoiseTV/aigateway 的公开历史不受影响**，其中同样的 config.yaml 凭证依旧公开；若上游凭证真实，唯一处置是上游轮换。
 2. GitHub 服务端可能按 SHA 缓存旧 commit 一段时间；彻底清除需联系 GitHub Support。
 3. 本 fork 的旧 SHA 仅可从备份 bundle / GitHub 缓存恢复；bundle 含旧密钥，**不要推送到任何远端**。
+
+## 5. ⚠️ 敏感备份处置（P1-00 验收补充，2026-08-29）
+
+`H:/zcode workspace/backup/secure-ai-gateway-pre-P100-20260828.bundle` **包含被清洗掉的旧历史与旧凭证（session_secret、prometheus 密码、上游 config.yaml），属敏感备份**：
+
+- **不得**推送到任何远端/网盘/仓库
+- **必须**二选一：① 加密后离线保存（如 `gpg -c` 或 age 加密）② 在人工确认 `secure-gateway-p0.1` 可从当前历史恢复所需内容后，由**人工**删除
+- **AI/自动化不得自行删除该 bundle**（含未来会话）
