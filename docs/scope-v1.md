@@ -53,9 +53,11 @@
 ## 5. P1 执行顺序修订（覆盖主方案 §7 的 P1 内部顺序）
 
 > 审计确认底座安全声明不实，P1 按"先止血后加固"重排。原编号在括号中保留以便对照。
+> P0 验收（2026-08-28）补充：新增 **P1-00**；安全工程强化项并入 P1-03/P7；供应链项并入 P8。
 
 | 新顺序 | 任务 | 原编号 | 说明 |
 |---|---|---|---|
+| 0 | **P1-00 Repository History Sanitation** | （P0 验收新增） | 本仓库是 Public Fork，历史中的上游 config.yaml（session_secret/prometheus 密码）仍可从旧 commit 取出。用 `git filter-repo` 清洗本 fork 历史 + force push；**注意：上游仓库的公开历史无法由本 fork 清除，若上游凭证真实，最终处置是上游轮换**。清洗后重新打 P0 恢复 tag（secure-gateway-p0.1）。历史清洗完成后才允许进入 P1-01 正式编码。 |
 | 1 | Admin Authentication 重建 | 原 P1-02 主体 | 服务端会话或签名 Cookie，杜绝 Cookie=权限；**监听面分离（原 P1-01）随之落地：Admin/Metrics 仅 loopback** |
 | 2 | Session / Cookie / CSRF | 原 P1-02 余项+P1-03 | rotation、过期、防爆破、真 CSRF |
 | 3 | Provider Key AEAD 加密 | 原 P1-05 | 主密钥 env/secret 文件；库内 ciphertext+nonce+key_id |
@@ -64,6 +66,11 @@
 | 6 | Rate Limit / Quota | 原 P1-06 | 补安全默认与超额错误码契约 |
 | 7 | Request validation | 原 P1-07 | 协议/体积/深度校验 |
 | 8 | Audit logging | 原 P1-08 后半 | 不可变管理审计事件 |
+
+### 安全工程强化（验收补充，随对应阶段落地）
+
+- **P1-03 起**：`scripts/secret-scan.sh` 基础版继续保留；P7 前引入 **gitleaks 或 trufflehog**（历史扫描 + 通用熵检测，弥补正则无法覆盖 `session_secret`/`password` 类通用 Secret 的短板），与本仓库的 forbidden-file 检查叠加使用。
+- **P8-01**：正式 release 采用 **signed tag**（GPG）+ artifact checksum，补供应链可信度（当前 `secure-gateway-p0` 为未签名 tag，开发期可接受）。
 
 **对后续 AI 执行者的强制提示：** 不要基于 README 假设 Provider Key 加密、会话安全、CSRF 已存在——以 `docs/baseline-audit.md` 为唯一事实来源，一切从代码出发。
 
