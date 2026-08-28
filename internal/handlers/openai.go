@@ -564,8 +564,12 @@ toolLoop:
 			if tcInterface != nil {
 				hasToolCall = true
 				if tc, ok := tcInterface.(*providers.StreamToolCall); ok {
-					if tc.ID != "" { toolCallID = tc.ID }
-					if tc.Name != "" { toolCallName = tc.Name }
+					if tc.ID != "" {
+						toolCallID = tc.ID
+					}
+					if tc.Name != "" {
+						toolCallName = tc.Name
+					}
 					toolCallArgs += tc.Arguments
 				}
 			}
@@ -576,8 +580,12 @@ toolLoop:
 			}
 
 			text, cit, cot := provider.ParseStreamChunk([]byte(jsonData))
-			if cit > 0 { it = cit }
-			if cot > 0 { ot = cot }
+			if cit > 0 {
+				it = cit
+			}
+			if cot > 0 {
+				ot = cot
+			}
 			if text != "" {
 				totalText.WriteString(text)
 				sendSSEChunk(w, flusher, responseID, req.Model, created, map[string]interface{}{"content": text}, nil)
@@ -610,7 +618,9 @@ toolLoop:
 		scanner = bufio.NewScanner(resp.Body)
 	}
 
-	if ot == 0 && totalText.Len() > 0 { ot = totalText.Len() / 4 }
+	if ot == 0 && totalText.Len() > 0 {
+		ot = totalText.Len() / 4
+	}
 	sendSSEChunk(w, flusher, responseID, req.Model, created, map[string]interface{}{}, "stop")
 	// Send usage info in a separate chunk for OpenAI compatibility
 	usageChunk := map[string]interface{}{
@@ -660,10 +670,16 @@ func extractErrorMessage(body []byte) string {
 		return "Upstream API error"
 	}
 	if e, ok := errObj["error"].(map[string]interface{}); ok {
-		if msg, ok := e["message"].(string); ok { return msg }
+		if msg, ok := e["message"].(string); ok {
+			return msg
+		}
 	}
-	if msg, ok := errObj["error"].(string); ok { return msg }
-	if msg, ok := errObj["message"].(string); ok { return msg }
+	if msg, ok := errObj["error"].(string); ok {
+		return msg
+	}
+	if msg, ok := errObj["message"].(string); ok {
+		return msg
+	}
 	return "Upstream API error"
 }
 

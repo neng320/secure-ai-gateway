@@ -12,6 +12,38 @@ A lightweight, self-hosted API gateway that sits between your applications and L
 
 ---
 
+# Fork Baseline（安全增强版基线）
+
+本仓库是 [DatanoiseTV/aigateway](https://github.com/DatanoiseTV/aigateway) 的安全增强 Fork，用于实施《轻量安全 LLM API Gateway 完整执行方案》。
+
+| 项目 | 值 |
+|---|---|
+| 上游仓库 | https://github.com/DatanoiseTV/aigateway |
+| 基线 commit | `2e192f174e97523b725d402fe7110273b95ef46d` |
+| 基线日期 | 2026-08-28 |
+| 上游默认分支 | `main` |
+| Go 版本 | 1.24+（本机验证 1.27.0） |
+
+## 分支策略
+
+- `main` — 跟随上游基线与本项目发布 tag，禁止直接开发
+- `develop` — 日常集成主干，任务分支统一合入
+- `task/P*-*` — 单任务分支，一个 Task ID 一个分支，完成后合入 `develop`
+
+## 构建方式
+
+```bash
+# 中国大陆网络需先切换模块代理（一次性）：
+go env -w GOPROXY=https://goproxy.cn,direct
+
+go build ./...
+go test ./...
+```
+
+> 安全增强方案的完整执行文档见 `docs/superpowers/specs/`。上游文档继续适用于原有功能；安全增强相关文档位于 `docs/` 下的 `adr/`、`runbooks/` 子目录。
+
+---
+
 # Screenshots
 
 <img width="2994" height="1542" alt="image" src="https://github.com/user-attachments/assets/420c007e-2443-4e3d-822f-1743daa9142f" />
