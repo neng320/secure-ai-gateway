@@ -22,6 +22,7 @@ func loginAndGetCookies(t *testing.T, env *authEnv) (session *http.Cookie, logou
 
 	logoutReq := httptest.NewRequest("POST", "/admin/logout", nil)
 	logoutReq.AddCookie(session)
+	logoutReq.Header.Set("X-CSRF-Token", csrfFor(env, session.Value))
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, logoutReq)
 	logoutClear = getSessionCookie(w.Result())

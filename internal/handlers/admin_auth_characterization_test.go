@@ -16,11 +16,13 @@ package handlers
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -116,11 +118,53 @@ func doReq(r http.Handler, method, target string, cookies []*http.Cookie) *http.
 	return w.Result()
 }
 
+// extractPreAuthCSRF: 从 login/setup 页面 HTML 解析 pre-auth csrf token
+func extractPreAuthCSRF(t *testing.T, body string) string {
+	t.Helper()
+	m := regexp.MustCompile(`name="csrf_token" value="([0-9a-f]{64})"`).FindStringSubmatch(body)
+	if m == nil {
+		t.Fatal("page missing pre-auth csrf token (SEC-004 wiring broken)")
+	}
+	return m[1]
+}
+
+func readBody(resp *http.Response) string {
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body = io.NopCloser(strings.NewReader(string(b)))
+	return string(b)
+}
+
+func findCookie(resp *http.Response, name string) *http.Cookie {
+	for _, c := range resp.Cookies() {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// csrfFor: 计算会话绑定 CSRF token（测试知道 SessionSecret；真实客户端由页面渲染获得）
+func csrfFor(env *authEnv, rawToken string) string {
+	return auth.CSRFToken(env.cfg.Admin.SessionSecret, rawToken)
+}
+
+// login: 完整 CSRF 流程——GET 登录页取 pre-auth token/Cookie，再提交
 func login(t *testing.T, r http.Handler, user, pass string) *http.Response {
 	t.Helper()
-	form := url.Values{"username": {user}, "password": {pass}}
+	pre := httptest.NewRequest("GET", "/admin/login", nil)
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, pre)
+	resp1 := w1.Result()
+	token := extractPreAuthCSRF(t, readBody(resp1))
+	pc := findCookie(resp1, auth.PreAuthCSRFCookie)
+	if pc == nil {
+		t.Fatal("login page did not set preauth_csrf cookie")
+	}
+
+	form := url.Values{"username": {user}, "password": {pass}, "csrf_token": {token}}
 	req := httptest.NewRequest("POST", "/admin/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(pc)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w.Result()
@@ -321,6 +365,7 @@ func TestAuthChar_Fixed_Logout_RevokesServerSide(t *testing.T) {
 	// 登出
 	logoutReq := httptest.NewRequest("POST", "/admin/logout", nil)
 	logoutReq.AddCookie(c)
+	logoutReq.Header.Set("X-CSRF-Token", csrfFor(env, c.Value))
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, logoutReq)
 	logoutResp := w.Result()
@@ -343,16 +388,27 @@ func TestAuthChar_Fixed_Logout_RevokesServerSide(t *testing.T) {
 	}
 }
 
-// [P1-01E 回归] 登出携带未知/伪造 token：不得 500，正常重定向。
-func TestAuthChar_Fixed_Logout_UnknownToken_NoError(t *testing.T) {
+// [P1-01E+P1-02B 回归] 登出携带未知/伪造 token：CSRF 先行拦截（403），绝无 500。
+// 持有该 token 页面缓存的旧 csrf 仍可通过（HMAC 确定性），吊销为幂等 no-op。
+func TestAuthChar_Fixed_Logout_UnknownToken_ForbiddenOrIdempotent(t *testing.T) {
 	env := newAuthEnv(t)
+	dead := strings.Repeat("ff", 32)
+	// 无 CSRF → 403
 	req := httptest.NewRequest("POST", "/admin/logout", nil)
-	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: strings.Repeat("ff", 32)})
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: dead})
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, req)
-	resp := w.Result()
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("[NORMAL] 未知 token 登出期望 302，实际 %d", resp.StatusCode)
+	if w.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("unknown-token logout without CSRF expect 403, got %d", w.Result().StatusCode)
+	}
+	// 带该 token 派生的 csrf（模拟页面缓存）→ 幂等 302，无 500
+	req2 := httptest.NewRequest("POST", "/admin/logout", nil)
+	req2.AddCookie(&http.Cookie{Name: sessionCookieName, Value: dead})
+	req2.Header.Set("X-CSRF-Token", csrfFor(env, dead))
+	w2 := httptest.NewRecorder()
+	env.router.ServeHTTP(w2, req2)
+	if code := w2.Result().StatusCode; code != http.StatusFound {
+		t.Fatalf("dead-token logout with derived csrf expect 302, got %d", code)
 	}
 }
 
@@ -411,17 +467,30 @@ func TestSetupChar_CompletesAndThenLoginWorks(t *testing.T) {
 		r := setupEnvRouter(env)
 		setupH.RegisterRoutes(r)
 
+		// 先 GET /setup 取 pre-auth CSRF（Cookie+token）
+		preReq := httptest.NewRequest("GET", "/setup", nil)
+		preW := httptest.NewRecorder()
+		r.ServeHTTP(preW, preReq)
+		preResp := preW.Result()
+		token := extractPreAuthCSRF(t, readBody(preResp))
+		pc := findCookie(preResp, auth.PreAuthCSRFCookie)
+		if pc == nil {
+			t.Fatal("setup page did not set preauth_csrf cookie")
+		}
+
 		form := url.Values{
 			"username":         {"admin"},
 			"password":         {"NewPass-Setup-99"},
 			"confirm_password": {"NewPass-Setup-99"},
+			"csrf_token":       {token},
 		}
 		req := httptest.NewRequest("POST", "/setup", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(pc)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Result().StatusCode != http.StatusFound {
-			t.Fatalf("[NORMAL] setup 完成期望 302，实际 %d", w.Result().StatusCode)
+			t.Fatalf("[NORMAL] setup complete expect 302, got %d", w.Result().StatusCode)
 		}
 
 		// 登录走 admin 路由（env.router），setup 走 setup 路由（r），与 main.go 的挂载方式一致
@@ -448,27 +517,56 @@ func setupEnvRouter(env *authEnv) *chi.Mux {
 // CSRF 面（仅固化现状，修复属 P1-02 / SEC-004）
 // ---------------------------------------------------------------------------
 
-// [KNOWN-VULN: SEC-004] 登录表单中的 csrf_token 是静态字面量，且服务端不校验：
-// 带任意/缺失 token 的登录 POST 都被正常处理。
-func TestSEC004_VULN_LoginIgnoresCSRFToken(t *testing.T) {
+// [P1-02B 修复后回归]（反转自 KNOWN-VULN "登录不做 CSRF 校验"）
+// 缺 token / 伪造 token → 403；正确 pre-auth 流程 → 302。
+func TestSEC004_Fixed_LoginCSRFEnforced(t *testing.T) {
 	env := newAuthEnv(t)
-	// 不带任何 token 的裸表单
-	resp := login(t, env.router, testAdminUser, testAdminPassword)
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("[SEC-004 已被修复?] 缺失 CSRF token 的登录被拒绝（%d）", resp.StatusCode)
-	}
-	// 伪造 token
-	form := url.Values{
-		"username":   {testAdminUser},
-		"password":   {testAdminPassword},
-		"csrf_token": {"forged-token"},
-	}
+
+	// 缺 token → 403
+	form := url.Values{"username": {testAdminUser}, "password": {testAdminPassword}}
 	req := httptest.NewRequest("POST", "/admin/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, req)
-	if w.Result().StatusCode != http.StatusFound {
-		t.Fatal("[SEC-004 已被修复?] 伪造 CSRF token 的登录被拒绝")
+	if w.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("[安全回归失败] missing CSRF token expect 403, got %d", w.Result().StatusCode)
 	}
-	t.Log("复现 SEC-004：登录端点完全不做 CSRF token 校验")
+
+	// 伪造 token（无对应 Cookie）→ 403
+	form.Set("csrf_token", strings.Repeat("ab", 32))
+	req2 := httptest.NewRequest("POST", "/admin/login", strings.NewReader(form.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w2 := httptest.NewRecorder()
+	env.router.ServeHTTP(w2, req2)
+	if w2.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("[安全回归失败] forged CSRF token expect 403, got %d", w2.Result().StatusCode)
+	}
+
+	// 正确 pre-auth 流程 → 302
+	if resp := login(t, env.router, testAdminUser, testAdminPassword); resp.StatusCode != http.StatusFound {
+		t.Fatalf("[安全回归失败] valid CSRF flow login expect 302, got %d", resp.StatusCode)
+	}
+	t.Log("SEC-004: login now enforces pre-auth CSRF")
+}
+
+// [P1-02B 回归] 跨会话 CSRF token 必须被拒绝（token 与会话绑定）。
+func TestSEC004_Fixed_CrossSessionCSRFTokenRejected(t *testing.T) {
+	env := newAuthEnv(t)
+	c1 := getSessionCookie(login(t, env.router, testAdminUser, testAdminPassword))
+	c2 := getSessionCookie(login(t, env.router, testAdminUser, testAdminPassword))
+	if c1 == nil || c2 == nil || c1.Value == c2.Value {
+		t.Fatal("two logins should yield different sessions")
+	}
+
+	// 用 t2 的 csrf 对 t1 的会话执行受保护写操作 → 403
+	form := url.Values{"name": {"x"}}
+	req := httptest.NewRequest("POST", "/admin/clients", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: c1.Value})
+	req.Header.Set("X-CSRF-Token", csrfFor(env, c2.Value))
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+	if w.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("[安全回归失败] cross-session CSRF token expect 403, got %d", w.Result().StatusCode)
+	}
 }
