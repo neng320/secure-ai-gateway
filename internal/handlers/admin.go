@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -28,7 +30,42 @@ import (
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	// SEC-004（P1-02C）：Admin WS 仅接受同源浏览器连接。
+	// - 严格 URL 解析比较，不做子串/后缀判断（admin.example.com.evil.example ≠ 同源）
+	// - 缺失 Origin 一律拒绝（浏览器必带 Origin；当前不存在必须支持的非浏览器 WS 客户端）
+	// - 不信任 X-Forwarded-*（Admin 走 loopback/隧道，无代理改写场景）
+	// - 端口：两侧都显式时必须一致；任一侧隐式默认端口时以 host 一致为准
+	CheckOrigin: func(r *http.Request) bool {
+		return wsOriginAllowed(r)
+	},
+}
+
+// wsOriginAllowed: Origin 的 host 与请求 Host 规范化后必须同源。
+func wsOriginAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	oh, op, oerr := net.SplitHostPort(u.Host)
+	if oerr != nil {
+		oh, op = u.Host, ""
+	}
+	rh, rp, rerr := net.SplitHostPort(r.Host)
+	if rerr != nil {
+		rh, rp = r.Host, ""
+	}
+	if oh == "" || rh == "" || !strings.EqualFold(oh, rh) {
+		return false
+	}
+	// 两侧端口都显式时必须一致；任一侧隐式默认端口 → host 一致即视为同源
+	if op != "" && rp != "" && op != rp {
+		return false
+	}
+	return true
 }
 
 func KnownProviderTypes() []string {
