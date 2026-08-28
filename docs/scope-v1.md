@@ -57,7 +57,7 @@
 
 | 新顺序 | 任务 | 原编号 | 说明 |
 |---|---|---|---|
-| 0 | **P1-00 Repository History Sanitation** | （P0 验收新增） | 本仓库是 Public Fork，历史中的上游 config.yaml（session_secret/prometheus 密码）仍可从旧 commit 取出。用 `git filter-repo` 清洗本 fork 历史 + force push；**注意：上游仓库的公开历史无法由本 fork 清除，若上游凭证真实，最终处置是上游轮换**。清洗后重新打 P0 恢复 tag（secure-gateway-p0.1）。历史清洗完成后才允许进入 P1-01 正式编码。 |
+| 0 | **P1-00 Repository History Sanitation** ✅ 已完成（2026-08-28，filter-repo 清洗 config.yaml/aigateway/node_modules 全历史，force push 全分支，重打 secure-gateway-p0.1 → main，bundle 备份存 H:/zcode workspace/backup/） | （P0 验收新增） | 本仓库是 Public Fork，历史中的上游 config.yaml（session_secret/prometheus 密码）仍可从旧 commit 取出。用 `git filter-repo` 清洗本 fork 历史 + force push；**注意：上游仓库的公开历史无法由本 fork 清除，若上游凭证真实，最终处置是上游轮换**。清洗后重新打 P0 恢复 tag（secure-gateway-p0.1）。历史清洗完成后才允许进入 P1-01 正式编码。 |
 | 1 | Admin Authentication 重建 | 原 P1-02 主体 | 服务端会话或签名 Cookie，杜绝 Cookie=权限；**监听面分离（原 P1-01）随之落地：Admin/Metrics 仅 loopback** |
 | 2 | Session / Cookie / CSRF | 原 P1-02 余项+P1-03 | rotation、过期、防爆破、真 CSRF |
 | 3 | Provider Key AEAD 加密 | 原 P1-05 | 主密钥 env/secret 文件；库内 ciphertext+nonce+key_id |
