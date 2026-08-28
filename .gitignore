@@ -54,3 +54,18 @@ node_modules/
 package-lock.json
 tailwind.config.js
 
+
+# ===== P0-04 Repository Hygiene（安全止血） =====
+# 环境变量与密钥文件
+.env
+.env.*
+secrets/
+# 运行时数据（整目录，含 SQLite 及其 journal/WAL/SHM）
+data/
+backups/
+*.db
+*.db-wal
+*.db-shm
+*.bak
+# 构建产物（无连字符二进制，区别于源码目录）
+aigateway
