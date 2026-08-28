@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -195,8 +196,18 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	// SEC-001 修复（P1-01E）：登出必须在服务端吊销会话，仅清浏览器 Cookie 不够。
+	// 未知/伪造 token 静默忽略（幂等），不让登出端点成为探测/500 源。
+	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil && cookie.Value != "" {
+		if err := h.sessionStore.Revoke(r.Context(), cookie.Value); err != nil && !errors.Is(err, auth.ErrSessionNotFound) {
+			log.Printf("[ADMIN] session revoke failed: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+	}
+
 	cookie := &http.Cookie{
-		Name:   "admin_session",
+		Name:   auth.SessionCookieName,
 		Value:  "",
 		Path:   "/",
 		MaxAge: -1,
