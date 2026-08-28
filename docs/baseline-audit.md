@@ -140,6 +140,7 @@
 | 5 | **27 个 Go 文件零测试** | P1 起按 TDD 补；关键路径 characterization test 优先 |
 | 6 | metrics 密码比较非常量时间（metrics.go:118-121） | P1-05 一并修 |
 | 7 | `-reset-password` 将新密码回显 stdout（main.go:75） | P1-08 一并修 |
+| 8 | `tools.go` SSH 工具使用 `ssh.InsecureIgnoreHostKey()`（MITM 风险；当前 `server_tools.enabled=false` 默认关闭） | 记录在案；若启用 server tools 需先改为 known_hosts 校验 |
 
 ---
 
