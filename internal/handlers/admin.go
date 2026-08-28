@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
@@ -52,6 +54,7 @@ type AdminHandler struct {
 	dashboardHub  *services.DashboardHub
 	toolService   *services.ToolService
 	templates     *template.Template
+	sessionStore  auth.Store
 }
 
 type PageData struct {
@@ -61,7 +64,7 @@ type PageData struct {
 	CSRFToken string
 }
 
-func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService) (*AdminHandler, error) {
+func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store) (*AdminHandler, error) {
 	tmpl := template.New("admin").Funcs(template.FuncMap{
 		"formatDate":     formatDate,
 		"formatInt":      formatInt,
@@ -87,6 +90,7 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 		dashboardHub:  dashboardHub,
 		toolService:   toolService,
 		templates:     tmpl,
+		sessionStore:  sessionStore,
 	}, nil
 }
 
@@ -125,13 +129,16 @@ func (h *AdminHandler) RegisterRoutes(r *chi.Mux) {
 
 func (h *AdminHandler) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("admin_session")
-		if err != nil {
+		cookie, err := r.Cookie(auth.SessionCookieName)
+		if err != nil || cookie.Value == "" {
 			http.Redirect(w, r, "/admin/login", http.StatusFound)
 			return
 		}
 
-		if cookie.Value == "" {
+		// SEC-001 修复（P1-01D）：服务端权威校验——存在 / 未撤销 / 未过期。
+		// Cookie 内容本身不再是权限；任何无法通过服务端会话校验的值一律拒绝。
+		if _, err := h.sessionStore.Validate(r.Context(), cookie.Value); err != nil {
+			log.Printf("[ADMIN] session rejected (%s): %v", r.URL.Path, err)
 			http.Redirect(w, r, "/admin/login", http.StatusFound)
 			return
 		}
@@ -163,14 +170,25 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SEC-001 修复（P1-01C）：凭据验证通过后签发真实服务端会话。
+	// 原始 256-bit 随机 token 仅此一次可见并放入 Cookie；库中只存 SHA-256。
+	expiresAt := time.Now().Add(auth.SessionDuration)
+	rawToken, err := h.sessionStore.Create(r.Context(), username, expiresAt)
+	if err != nil {
+		// 会话创建失败时绝不能让登录"静默成功"（否则会退回无法验证的状态）
+		log.Printf("[ADMIN] session create failed: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
 	cookie := &http.Cookie{
-		Name:     "admin_session",
-		Value:    "authenticated",
+		Name:     auth.SessionCookieName,
+		Value:    rawToken,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   h.cfg.Server.HTTPS.Enabled,
 		SameSite: http.SameSiteStrictMode,
-		Expires:  time.Now().Add(24 * time.Hour),
+		Expires:  expiresAt, // 与服务端 expires_at 一致（权威在服务端）
 	}
 
 	http.SetCookie(w, cookie)
@@ -178,8 +196,18 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	// SEC-001 修复（P1-01E）：登出必须在服务端吊销会话，仅清浏览器 Cookie 不够。
+	// 未知/伪造 token 静默忽略（幂等），不让登出端点成为探测/500 源。
+	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil && cookie.Value != "" {
+		if err := h.sessionStore.Revoke(r.Context(), cookie.Value); err != nil && !errors.Is(err, auth.ErrSessionNotFound) {
+			log.Printf("[ADMIN] session revoke failed: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+	}
+
 	cookie := &http.Cookie{
-		Name:   "admin_session",
+		Name:   auth.SessionCookieName,
 		Value:  "",
 		Path:   "/",
 		MaxAge: -1,

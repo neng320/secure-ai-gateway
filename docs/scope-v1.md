@@ -12,11 +12,11 @@
 
 | ID | 状态 | 描述 | 审计证据 | 关闭标准 | 承接任务 |
 |---|---|---|---|---|---|
-| SEC-001 | 🔴 OPEN | Admin 认证可绕过：会话 Cookie 值为静态 `"authenticated"`，服务端仅检查存在性 | baseline-audit §1.3 | 服务端会话（随机 ID + 有效期校验）或签名/加密 Cookie；Cookie 内容 ≠ 权限；有吊销能力 | P1-01/02（重建） |
+| SEC-001 | ✅ **CLOSED**（2026-08-29） | Admin 认证可绕过：会话 Cookie 值为静态 `"authenticated"`，服务端仅检查存在性 | baseline-audit §1.3 | 服务端会话（随机 ID + 有效期校验）或签名/加密 Cookie；Cookie 内容 ≠ 权限；有吊销能力 | **已实现**：P1-01B(Session Store) + P1-01C(随机 256-bit 签发) + P1-01D(RequireAuth 服务端校验) + P1-01E(Logout 吊销)；证据：Auth Security Regression Gate @ develop `f34c8e4`（伪造/过期/吊销/改1字符全拒 + 合法对照 + HTML/JSON/WS 三面覆盖） |
 | SEC-002 | 🔴 OPEN | Provider Key 明文存储（SQLite `backend_api_key` + config.yaml） | baseline-audit §1.2 | AEAD（AES-256-GCM 或 XChaCha20-Poly1305）加密落库，主密钥来自环境变量/secret 文件；库内仅 ciphertext+nonce+key_id | P1-03 |
 | SEC-003 | 🔴 OPEN | 完整 Prompt 默认持久化到 `request_logs.request_body` | baseline-audit §1.9 | 默认仅记录元数据（request_id/client/model/tokens/latency/status/error）；正文日志默认 OFF、需显式临时开启、有过期时间 | P1-04 |
-| SEC-004 | 🔴 OPEN | CSRF 防护无效（静态假 token，无校验） | baseline-audit §1.4 | 真实随机 token + 服务端校验，或等效 same-origin 严格校验；覆盖全部管理写操作 | P1-02 |
-| SEC-005 | 🟠 P0 处理中 | Secret 进入 Git 历史（上游作者的 config.yaml：session_secret、prometheus 密码） | baseline-audit §4-1 | config.yaml 移出跟踪 + .gitignore（P0-04）；跟踪文件 secret 扫描进 CI（P0-05）；**任何复用该配置的部署视为凭证已泄漏，上线前必须重新生成**；历史清洗（filter-repo）作为独立任务另行评估 | P0-04/P0-05 + 历史清洗（backlog） |
+| SEC-004 | 🔴 OPEN | CSRF 防护无效（静态假 token，无校验） | baseline-audit §1.4 | 真实随机 token + 服务端校验，或等效 same-origin 严格校验；覆盖全部管理写操作；WebSocket 增加 Origin 校验（同属本项，wsUpgrader.CheckOrigin 当前恒 true） | P1-02 |
+| SEC-005 | ✅ **CLOSED (fork-side)**（2026-08-29） | Secret 进入 Git 历史（上游作者的 config.yaml：session_secret、prometheus 密码） | baseline-audit §4-1 | fork 侧：filter-repo 全历史清洗 + 重打恢复点 `secure-gateway-p0.1`（见 docs/p1-00-sha-mapping.md）。**边界：upstream 仓库公开历史与 GitHub 服务端缓存不在本仓库控制范围**；pre-P1-00 bundle 备份含旧 Secret，属敏感备份须加密离线保存或人工确认后删除 | P0-04/P0-05 + P1-00 ✅ |
 
 **当前部署状态声明：** 本网关尚未在任何服务器部署，无真实流量、无属于运营者的真实凭证入库。入库凭证属于上游作者实例，按"已泄漏"原则处理（见 SEC-005 关闭标准）。在 SEC-001~005 全部关闭前，**禁止在公网环境运行任何实例**，开发实例仅允许绑定 loopback。
 
@@ -53,9 +53,11 @@
 ## 5. P1 执行顺序修订（覆盖主方案 §7 的 P1 内部顺序）
 
 > 审计确认底座安全声明不实，P1 按"先止血后加固"重排。原编号在括号中保留以便对照。
+> P0 验收（2026-08-28）补充：新增 **P1-00**；安全工程强化项并入 P1-03/P7；供应链项并入 P8。
 
 | 新顺序 | 任务 | 原编号 | 说明 |
 |---|---|---|---|
+| 0 | **P1-00 Repository History Sanitation** ✅ 已完成（2026-08-28，filter-repo 清洗 config.yaml/aigateway/node_modules 全历史，force push 全分支，重打 secure-gateway-p0.1 → main，bundle 备份存 H:/zcode workspace/backup/） | （P0 验收新增） | 本仓库是 Public Fork，历史中的上游 config.yaml（session_secret/prometheus 密码）仍可从旧 commit 取出。用 `git filter-repo` 清洗本 fork 历史 + force push；**注意：上游仓库的公开历史无法由本 fork 清除，若上游凭证真实，最终处置是上游轮换**。清洗后重新打 P0 恢复 tag（secure-gateway-p0.1）。历史清洗完成后才允许进入 P1-01 正式编码。 |
 | 1 | Admin Authentication 重建 | 原 P1-02 主体 | 服务端会话或签名 Cookie，杜绝 Cookie=权限；**监听面分离（原 P1-01）随之落地：Admin/Metrics 仅 loopback** |
 | 2 | Session / Cookie / CSRF | 原 P1-02 余项+P1-03 | rotation、过期、防爆破、真 CSRF |
 | 3 | Provider Key AEAD 加密 | 原 P1-05 | 主密钥 env/secret 文件；库内 ciphertext+nonce+key_id |
@@ -64,6 +66,11 @@
 | 6 | Rate Limit / Quota | 原 P1-06 | 补安全默认与超额错误码契约 |
 | 7 | Request validation | 原 P1-07 | 协议/体积/深度校验 |
 | 8 | Audit logging | 原 P1-08 后半 | 不可变管理审计事件 |
+
+### 安全工程强化（验收补充，随对应阶段落地）
+
+- **P1-03 起**：`scripts/secret-scan.sh` 基础版继续保留；P7 前引入 **gitleaks 或 trufflehog**（历史扫描 + 通用熵检测，弥补正则无法覆盖 `session_secret`/`password` 类通用 Secret 的短板），与本仓库的 forbidden-file 检查叠加使用。
+- **P8-01**：正式 release 采用 **signed tag**（GPG）+ artifact checksum，补供应链可信度（当前 `secure-gateway-p0` 为未签名 tag，开发期可接受）。
 
 **对后续 AI 执行者的强制提示：** 不要基于 README 假设 Provider Key 加密、会话安全、CSRF 已存在——以 `docs/baseline-audit.md` 为唯一事实来源，一切从代码出发。
 

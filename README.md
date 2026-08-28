@@ -19,7 +19,7 @@ A lightweight, self-hosted API gateway that sits between your applications and L
 | 项目 | 值 |
 |---|---|
 | 上游仓库 | https://github.com/DatanoiseTV/aigateway |
-| 基线 commit | `2e192f174e97523b725d402fe7110273b95ef46d` |
+| 原始基线 commit | `2e192f174e97523b725d402fe7110273b95ef46d`（上游仓库；本 fork 经 P1-00 历史清洗后该 SHA 不再存在于本地，新历史根为 `c080ae4`，见 docs/p1-00-sha-mapping.md） |
 | 基线日期 | 2026-08-28 |
 | 上游默认分支 | `main` |
 | Go 版本 | 1.24+（本机验证 1.27.0） |

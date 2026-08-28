@@ -71,12 +71,7 @@ type DailyUsage struct {
 	TotalOutputTokens int       `gorm:"default:0" json:"total_output_tokens"`
 }
 
-type AdminSession struct {
-	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	Username  string    `gorm:"type:varchar(255);uniqueIndex" json:"username"`
-	ExpiresAt time.Time `json:"expires_at"`
-	CreatedAt time.Time `json:"created_at"`
-}
+// AdminSession 已迁移至 internal/models/admin_session.go（P1-01B 重定义：token_hash/expires_at/revoked_at）
 
 type Stats struct {
 	TotalRequestsToday     int64   `json:"total_requests_today"`
