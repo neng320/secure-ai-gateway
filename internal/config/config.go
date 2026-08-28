@@ -45,9 +45,19 @@ type LegacyGeminiConfig struct {
 }
 
 type ServerConfig struct {
-	Host  string      `yaml:"host"`
-	Port  int         `yaml:"port"`
-	HTTPS HTTPSConfig `yaml:"https"`
+	Host  string         `yaml:"host"`
+	Port  int            `yaml:"port"`
+	HTTPS HTTPSConfig    `yaml:"https"`
+	Admin ListenerConfig `yaml:"admin"`
+	// Metrics 监听面仅在 prometheus.enabled=true 时启动
+	Metrics ListenerConfig `yaml:"metrics"`
+}
+
+// ListenerConfig: 独立监听面地址（P1-01F）。
+// 默认 loopback——Admin/Metrics 绝不默认公网；显式配置其他地址属运营者自主决定（启动时告警）。
+type ListenerConfig struct {
+	Host string `yaml:"host"`
+	Port int    `yaml:"port"`
 }
 
 type HTTPSConfig struct {
@@ -122,8 +132,25 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// 监听面默认值（P1-01F）：API 默认 loopback（生产由反代同机转发）；
+	// Admin/Metrics 强制默认 loopback，绝不默认公网。
+	if cfg.Server.Host == "" {
+		cfg.Server.Host = "127.0.0.1"
+	}
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8090
+	}
+	if cfg.Server.Admin.Host == "" {
+		cfg.Server.Admin.Host = "127.0.0.1"
+	}
+	if cfg.Server.Admin.Port == 0 {
+		cfg.Server.Admin.Port = 8091
+	}
+	if cfg.Server.Metrics.Host == "" {
+		cfg.Server.Metrics.Host = "127.0.0.1"
+	}
+	if cfg.Server.Metrics.Port == 0 {
+		cfg.Server.Metrics.Port = 9090
 	}
 
 	if cfg.Providers == nil {
@@ -200,10 +227,18 @@ func createDefaultConfig(path string) (*Config, error) {
 
 	cfg := &Config{
 		Server: ServerConfig{
-			Host: "0.0.0.0",
+			Host: "127.0.0.1",
 			Port: 8090,
 			HTTPS: HTTPSConfig{
 				Enabled: false,
+			},
+			Admin: ListenerConfig{
+				Host: "127.0.0.1",
+				Port: 8091,
+			},
+			Metrics: ListenerConfig{
+				Host: "127.0.0.1",
+				Port: 9090,
 			},
 		},
 		Admin: AdminConfig{
