@@ -186,7 +186,7 @@ func (t *ToolService) registerBuiltInTools() {
 				return `{"error": "host and port are required"}`, nil
 			}
 
-			addr := fmt.Sprintf("%s:%d", host, int(port))
+			addr := net.JoinHostPort(host, fmt.Sprint(int(port)))
 			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 			if err != nil {
 				return fmt.Sprintf(`{"error": "connection failed: %v"}`, err), nil
@@ -214,7 +214,7 @@ func (t *ToolService) registerBuiltInTools() {
 				return `{"error": "host and port are required"}`, nil
 			}
 
-			addr := fmt.Sprintf("%s:%d", host, int(port))
+			addr := net.JoinHostPort(host, fmt.Sprint(int(port)))
 			conn, err := net.DialTimeout("udp", addr, 5*time.Second)
 			if err != nil {
 				return fmt.Sprintf(`{"error": "connection failed: %v"}`, err), nil
@@ -282,7 +282,7 @@ func (t *ToolService) registerBuiltInTools() {
 				Timeout:         time.Duration(timeout) * time.Second,
 			}
 
-			addr := fmt.Sprintf("%s:%d", host, port)
+			addr := net.JoinHostPort(host, fmt.Sprint(port))
 			client, err := ssh.Dial("tcp", addr, config)
 			if err != nil {
 				return fmt.Sprintf(`{"error": "SSH connection failed: %v"}`, err), nil
@@ -372,7 +372,7 @@ func (t *ToolService) registerBuiltInTools() {
 				Timeout:         10 * time.Second,
 			}
 
-			addr := fmt.Sprintf("%s:%d", host, port)
+			addr := net.JoinHostPort(host, fmt.Sprint(port))
 			client, err := ssh.Dial("tcp", addr, config)
 			if err != nil {
 				return fmt.Sprintf(`{"error": "SSH connection failed: %v"}`, err), nil

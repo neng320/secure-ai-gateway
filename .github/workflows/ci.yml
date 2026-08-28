@@ -2,12 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - '**'
   pull_request:
-    branches: [main]
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  lint:
+    name: Format & Vet
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,29 +22,47 @@ jobs:
         with:
           go-version: '1.24'
 
-      - name: Set build variables
-        id: vars
+      - name: gofmt（仅检查 Git 跟踪的 Go 文件）
         run: |
-          if [[ "${{ github.ref_name }}" == "main" ]]; then
-            VERSION="main"
-          else
-            VERSION="dev"
+          out=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$out" ]; then
+            echo "::error::以下文件需要 gofmt:"
+            echo "$out"
+            exit 1
           fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Build
-        env:
-          VERSION: ${{ steps.vars.outputs.version }}
-          COMMIT: ${{ steps.vars.outputs.commit }}
-          BUILD_TIME: ${{ steps.vars.outputs.build_time }}
-        run: |
-          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}"
-          go build -ldflags "$LDFLAGS" -v ./...
-
-      - name: Vet
+      - name: go vet
         run: go vet ./...
 
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      # mattn/go-sqlite3 需要 CGO；ubuntu-latest 自带 gcc
+      - name: Build
+        env:
+          CGO_ENABLED: '1'
+        run: go build ./...
+
       - name: Test
-        run: go test -v ./...
+        env:
+          CGO_ENABLED: '1'
+        run: go test ./...
+
+  security:
+    name: Secret Scan & Repo Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret scan
+        run: bash scripts/secret-scan.sh
+
+      - name: Large file check
+        run: bash scripts/check-large-files.sh
