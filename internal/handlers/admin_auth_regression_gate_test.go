@@ -11,7 +11,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -155,15 +154,7 @@ func TestGate_LoginRotatesSession_EveryLoginNewToken(t *testing.T) {
 func TestGate_LoginFlow_EndToEnd(t *testing.T) {
 	env := newAuthEnv(t)
 
-	form := url.Values{"username": {testAdminUser}, "password": {testAdminPassword}}
-	req := httptest.NewRequest("POST", "/admin/login", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-	env.router.ServeHTTP(w, req)
-	if w.Result().StatusCode != http.StatusFound {
-		t.Fatalf("登录期望 302，实际 %d", w.Result().StatusCode)
-	}
-	token := getSessionCookie(w.Result()).Value
+	token := gateLogin(t, env)
 
 	ok := doReq(env.router, "GET", "/admin/dashboard",
 		[]*http.Cookie{{Name: sessionCookieName, Value: token}})
@@ -173,6 +164,7 @@ func TestGate_LoginFlow_EndToEnd(t *testing.T) {
 
 	logoutReq := httptest.NewRequest("POST", "/admin/logout", nil)
 	logoutReq.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	logoutReq.Header.Set("X-CSRF-Token", csrfFor(env, token))
 	w2 := httptest.NewRecorder()
 	env.router.ServeHTTP(w2, logoutReq)
 

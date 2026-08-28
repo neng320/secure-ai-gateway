@@ -3,9 +3,12 @@ package handlers
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
+	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 
 	"github.com/go-chi/chi/v5"
@@ -27,7 +30,48 @@ func (h *SetupHandler) IsSetupRequired() bool {
 
 func (h *SetupHandler) RegisterRoutes(r chi.Router) {
 	r.Get("/setup", h.ShowSetup)
-	r.Post("/setup", h.HandleSetup)
+	r.Post("/setup", h.setupCSRF(http.HandlerFunc(h.HandleSetup)).ServeHTTP)
+}
+
+// setupCSRF: Setup 无会话，使用 pre-auth double-submit（SEC-004，P1-02B）。
+func (h *SetupHandler) setupCSRF(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !auth.PreAuthCSRFValid(r) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// renderSetupPage: 渲染 setup 页面。
+// 注意：页面 CSS 含裸百分号（linear-gradient 0%/100%），绝不能用 fmt.Fprintf——
+// 裸 % 会被当作格式化 verb 吞掉参数（上游曾因此 Port 行渲染成 %!d(MISSING)）。
+// 改用显式占位符替换。
+func (h *SetupHandler) renderSetupPage(csrfToken string) []byte {
+	page := strings.NewReplacer(
+		"{{CSRF}}", csrfToken,
+		"{{PORT}}", strconv.Itoa(h.cfg.Server.Port),
+	).Replace(setupHTML)
+	return []byte(page)
+}
+
+// issuePreAuthCSRF: 签发 pre-auth token（渲染值 + 同值 Cookie）
+func (h *SetupHandler) issuePreAuthCSRF(w http.ResponseWriter) (string, error) {
+	token, err := auth.NewPreAuthCSRF()
+	if err != nil {
+		return "", err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.PreAuthCSRFCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cfg.Admin.CookieSecure,
+		SameSite: http.SameSiteStrictMode,
+		Expires:  time.Now().Add(15 * time.Minute),
+	})
+	return token, nil
 }
 
 func (h *SetupHandler) ShowSetup(w http.ResponseWriter, r *http.Request) {
@@ -36,8 +80,13 @@ func (h *SetupHandler) ShowSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	token, err := h.issuePreAuthCSRF(w)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, setupHTML, h.cfg.Server.Port)
+	w.Write([]byte(h.renderSetupPage(token)))
 }
 
 func (h *SetupHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
@@ -87,8 +136,14 @@ func (h *SetupHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *SetupHandler) showError(w http.ResponseWriter, msg string) {
+	// 重签 pre-auth token，保证用户修正输入后可重新提交
+	token, err := h.issuePreAuthCSRF(w)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, setupHTML, h.cfg.Server.Port)
+	w.Write([]byte(h.renderSetupPage(token)))
 }
 
 func generateRandomString(length int) string {
@@ -119,6 +174,7 @@ var setupHTML = `<!DOCTYPE html>
             </div>
 
             <form method="POST" class="space-y-6">
+                <input type="hidden" name="csrf_token" value="{{CSRF}}">
                 <div>
                     <label class="block text-gray-400 text-sm font-medium mb-2">Admin Username</label>
                     <input type="text" name="username" value="admin" required
@@ -143,7 +199,7 @@ var setupHTML = `<!DOCTYPE html>
                         <li>Prometheus metrics enabled</li>
                         <li>Username: prometheus</li>
                         <li>Password: auto-generated</li>
-                        <li>Port: %d</li>
+                        <li>Port: {{PORT}}</li>
                     </ul>
                 </div>
 

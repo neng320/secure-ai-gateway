@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -44,6 +46,16 @@ func KnownProviderTypes() []string {
 		"vllm",
 		"openrouter",
 	}
+}
+
+// adminCSRFKey: request context 中携带的会话绑定 CSRF token
+type adminCSRFKey struct{}
+
+func csrfFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(adminCSRFKey{}).(string); ok {
+		return v
+	}
+	return ""
 }
 
 type AdminHandler struct {
@@ -96,6 +108,9 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 
 func (h *AdminHandler) RegisterRoutes(r *chi.Mux) {
 	r.Group(func(r chi.Router) {
+		// SEC-004（P1-02B）：login/logout POST 必须携带有效 CSRF（pre-auth double-submit
+		// 或会话绑定 token）；GET 只读不受限
+		r.Use(h.requireCSRFPublic)
 		r.Get("/admin", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/admin/dashboard", http.StatusFound)
 		})
@@ -107,6 +122,8 @@ func (h *AdminHandler) RegisterRoutes(r *chi.Mux) {
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Timeout(60 * time.Second))
 		r.Use(h.RequireAuth)
+		// SEC-004（P1-02B）：受保护组所有 POST 必须携带会话绑定 CSRF token
+		r.Use(h.requireCSRFSession)
 
 		r.Get("/admin/dashboard", h.Dashboard)
 		r.Get("/admin/clients", h.ListClients)
@@ -143,14 +160,109 @@ func (h *AdminHandler) RequireAuth(next http.Handler) http.Handler {
 			return
 		}
 
+		// SEC-004 修复（P1-02B）：派生会话绑定 CSRF token 注入 context，供模板渲染
+		ctx := context.WithValue(r.Context(), adminCSRFKey{}, auth.CSRFToken(h.cfg.Admin.SessionSecret, cookie.Value))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// CSRF（SEC-004 修复，P1-02B）
+//
+// 两种模式：
+//   会话绑定（受保护组 POST）：token = HMAC-SHA256(SessionSecret, "csrf:"+rawToken)，
+//     constant-time 比对；token 随会话轮换，跨会话/跨实例不可复用。
+//   Pre-auth（login/setup POST）：double-submit Cookie——GET 时 Set-Cookie(preauth_csrf)
+//     并渲染同值 token，POST 比对两者；攻击者跨站既读不到也设不了该 Cookie。
+// 缺 token / 不匹配 / 无 Cookie → 一律 403，不泄露期望值。
+// ---------------------------------------------------------------------------
+
+func (h *AdminHandler) csrfTokenFromRequest(r *http.Request) string {
+	if r.Form == nil || r.Form.Get("csrf_token") == "" {
+		r.ParseForm()
+	}
+	if t := r.Form.Get("csrf_token"); t != "" {
+		return t
+	}
+	return r.Header.Get("X-CSRF-Token")
+}
+
+// verifySessionCSRF: 会话绑定模式校验
+func (h *AdminHandler) verifySessionCSRF(r *http.Request) bool {
+	cookie, err := r.Cookie(auth.SessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	expected := auth.CSRFToken(h.cfg.Admin.SessionSecret, cookie.Value)
+	token := h.csrfTokenFromRequest(r)
+	return token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+}
+
+// verifyPreAuthCSRF: double-submit 模式校验（Cookie 值 vs 表单 token，均为服务端签发）
+func (h *AdminHandler) verifyPreAuthCSRF(r *http.Request) bool {
+	return auth.PreAuthCSRFValid(r)
+}
+
+// requireCSRFPublic: 公开组（login/logout）——先试会话绑定，再退 pre-auth double-submit。
+func (h *AdminHandler) requireCSRFPublic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if h.verifySessionCSRF(r) || h.verifyPreAuthCSRF(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		log.Printf("[ADMIN] CSRF rejected %s", r.URL.Path)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+	})
+}
+
+// requireCSRFSession: 受保护组——POST 必须携带会话绑定 token（GET 只读跳过）。
+func (h *AdminHandler) requireCSRFSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !h.verifySessionCSRF(r) {
+			log.Printf("[ADMIN] CSRF rejected %s (session-bound)", r.URL.Path)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+// issuePreAuthCSRF: 为 login/setup 页面签发 pre-auth token（渲染值 + 同值 Cookie）
+func (h *AdminHandler) issuePreAuthCSRF(w http.ResponseWriter) (string, error) {
+	token, err := auth.NewPreAuthCSRF()
+	if err != nil {
+		return "", err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.PreAuthCSRFCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cfg.Admin.CookieSecure,
+		SameSite: http.SameSiteStrictMode,
+		Expires:  time.Now().Add(15 * time.Minute),
+	})
+	return token, nil
+}
+
 func (h *AdminHandler) ShowLogin(w http.ResponseWriter, r *http.Request) {
-	h.render(w, "login.html", PageData{
+	token, err := h.issuePreAuthCSRF(w)
+	if err != nil {
+		log.Printf("[ADMIN] pre-auth csrf issue failed: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	h.render(r, w, "login.html", PageData{
 		Title:     "Admin Login",
-		CSRFToken: "login-csrf-token",
+		CSRFToken: token,
 	})
 }
 
@@ -227,7 +339,7 @@ func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	modelUsage, _ := h.statsService.GetModelUsage()
 	recentStats, _ := h.statsService.GetRecentStats(5)
 
-	h.render(w, "dashboard.html", PageData{
+	h.render(r, w, "dashboard.html", PageData{
 		Title: "Dashboard",
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -248,7 +360,7 @@ func (h *AdminHandler) ListClients(w http.ResponseWriter, r *http.Request) {
 		statsMap[cs.ClientID] = cs
 	}
 
-	h.render(w, "clients.html", PageData{
+	h.render(r, w, "clients.html", PageData{
 		Title: "Clients",
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -302,7 +414,7 @@ func (h *AdminHandler) CreateClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.render(w, "client_created.html", PageData{
+	h.render(r, w, "client_created.html", PageData{
 		Title: "Client Created",
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -324,7 +436,7 @@ func (h *AdminHandler) ShowClient(w http.ResponseWriter, r *http.Request) {
 	clientStats, _ := h.statsService.GetClientStats(id)
 	recentLogs, _ := h.statsService.GetRecentRequests(id, 50)
 
-	h.render(w, "client_detail.html", PageData{
+	h.render(r, w, "client_detail.html", PageData{
 		Title: client.Name,
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -443,7 +555,7 @@ func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 
 	client, _ := h.clientService.GetClientByID(id)
 
-	h.render(w, "client_created.html", PageData{
+	h.render(r, w, "client_created.html", PageData{
 		Title: "API Key Regenerated",
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -462,7 +574,7 @@ func (h *AdminHandler) ShowServerTools(w http.ResponseWriter, r *http.Request) {
 		enabledTools[name] = true
 	}
 
-	h.render(w, "server_tools.html", PageData{
+	h.render(r, w, "server_tools.html", PageData{
 		Title: "Server Tools",
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -508,7 +620,7 @@ func (h *AdminHandler) ShowStats(w http.ResponseWriter, r *http.Request) {
 	clientStats, _ := h.statsService.GetClientStats2(7)
 	stats, _ := h.statsService.GetGlobalStats()
 
-	h.render(w, "stats.html", PageData{
+	h.render(r, w, "stats.html", PageData{
 		Title: "Statistics",
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -523,7 +635,7 @@ func (h *AdminHandler) ShowStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) ShowSettings(w http.ResponseWriter, r *http.Request) {
-	h.render(w, "settings.html", PageData{
+	h.render(r, w, "settings.html", PageData{
 		Title: "Settings",
 		User:  h.cfg.Admin.Username,
 		Data: map[string]interface{}{
@@ -755,7 +867,11 @@ func formatStringArray(arr []string) string {
 	return result
 }
 
-func (h *AdminHandler) render(w http.ResponseWriter, name string, data PageData) {
+func (h *AdminHandler) render(r *http.Request, w http.ResponseWriter, name string, data PageData) {
+	if data.CSRFToken == "" && r != nil {
+		// 受保护页面：从 context 取会话绑定 CSRF token（RequireAuth 注入）
+		data.CSRFToken = csrfFromContext(r.Context())
+	}
 	err := h.templates.ExecuteTemplate(w, name, data)
 	if err != nil {
 		log.Printf("Template error for %s: %v", name, err)
@@ -953,6 +1069,7 @@ var adminTemplates = []byte(`
                         </svg>
                     </a>
                     <form method="POST" action="/admin/logout" class="ml-2">
+                        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                         <button type="submit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
@@ -1292,6 +1409,7 @@ var adminTemplates = []byte(`
                         </svg>
                     </a>
                     <form method="POST" action="/admin/logout" class="ml-2">
+                        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                         <button type="submit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
@@ -1348,6 +1466,7 @@ var adminTemplates = []byte(`
                         </td>
                         <td class="px-6 py-4">
                             <form method="POST" action="/admin/clients/{{.ID}}/toggle">
+                                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                                 <button type="submit" class="px-3 py-1 text-xs font-medium rounded-full {{if .IsActive}}bg-green-500/20 text-green-400{{else}}bg-red-500/20 text-red-400{{end}} hover:opacity-80 transition-opacity">
                                     {{if .IsActive}}Active{{else}}Disabled{{end}}
                                 </button>
@@ -1418,6 +1537,7 @@ var adminTemplates = []byte(`
                 </button>
             </div>
             <form method="POST" action="/admin/clients">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                 <div class="space-y-3">
                     <div>
                         <label class="block text-gray-400 text-xs font-medium my-2">Name</label>
@@ -1529,6 +1649,7 @@ var adminTemplates = []byte(`
                         </svg>
                     </a>
                     <form method="POST" action="/admin/logout" class="ml-2">
+                        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                         <button type="submit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
@@ -1617,6 +1738,7 @@ var adminTemplates = []byte(`
             <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
                 <h3 class="text-lg font-semibold text-white mb-6">Client Settings</h3>
                 <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/update">
+                    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                     <div class="grid grid-cols-2 gap-4 mb-4">
                         <div>
                             <label class="block text-gray-400 text-sm font-medium mb-2">Rate (req/min)</label>
@@ -1757,6 +1879,7 @@ var adminTemplates = []byte(`
                                 <p class="text-gray-500 text-sm">Invalidates the current key and generates a new one</p>
                             </div>
                             <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/regenerate" class="flex items-center space-x-2">
+                                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                                 <select name="key_type" onchange="toggleRegenPrefix(this)" class="px-3 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-500">
                                     <option value="gemini">gm_</option>
                                     <option value="openai">sk-</option>
@@ -1777,6 +1900,7 @@ var adminTemplates = []byte(`
                                 <p class="text-gray-500 text-sm">Permanently delete this client and all associated data</p>
                             </div>
                             <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/delete" onsubmit="return confirm('Are you sure? This cannot be undone.')">
+                                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                                 <button type="submit" class="px-4 py-2 bg-red-600/20 text-red-400 border border-red-600/50 rounded-lg hover:bg-red-600/30 transition-colors">Delete</button>
                             </form>
                         </div>
@@ -2025,6 +2149,7 @@ var adminTemplates = []byte(`
                     <a href="/admin/clients" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Clients</a>
                     <a href="/admin/stats" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Stats</a>
                     <form method="POST" action="/admin/logout" class="ml-2">
+                        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                         <button type="submit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
@@ -2116,6 +2241,7 @@ var adminTemplates = []byte(`
                         </svg>
                     </a>
                     <form method="POST" action="/admin/logout" class="ml-2">
+                        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                         <button type="submit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
@@ -2374,6 +2500,7 @@ var adminTemplates = []byte(`
                 <p class="text-gray-400 mb-6">Enable or disable server-provided tools. These tools are available to clients that have "Enable Server Tools" checked in their settings.</p>
 
                 <form method="POST" action="/admin/server-tools">
+                    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                     <div class="space-y-4">
                         {{range .Data.Tools}}
                         <div class="flex items-center p-4 bg-gray-900 rounded-lg border border-gray-700">
