@@ -108,7 +108,7 @@ func (p *OllamaProvider) buildRequestBody(req *ChatRequest, stream bool) []byte 
 	for i, m := range req.Messages {
 		msg := map[string]interface{}{"role": m.Role, "content": m.Content}
 		if m.Role == "tool" && m.ToolCallID != "" {
-			// Ollama doesn't explicitly mention tool_call_id in its messages spec, 
+			// Ollama doesn't explicitly mention tool_call_id in its messages spec,
 			// but for chat history it's often needed.
 		}
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
