@@ -21,6 +21,10 @@ server:
 admin:
   username: admin
   # password_hash and session_secret are auto-generated on first run
+  # Admin 会话 Cookie 的 Secure 属性（与已废弃的 server.https 解耦）：
+  #   false —— loopback / SSH 隧道的纯 HTTP 开发访问（默认）
+  #   true  —— 生产经 HTTPS 访问 Admin 面时必须显式开启
+  cookie_secure: false
 
 providers:
   gemini:

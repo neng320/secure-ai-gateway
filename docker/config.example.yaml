@@ -19,6 +19,10 @@ server:
     host: 127.0.0.1
     port: 9090
 admin:
+
+  # Admin 会话 Cookie 的 Secure 属性（与已废弃的 server.https 解耦）
+  # 容器场景若经 HTTPS 反代访问 Admin 面，请显式置 true
+  cookie_secure: false
   username: admin
   # Bcrypt hash of the admin password.
   # Generate with:  docker run --rm <image> hashpw 'your-password'
