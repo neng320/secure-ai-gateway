@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/handlers"
 	"ai-gateway/internal/logger"
@@ -107,6 +108,7 @@ func main() {
 	geminiService := services.NewGeminiService(db, cfg)
 	statsService := services.NewStatsService(db)
 	toolService := services.NewToolService(cfg.ServerTools.Tools)
+	sessionStore := auth.NewSQLiteStore(db)
 
 	// Build the multi-backend provider registry from config
 	providerRegistry := providers.BuildRegistry(cfg)
@@ -136,7 +138,7 @@ func main() {
 		openaiHandler.RegisterRoutes(r)
 	})
 
-	adminHandler, err := handlers.NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService)
+	adminHandler, err := handlers.NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, sessionStore)
 	if err != nil {
 		log.Fatalf("Failed to initialize admin handler: %v", err)
 	}
