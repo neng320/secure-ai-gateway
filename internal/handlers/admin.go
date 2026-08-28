@@ -128,13 +128,16 @@ func (h *AdminHandler) RegisterRoutes(r *chi.Mux) {
 
 func (h *AdminHandler) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("admin_session")
-		if err != nil {
+		cookie, err := r.Cookie(auth.SessionCookieName)
+		if err != nil || cookie.Value == "" {
 			http.Redirect(w, r, "/admin/login", http.StatusFound)
 			return
 		}
 
-		if cookie.Value == "" {
+		// SEC-001 修复（P1-01D）：服务端权威校验——存在 / 未撤销 / 未过期。
+		// Cookie 内容本身不再是权限；任何无法通过服务端会话校验的值一律拒绝。
+		if _, err := h.sessionStore.Validate(r.Context(), cookie.Value); err != nil {
+			log.Printf("[ADMIN] session rejected (%s): %v", r.URL.Path, err)
 			http.Redirect(w, r, "/admin/login", http.StatusFound)
 			return
 		}
