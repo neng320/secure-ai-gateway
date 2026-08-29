@@ -74,6 +74,12 @@ type keyFlowEnv struct {
 
 func newKeyFlowEnv(t *testing.T, globalAPIKey string) *keyFlowEnv {
 	t.Helper()
+	return newKeyFlowEnvWithManager(t, globalAPIKey, secrets.NewManager(mustKFCipher(t)))
+}
+
+// newKeyFlowEnvWithManager: 允许注入 nil Manager（模拟未配置 Master Key 的空系统）
+func newKeyFlowEnvWithManager(t *testing.T, globalAPIKey string, manager *secrets.Manager) *keyFlowEnv {
+	t.Helper()
 
 	// 本地 upstream：捕获 Authorization，返回合法 OpenAI 形态响应
 	var auths []string
@@ -120,7 +126,6 @@ func newKeyFlowEnv(t *testing.T, globalAPIKey string) *keyFlowEnv {
 	dashboardHub := services.NewDashboardHub(statsService)
 	store := auth.NewSQLiteStore(db)
 	limiter := auth.NewLoginRateLimiter()
-	manager := secrets.NewManager(mustKFCipher(t))
 
 	// Public API 路由（与 buildAPIRouter 同构）
 	openaiHandler := NewOpenAIHandler(geminiService, clientService, statsService, registry, toolService, manager)
