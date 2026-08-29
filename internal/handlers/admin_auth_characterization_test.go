@@ -57,10 +57,11 @@ var testPasswordHash = func() string {
 
 // authEnv 承载一个独立的 handler + 内存级路由；DB 用临时文件避免 :memory: 连接池陷阱
 type authEnv struct {
-	cfg    *config.Config
-	router http.Handler
-	db     *gorm.DB
-	store  *auth.SQLiteStore
+	cfg     *config.Config
+	router  http.Handler
+	db      *gorm.DB
+	store   *auth.SQLiteStore
+	limiter *auth.LoginRateLimiter
 }
 
 func newAuthEnv(t *testing.T) *authEnv {
@@ -99,13 +100,15 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	toolSvc := services.NewToolService(nil)
 
 	store := auth.NewSQLiteStore(db)
-	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, auth.NewLoginRateLimiter())
+	limiter := auth.NewLoginRateLimiter()
+	limiter.Configure(5, 15*time.Minute, cfg.Admin.Username) // 与 newGatewayDeps 同语义
+	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, limiter)
 	if err != nil {
 		t.Fatalf("NewAdminHandler: %v", err)
 	}
 	r := chi.NewRouter()
 	adminH.RegisterRoutes(r)
-	return &authEnv{cfg: cfg, router: r, db: db, store: store}
+	return &authEnv{cfg: cfg, router: r, db: db, store: store, limiter: limiter}
 }
 
 func doReq(r http.Handler, method, target string, cookies []*http.Cookie) *http.Response {
@@ -436,7 +439,7 @@ func withTempWorkingDir(t *testing.T, fn func()) {
 func TestSetupChar_UnsetPassword_SetupReachableWithoutAuth(t *testing.T) {
 	withTempWorkingDir(t, func() {
 		env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-		setupH := NewSetupHandler(env.cfg, false)
+		setupH := NewSetupHandler(env.cfg, false, env.limiter)
 		r := setupEnvRouter(env)
 		setupH.RegisterRoutes(r)
 
@@ -450,7 +453,7 @@ func TestSetupChar_UnsetPassword_SetupReachableWithoutAuth(t *testing.T) {
 // [NORMAL] 已设密码后 setup 必须关闭。
 func TestSetupChar_PasswordSet_SetupRedirectsAway(t *testing.T) {
 	env := newAuthEnv(t)
-	setupH := NewSetupHandler(env.cfg, false)
+	setupH := NewSetupHandler(env.cfg, false, env.limiter)
 	r := setupEnvRouter(env)
 	setupH.RegisterRoutes(r)
 	resp := doReq(r, "GET", "/setup", nil)
@@ -463,7 +466,7 @@ func TestSetupChar_PasswordSet_SetupRedirectsAway(t *testing.T) {
 func TestSetupChar_CompletesAndThenLoginWorks(t *testing.T) {
 	withTempWorkingDir(t, func() {
 		env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-		setupH := NewSetupHandler(env.cfg, false)
+		setupH := NewSetupHandler(env.cfg, false, env.limiter)
 		r := setupEnvRouter(env)
 		setupH.RegisterRoutes(r)
 

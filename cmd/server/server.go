@@ -111,7 +111,7 @@ func buildAdminRouter(d gatewayDeps) (*chi.Mux, error) {
 		return nil, fmt.Errorf("admin handler: %w", err)
 	}
 
-	setupHandler := handlers.NewSetupHandler(d.cfg, d.setupMode)
+	setupHandler := handlers.NewSetupHandler(d.cfg, d.setupMode, d.loginLimiter)
 	if setupHandler.IsSetupRequired() {
 		setupHandler.RegisterRoutes(r)
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
