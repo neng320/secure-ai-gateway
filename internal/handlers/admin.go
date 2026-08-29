@@ -19,6 +19,7 @@ import (
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
+	"ai-gateway/internal/secrets"
 	"ai-gateway/internal/services"
 
 	"github.com/go-chi/chi/v5"
@@ -108,6 +109,8 @@ type AdminHandler struct {
 	templates     *template.Template
 	sessionStore  auth.Store
 	loginLimiter  *auth.LoginRateLimiter
+	secretMgr     *secrets.Manager
+	configPath    string
 	wsUpgrader    *websocket.Upgrader
 }
 
@@ -118,7 +121,10 @@ type PageData struct {
 	CSRFToken string
 }
 
-func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store, loginLimiter *auth.LoginRateLimiter) (*AdminHandler, error) {
+// NewAdminHandler: secretMgr 为 Provider Secret 加密/解密的唯一入口（可为 nil——
+// 未配置 Master Key 且无密文存在的部署）；configPath 是运行配置的真实来源路径，
+// 供持久化使用（禁止回到硬编码 "config.yaml"）。
+func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store, loginLimiter *auth.LoginRateLimiter, secretMgr *secrets.Manager, configPath string) (*AdminHandler, error) {
 	tmpl := template.New("admin").Funcs(template.FuncMap{
 		"formatDate":     formatDate,
 		"formatInt":      formatInt,
@@ -152,6 +158,8 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 		templates:     tmpl,
 		sessionStore:  sessionStore,
 		loginLimiter:  loginLimiter,
+		secretMgr:     secretMgr,
+		configPath:    configPath,
 		wsUpgrader: &websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -436,6 +444,50 @@ func (h *AdminHandler) ListClients(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// keyOpError: Admin key 操作失败的受限错误——消息面向运维，绝不携带 key 材料。
+type keyOpError struct {
+	message string
+	status  int
+}
+
+// encryptClientKey: 把表单明文 key 转为该 client 的 AEAD 信封（P1-03C3）。
+// Master Key 未配置 → 明确拒绝（明文保存被禁止，无明文 fallback）；加密失败 → 通用错误。
+func (h *AdminHandler) encryptClientKey(clientID, plaintext string) (string, *keyOpError) {
+	if h.secretMgr == nil {
+		return "", &keyOpError{
+			message: "master key not configured: refusing to store provider key in plaintext (set AIGATEWAY_MASTER_KEY or AIGATEWAY_MASTER_KEY_FILE)",
+			status:  http.StatusServiceUnavailable,
+		}
+	}
+	env, err := h.secretMgr.EncryptClientBackendKey(clientID, []byte(plaintext))
+	if err != nil {
+		log.Printf("[ADMIN] encrypt client provider key failed: %v", err)
+		return "", &keyOpError{message: "failed to encrypt provider key", status: http.StatusInternalServerError}
+	}
+	return env, nil
+}
+
+// decryptClientKey: client Provider Key 的 point-of-use 解密。
+// 密文无 Master Key / legacy 明文不变量破坏 → 受限错误，绝不回退明文。
+func (h *AdminHandler) decryptClientKey(client *models.Client) (string, *keyOpError) {
+	switch {
+	case client.BackendAPIKeyEncrypted != "":
+		if h.secretMgr == nil {
+			return "", &keyOpError{message: "client provider key is encrypted but no master key is configured", status: http.StatusServiceUnavailable}
+		}
+		pt, err := h.secretMgr.DecryptClientBackendKey(client.ID, client.BackendAPIKeyEncrypted)
+		if err != nil {
+			log.Printf("[ADMIN] decrypt client %s provider key failed: %v", client.ID, err)
+			return "", &keyOpError{message: "client provider key could not be decrypted", status: http.StatusInternalServerError}
+		}
+		return string(pt), nil
+	case client.BackendAPIKey != "":
+		return "", &keyOpError{message: "client has a legacy plaintext provider key; run -migrate-provider-secrets", status: http.StatusConflict}
+	default:
+		return "", nil // 无 per-client key：调用方走全局回退
+	}
+}
+
 func (h *AdminHandler) CreateClient(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 	name := r.Form.Get("name")
@@ -463,18 +515,32 @@ func (h *AdminHandler) CreateClient(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client, apiKey, err := h.clientService.CreateClient(name, description, keyType, keyPrefix, h.cfg)
-	if err == nil {
-		client.Backend = backend
-		client.BackendAPIKey = backendAPIKey
-		client.BackendBaseURL = backendBaseURL
-		client.BackendDefaultModel = backendDefaultModel
-		client.SystemPrompt = systemPrompt
-		client.ToolMode = toolMode
-		client.FallbackModels = fallbackModels
-		client.ServerTools = serverTools
-		h.clientService.UpdateClient(client)
-	}
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	client.Backend = backend
+	client.BackendBaseURL = backendBaseURL
+	client.BackendDefaultModel = backendDefaultModel
+	client.SystemPrompt = systemPrompt
+	client.ToolMode = toolMode
+	client.FallbackModels = fallbackModels
+	client.ServerTools = serverTools
+
+	// SEC-002（P1-03C3）：client Provider Key 只存密文。表单明文即刻消费为信封，
+	// legacy 字段保持空——绝不写 client.BackendAPIKey。
+	if backendAPIKey != "" {
+		env, encErr := h.encryptClientKey(client.ID, backendAPIKey)
+		if encErr != nil {
+			_ = h.clientService.DeleteClient(client.ID) // 补偿：不留半创建 client
+			http.Error(w, encErr.message, encErr.status)
+			return
+		}
+		client.BackendAPIKeyEncrypted = env
+	}
+	if err := h.clientService.UpdateClient(client); err != nil {
+		_ = h.clientService.DeleteClient(client.ID) // 补偿：不留半创建 client
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -522,6 +588,7 @@ func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 	isActive := r.Form.Get("is_active") == "on"
 	backend := r.Form.Get("backend")
 	backendAPIKey := r.Form.Get("backend_api_key")
+	clearBackendKey := r.Form.Get("clear_backend_api_key") == "on"
 	backendBaseURL := r.Form.Get("backend_base_url")
 	backendDefaultModel := r.Form.Get("backend_default_model")
 	systemPrompt := r.Form.Get("system_prompt")
@@ -548,7 +615,6 @@ func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 	client.Description = description
 	client.IsActive = isActive
 	client.Backend = backend
-	client.BackendAPIKey = backendAPIKey
 	client.BackendBaseURL = backendBaseURL
 	client.BackendDefaultModel = backendDefaultModel
 	client.SystemPrompt = systemPrompt
@@ -565,6 +631,25 @@ func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 	client.MaxOutputTokens = maxOutputTokens
 	if modelsList != "" {
 		client.BackendModels = modelsList
+	}
+
+	// SEC-002（P1-03C3）key 更新语义（取代旧 "blank=清空" 的危险默认）：
+	//   填入新 key            → 加密替换 BackendAPIKeyEncrypted（legacy 字段保持空）
+	//   blank 且未勾选清除    → 保留现有 key（密文/legacy 都不动——编辑表单不再回填明文，
+	//                            旧行为会在此把用户想保留的 key 静默清掉）
+	//   clear_backend_api_key → 显式清除
+	switch {
+	case clearBackendKey:
+		client.BackendAPIKey = ""
+		client.BackendAPIKeyEncrypted = ""
+	case backendAPIKey != "":
+		env, kerr := h.encryptClientKey(client.ID, backendAPIKey)
+		if kerr != nil {
+			http.Error(w, kerr.message, kerr.status)
+			return
+		}
+		client.BackendAPIKeyEncrypted = env
+		client.BackendAPIKey = ""
 	}
 
 	err = h.clientService.UpdateClient(client)
@@ -657,7 +742,14 @@ func (h *AdminHandler) UpdateServerTools(w http.ResponseWriter, r *http.Request)
 	h.cfg.ServerTools.Tools = enabledTools
 	h.cfg.ServerTools.Enabled = len(enabledTools) > 0
 
-	if err := config.SaveConfig(h.cfg, "config.yaml"); err != nil {
+	// P1-03C3：持久化必须写真实配置来源路径（废除硬编码 "config.yaml"——
+	// 那会在配置不在 CWD 时分裂出第二份配置，并把运行态 cfg 落到错误位置）。
+	// h.cfg 为持久化视图：Provider 密钥只含信封，不含运行态明文。
+	if h.configPath == "" {
+		http.Error(w, "config source path unknown; refusing to persist", http.StatusInternalServerError)
+		return
+	}
+	if err := config.SaveConfig(h.cfg, h.configPath); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -710,6 +802,11 @@ func (h *AdminHandler) ShowSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// UpdateSettings: DEAD CODE——自 fork baseline 起未注册任何路由（RegisterRoutes 不挂载
+// /admin/settings，settings.html 不可达）。按 P1-03C3 任务卡决定：文档化而非为其扩展 UI。
+// ⚠ 不得在接入 P1-03C3 key 语义（blank 保留 / 非空加密替换 / 显式清除）之前复活：
+// 现有实现直接把表单明文写进 cfg.Providers[*].APIKey 并 config.Save(h.cfg)，
+// 属 SEC-002 明文持久化模式。若未来启用，必须重写为 SetupHandler 式 candidate 原子保存。
 func (h *AdminHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 
@@ -813,9 +910,17 @@ func (h *AdminHandler) TestClientConnection(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// SEC-002（P1-03C3）：per-client key 走 point-of-use 解密（明文仅在本次请求内）
+	key, kerr := h.decryptClientKey(client)
+	if kerr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"success":false,"message":"%s"}`, kerr.message)
+		return
+	}
+
 	pcfg := config.ProviderConfig{
 		Type:           client.Backend,
-		APIKey:         client.BackendAPIKey,
+		APIKey:         key,
 		BaseURL:        client.BackendBaseURL,
 		DefaultModel:   client.BackendDefaultModel,
 		TimeoutSeconds: 30,
@@ -849,9 +954,17 @@ func (h *AdminHandler) FetchClientModels(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// SEC-002（P1-03C3）：per-client key 走 point-of-use 解密（明文仅在本次请求内）
+	key, kerr := h.decryptClientKey(client)
+	if kerr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"success":false,"error":"%s"}`, kerr.message)
+		return
+	}
+
 	pcfg := config.ProviderConfig{
 		Type:           client.Backend,
-		APIKey:         client.BackendAPIKey,
+		APIKey:         key,
 		BaseURL:        client.BackendBaseURL,
 		DefaultModel:   client.BackendDefaultModel,
 		TimeoutSeconds: 30,
@@ -1869,8 +1982,13 @@ var adminTemplates = []byte(`
                     </div>
                     <div class="mb-6">
                         <label class="block text-gray-400 text-sm font-medium mb-2">Backend API Key</label>
-                        <input type="password" name="backend_api_key" value="{{(index .Data "Client").BackendAPIKey}}" placeholder="Leave empty to use global config" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
-                        <p class="text-gray-500 text-xs mt-1">Per-client API key. If empty, uses global provider config.</p>
+                        {{if (index .Data "Client").HasBackendKey}}<p class="text-green-400 text-xs mb-1">Provider key configured</p>{{else}}<p class="text-gray-500 text-xs mb-1">No per-client key — using global provider config.</p>{{end}}
+                        <input type="password" name="backend_api_key" value="" placeholder="Enter a new key to replace (leave empty to keep current)" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <label class="flex items-center text-gray-300 mt-2">
+                            <input type="checkbox" name="clear_backend_api_key" class="w-4 h-4 rounded bg-gray-900 border-gray-600 text-red-600 focus:ring-red-500">
+                            <span class="ml-2">Clear stored provider key (revert to global config)</span>
+                        </label>
+                        <p class="text-gray-500 text-xs mt-1">Stored keys are encrypted at rest and never re-displayed. Leave empty to keep the current key.</p>
                     </div>
                     <div class="mb-6">
                         <label class="block text-gray-400 text-sm font-medium mb-2">Base URL Override</label>

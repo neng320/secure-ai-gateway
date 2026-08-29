@@ -2,16 +2,18 @@ package handlers
 
 // P1-03A · Provider Key Flow Characterization Tests
 //
-// 固化当前（tag secure-gateway-p1-admin-security.3 时点）Provider Secret 的真实行为。
+// 固化 tag secure-gateway-p1-admin-security.3 时点的 Provider Secret 行为。
 //
 // 标记约定：
-//   [CURRENT]                     —— 当前行为，SEC-002 修复后按设计决定保留或调整
-//   [KNOWN-VULN: SEC-002]         —— 明文暴露事实，AEAD 落地后必须翻红并改写
+//   [CURRENT]                     —— 当时行为，SEC-002 修复后按设计决定保留或调整
+//   [KNOWN-VULN: SEC-002]         —— 明文暴露事实，AEAD 落地后翻红并改写
+//   [P1-03C3 安全回归]             —— 反转后的安全行为回归（原文保留在注释里）
 //
 // Canary 约束：仅使用明显的测试标记串，绝不使用疑似真实 Key 的字符串
 //（避免 secret scanner 误报）。禁止使用真实 API Key 作为测试数据。
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +27,7 @@ import (
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
+	"ai-gateway/internal/secrets"
 	"ai-gateway/internal/services"
 
 	mw "ai-gateway/internal/middleware"
@@ -38,7 +41,22 @@ const (
 	canaryGlobal = "P103A_CANARY_GLOBAL_PROVIDER_SECRET"
 	canaryClient = "P103A_CANARY_CLIENT_PROVIDER_SECRET"
 	canaryGemini = "P103A_CANARY_GEMINI_PROVIDER_SECRET"
+	// kfMasterKeyB64: 本文件专用的测试 Master Key（32 字节，非真实凭证）
+	kfMasterKeyB64 = "GROnfCSaRXSkQ9VpR8kjD9Xc1vLGZ0zGKivSgNzTuw0="
 )
+
+func mustKFCipher(t *testing.T) *secrets.AESGCMCipher {
+	t.Helper()
+	key, err := base64.StdEncoding.DecodeString(kfMasterKeyB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := secrets.NewAESGCMCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
 
 // keyFlowEnv: 密钥流测试环境（本地 upstream 捕获 Authorization，不出外网）
 type keyFlowEnv struct {
@@ -47,6 +65,7 @@ type keyFlowEnv struct {
 	clientService *services.ClientService
 	limiter       *auth.LoginRateLimiter
 	store         *auth.SQLiteStore
+	manager       *secrets.Manager
 	openai        http.Handler // /v1/* 路由（含 client key 认证中间件）
 	admin         http.Handler // /admin/* 路由（含 RequireAuth/CSRF）
 	upstreamURL   string
@@ -101,15 +120,16 @@ func newKeyFlowEnv(t *testing.T, globalAPIKey string) *keyFlowEnv {
 	dashboardHub := services.NewDashboardHub(statsService)
 	store := auth.NewSQLiteStore(db)
 	limiter := auth.NewLoginRateLimiter()
+	manager := secrets.NewManager(mustKFCipher(t))
 
 	// Public API 路由（与 buildAPIRouter 同构）
-	openaiHandler := NewOpenAIHandler(geminiService, clientService, statsService, registry, toolService)
+	openaiHandler := NewOpenAIHandler(geminiService, clientService, statsService, registry, toolService, manager)
 	apiMux := chi.NewRouter()
 	apiMux.Use(mw.NewAuthMiddleware(clientService).Handler)
 	openaiHandler.RegisterRoutes(apiMux)
 
 	// Admin 路由（与 buildAdminRouter 同构）
-	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, store, limiter)
+	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, store, limiter, manager, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +138,7 @@ func newKeyFlowEnv(t *testing.T, globalAPIKey string) *keyFlowEnv {
 
 	return &keyFlowEnv{
 		cfg: cfg, db: db, clientService: clientService, limiter: limiter, store: store,
-		openai: apiMux, admin: adminMux, upstreamURL: upstream.URL, upstreamAuths: &auths,
+		manager: manager, openai: apiMux, admin: adminMux, upstreamURL: upstream.URL, upstreamAuths: &auths,
 	}
 }
 
@@ -144,16 +164,23 @@ func (e *keyFlowEnv) doChat(t *testing.T, clientAPIKey, model string) {
 	}
 }
 
-// createClientWithKey: 建一个 backend=openai 的 client
+// createClientWithKey: 建一个 backend=openai 的 client。
+// P1-03C3 起 key 只存密文（与 Admin CreateClient 同语义）：明文参数即刻转为信封。
 func (e *keyFlowEnv) createClientWithKey(t *testing.T, backendAPIKey string) *models.Client {
 	t.Helper()
 	client, _, err := e.clientService.CreateClient("kf", "", "openai", "sk-", e.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.Backend = "openai" // service 层 CreateClient 不设 Backend（DB 默认 gemini），显式指定
-	client.BackendAPIKey = backendAPIKey
+	client.Backend = "openai"                     // service 层 CreateClient 不设 Backend（DB 默认 gemini），显式指定
 	client.BackendBaseURL = e.upstreamURL + "/v1" // openai_compat 约定：base 已含 /v1
+	if backendAPIKey != "" {
+		env, encErr := e.manager.EncryptClientBackendKey(client.ID, []byte(backendAPIKey))
+		if encErr != nil {
+			t.Fatal(encErr)
+		}
+		client.BackendAPIKeyEncrypted = env
+	}
 	if err := e.clientService.UpdateClient(client); err != nil {
 		t.Fatal(err)
 	}
@@ -161,14 +188,22 @@ func (e *keyFlowEnv) createClientWithKey(t *testing.T, backendAPIKey string) *mo
 }
 
 // ---------------------------------------------------------------------------
-// 1) [KNOWN-VULN: SEC-002] 全局 Provider Key 明文落 YAML（保存 + 回读双确认）
+//  1. [P1-03C3 安全回归]（反转自 KNOWN-VULN: SEC-002 "全局 Provider Key 明文落 YAML"）
+//     持久化层保存 AEAD 信封：YAML 不含明文；Load 回读后 legacy 字段为空、信封保留
+//     （运行态明文仅经 cmd/server buildRuntimeConfig 进入一次性副本，绝不回流持久化视图）。
+//
 // ---------------------------------------------------------------------------
 func TestP103A_GlobalKey_PlaintextInSavedYAML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	cfg := minimalSetupCfg()
+	mgr := secrets.NewManager(mustKFCipher(t))
+	env, err := mgr.EncryptGlobalProviderKey("openai", []byte(canaryGlobal))
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg.Providers = map[string]config.ProviderConfig{
-		"openai": {Type: "openai", APIKey: canaryGlobal, BaseURL: "https://api.openai.example/v1"},
+		"openai": {Type: "openai", APIKeyEncrypted: env, BaseURL: "https://api.openai.example/v1"},
 	}
 
 	if err := config.SaveConfig(cfg, path); err != nil {
@@ -178,36 +213,54 @@ func TestP103A_GlobalKey_PlaintextInSavedYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), canaryGlobal) {
-		t.Fatal("[CURRENT BEHAVIOR CHANGED] YAML 中未找到明文 canary——若 AEAD 已落地，请改写为密文形态断言")
+	saved := string(raw)
+	if strings.Contains(saved, canaryGlobal) {
+		t.Fatal("[安全回归失败] YAML 中出现明文 canary")
 	}
-	t.Log("[KNOWN-VULN: SEC-002] 确认：全局 Provider Key 明文写入 YAML")
+	if !strings.Contains(saved, "api_key_encrypted: "+env) {
+		t.Fatalf("[安全回归失败] YAML 未按信封形态保存 api_key_encrypted:\n%s", saved)
+	}
 
-	// 回读：运行时配置同样持有明文（Runtime plaintext boundary）
+	// 回读：持久化视图 legacy 为空、信封保留
 	cfg2, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg2.Providers["openai"].APIKey != canaryGlobal {
-		t.Fatal("回读后 APIKey 应为明文 canary")
+	p := cfg2.Providers["openai"]
+	if p.APIKey != "" {
+		t.Fatalf("[安全回归失败] 回读后 legacy APIKey 应为空，实际 %q", p.APIKey)
+	}
+	if p.APIKeyEncrypted != env {
+		t.Fatalf("[安全回归失败] 回读后信封不符: %q", p.APIKeyEncrypted)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// 2) [KNOWN-VULN: SEC-002] Client BackendAPIKey 明文落 SQLite
+//  2. [P1-03C3 安全回归]（反转自 KNOWN-VULN: SEC-002 "Client BackendAPIKey 明文落 SQLite"）
+//     legacy 列保持空；密文在 additive encrypted 列且解密可还原原明文。
+//
 // ---------------------------------------------------------------------------
 func TestP103A_ClientKey_PlaintextInSQLite(t *testing.T) {
 	env := newKeyFlowEnv(t, canaryGlobal)
 	client := env.createClientWithKey(t, canaryClient)
 
-	var stored string
-	if err := env.db.Raw("SELECT backend_api_key FROM clients WHERE id = ?", client.ID).Scan(&stored).Error; err != nil {
+	var row struct {
+		Legacy    string
+		Encrypted string
+	}
+	if err := env.db.Raw("SELECT backend_api_key AS legacy, backend_api_key_encrypted AS encrypted FROM clients WHERE id = ?", client.ID).Scan(&row).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stored != canaryClient {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] backend_api_key 不再是明文（%q）——若 AEAD 已落地，请改写为密文形态断言", stored)
+	if row.Legacy != "" {
+		t.Fatalf("[安全回归失败] legacy backend_api_key 应为空，实际 %q", row.Legacy)
 	}
-	t.Log("[KNOWN-VULN: SEC-002] 确认：Client BackendAPIKey 明文存于 SQLite")
+	if !secrets.IsEncryptedEnvelope(row.Encrypted) {
+		t.Fatalf("[安全回归失败] backend_api_key_encrypted 应为 enc:v1 信封，实际 %q", row.Encrypted)
+	}
+	pt, err := env.manager.DecryptClientBackendKey(client.ID, row.Encrypted)
+	if err != nil || string(pt) != canaryClient {
+		t.Fatalf("[安全回归失败] 解密应还原原明文，实际 %q err=%v", string(pt), err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +278,8 @@ func TestP103A_KeyPrecedence_ClientKeyWins_ThenGlobalFallback(t *testing.T) {
 		t.Fatalf("[优先级回归失败] 期望 client key，实际 %q", got)
 	}
 
-	// b) client key 清空 + BaseURL 保留 → 全局 key 回退
+	// b) client key 清空（encrypted 字段清空，BaseURL 保留）→ 全局 key 回退
+	client.BackendAPIKeyEncrypted = ""
 	client.BackendAPIKey = ""
 	if err := env.clientService.UpdateClient(client); err != nil {
 		t.Fatal(err)
@@ -262,45 +316,89 @@ func clientAPIKeyOf(t *testing.T, env *keyFlowEnv, client *models.Client) string
 }
 
 // ---------------------------------------------------------------------------
-//  4. [CURRENT] Admin 写入语义：Update 表单 blank key = 清空（无条件覆盖）
-//     （编辑表单靠 value 预填回传实现"保留"，API 层无保留语义——迁移设计必须显式决定）
+//  4. [P1-03C3 安全回归]（反转自 [CURRENT] "Update 表单 blank key = 清空"）
+//     决策后的新语义：
+//     blank key            → 保留现有 key（表单不再回填明文，旧行为会静默清掉）
+//     填入新 key           → 加密替换（解密 == 新 key，legacy 保持空）
+//     clear_backend_api_key → 显式清除
 //
 // ---------------------------------------------------------------------------
-func TestP103A_UpdateClient_BlankKeyClears(t *testing.T) {
+func TestP103A_Fixed_UpdateClient_KeySemantics(t *testing.T) {
 	env := newKeyFlowEnv(t, canaryGlobal)
 	client := env.createClientWithKey(t, canaryClient)
 	clientToken := adminSessionToken(t, env)
+	originalEnvelope := client.BackendAPIKeyEncrypted
 
-	form := url.Values{
-		"name":                  {client.Name},
-		"backend":               {"openai"},
-		"backend_api_key":       {""}, // 留空
-		"backend_base_url":      {env.upstreamURL},
-		"backend_default_model": {"test-model"},
+	postUpdate := func(extra map[string]string) *http.Response {
+		form := url.Values{
+			"name":                  {client.Name},
+			"backend":               {"openai"},
+			"backend_base_url":      {env.upstreamURL + "/v1"},
+			"backend_default_model": {"test-model"},
+		}
+		for k, v := range extra {
+			form.Set(k, v)
+		}
+		req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/update", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: clientToken})
+		req.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, clientToken))
+		w := httptest.NewRecorder()
+		env.admin.ServeHTTP(w, req)
+		return w.Result()
 	}
-	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/update", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: clientToken})
-	req.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, clientToken))
-	w := httptest.NewRecorder()
-	env.admin.ServeHTTP(w, req)
-	if w.Result().StatusCode == http.StatusForbidden {
+	reload := func(t *testing.T) *models.Client {
+		t.Helper()
+		c, err := env.clientService.GetClientByID(client.ID)
+		if err != nil || c == nil {
+			t.Fatal("client 不存在")
+		}
+		return c
+	}
+
+	// a) blank → 保留原信封
+	if resp := postUpdate(map[string]string{"backend_api_key": ""}); resp.StatusCode == http.StatusForbidden {
 		t.Fatal("测试自身问题：合法 CSRF 被拒")
 	}
+	c := reload(t)
+	if c.BackendAPIKeyEncrypted != originalEnvelope {
+		t.Fatalf("[安全回归失败] blank update 应保留信封，实际 %q", c.BackendAPIKeyEncrypted)
+	}
+	if c.BackendAPIKey != "" {
+		t.Fatalf("[安全回归失败] legacy 字段应保持空，实际 %q", c.BackendAPIKey)
+	}
 
-	reloaded, err := env.clientService.GetClientByID(client.ID)
-	if err != nil || reloaded == nil {
-		t.Fatal("client 不存在")
+	// b) 填入新 key → 加密替换，解密 == 新 key
+	rotated := canaryClient + "-ROTATED"
+	if resp := postUpdate(map[string]string{"backend_api_key": rotated}); resp.StatusCode != http.StatusFound {
+		t.Fatalf("替换 key 应 302，实际 %d", resp.StatusCode)
 	}
-	if reloaded.BackendAPIKey != "" {
-		t.Fatalf("[行为变化] blank key 不再清空（实际 %q）——AEAD 迁移设计时必须显式决定语义并更新文档", reloaded.BackendAPIKey)
+	c = reload(t)
+	if c.BackendAPIKeyEncrypted == "" || c.BackendAPIKeyEncrypted == originalEnvelope {
+		t.Fatalf("[安全回归失败] 新 key 应产生新信封，实际 %q", c.BackendAPIKeyEncrypted)
 	}
-	t.Log("[CURRENT] 确认：Update 表单 blank key = 清空（UI 靠 value 预填回传实现保留）")
+	pt, err := env.manager.DecryptClientBackendKey(client.ID, c.BackendAPIKeyEncrypted)
+	if err != nil || string(pt) != rotated {
+		t.Fatalf("[安全回归失败] 新信封应解密为新 key，实际 %q err=%v", string(pt), err)
+	}
+	if c.BackendAPIKey != "" {
+		t.Fatalf("[安全回归失败] 替换后 legacy 字段应保持空，实际 %q", c.BackendAPIKey)
+	}
+
+	// c) clear_backend_api_key=on → 显式清除
+	if resp := postUpdate(map[string]string{"clear_backend_api_key": "on"}); resp.StatusCode != http.StatusFound {
+		t.Fatalf("显式清除应 302，实际 %d", resp.StatusCode)
+	}
+	c = reload(t)
+	if c.BackendAPIKeyEncrypted != "" || c.BackendAPIKey != "" {
+		t.Fatalf("[安全回归失败] 显式清除后两字段应为空，实际 legacy=%q encrypted=%q", c.BackendAPIKey, c.BackendAPIKeyEncrypted)
+	}
 }
 
 // ---------------------------------------------------------------------------
-//  5. [KNOWN-VULN: SEC-002] 编辑表单把明文 Provider Key 回填进 HTML
-//     （type=password 只遮显示，value 属性源码可见）
+//  5. [P1-03C3 安全回归]（反转自 KNOWN-VULN: SEC-002 "编辑表单把明文 Provider Key 回填进 HTML"）
+//     要求四重：无明文、无信封（enc:v1:）、有"已配置"指示、有显式清除复选框，
+//     且 backend_api_key 输入框 value 恒为空。
 //
 // ---------------------------------------------------------------------------
 func TestP103A_ClientKey_ReDisplayedInEditFormHTML(t *testing.T) {
@@ -316,10 +414,21 @@ func TestP103A_ClientKey_ReDisplayedInEditFormHTML(t *testing.T) {
 		t.Fatalf("ShowClient 期望 200，实际 %d", w.Result().StatusCode)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, canaryClient) {
-		t.Fatal("[CURRENT BEHAVIOR CHANGED] 编辑页不再回显明文 key——若已做遮罩，请改写为遮罩断言")
+	if strings.Contains(body, canaryClient) {
+		t.Fatal("[安全回归失败] 编辑页回显了明文 Provider Key")
 	}
-	t.Log("[KNOWN-VULN: SEC-002] 确认：编辑表单 value 属性回填明文 Provider Key")
+	if strings.Contains(body, "enc:v1:") {
+		t.Fatal("[安全回归失败] 编辑页回显了密文信封（信封同样不得进入 HTML）")
+	}
+	if !strings.Contains(body, "Provider key configured") {
+		t.Fatal("[安全回归失败] 已配置状态指示缺失")
+	}
+	if !strings.Contains(body, `name="clear_backend_api_key"`) {
+		t.Fatal("[安全回归失败] 显式清除复选框缺失")
+	}
+	if !strings.Contains(body, `name="backend_api_key" value=""`) {
+		t.Fatal("[安全回归失败] backend_api_key 输入框应为空值（不回填任何材料）")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +475,11 @@ func TestP103A_Gemini_TestConnection_EmptyKeyClearMessage(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 8) [CURRENT] Config Save 往返：明文进明文出（未来加密配置设计的硬约束）
+//  8. [CURRENT] Config Save 机制：struct 里有什么就写什么（P1-03C3 机制保持不变）
+//     该机制正是"运行时/持久化双视图"必须存在的原因：系统级保障是
+//     明文只进 buildRuntimeConfig 的一次性副本，持久化 cfg 永不含运行态明文
+//     （由 cmd/server Migration Simulation Gate 的 persistence-isolation 用例回归）。
+//
 // ---------------------------------------------------------------------------
 func TestP103A_GlobalKey_SaveRoundTrip_PlaintextOut(t *testing.T) {
 	dir := t.TempDir()
@@ -378,28 +491,29 @@ func TestP103A_GlobalKey_SaveRoundTrip_PlaintextOut(t *testing.T) {
 	if err := config.SaveConfig(cfg, path); err != nil {
 		t.Fatal(err)
 	}
-	// 模拟运行态被解密后的场景：运行时字段是明文 → Save 会把明文写回磁盘
+	// 机制确认：把明文放回 struct 再 Save，就会落盘——所以运行态明文绝不允许进入持久化 struct
 	cfg.Providers["openai"] = config.ProviderConfig{Type: "openai", APIKey: canaryGlobal + "-RUNTIME"}
 	if err := config.SaveConfig(cfg, path); err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(path)
 	if !strings.Contains(string(raw), canaryGlobal+"-RUNTIME") {
-		t.Fatal("[行为变化] SaveConfig 不再直写明文——加密配置设计已改变保存路径，更新本约束")
+		t.Fatal("[机制变化] SaveConfig 不再直写 struct 中的明文——若如此，更新本机制说明")
 	}
-	t.Log("[设计约束确认] 运行态明文 + SaveConfig = 明文落盘；AEAD 迁移必须改造保存路径")
+	t.Log("[设计约束确认] 持久化隔离依赖双视图纪律：明文只存在于 runtimeCfg 副本")
 }
 
 // ---------------------------------------------------------------------------
-// 9) [CURRENT] json:"-" 生效：BackendAPIKey 不进 API JSON 响应
+// 9) [CURRENT] json:"-" 生效：legacy 与 encrypted 两个 key 字段都不进 API JSON 响应
 // ---------------------------------------------------------------------------
 func TestP103A_ClientKey_NotInJSONMarshaling(t *testing.T) {
-	c := models.Client{BackendAPIKey: canaryClient}
+	c := models.Client{BackendAPIKey: canaryClient, BackendAPIKeyEncrypted: "enc:v1:deadbeef:QUJDREVGRw"}
 	b, _ := json.Marshal(c)
-	if strings.Contains(string(b), canaryClient) {
-		t.Fatal("[行为变化] BackendAPIKey 出现在 JSON 序列化中——回归检查 json:\"-\" 标注")
+	out := string(b)
+	if strings.Contains(out, canaryClient) || strings.Contains(out, "enc:v1:") {
+		t.Fatal("[行为变化] key 字段出现在 JSON 序列化中——回归检查 json:\"-\" 标注")
 	}
-	t.Log("[CURRENT] 确认：json:\"-\" 生效，API JSON 响应不含 BackendAPIKey")
+	t.Log("[CURRENT] 确认：json:\"-\" 生效，API JSON 响应不含 legacy/encrypted key 字段")
 }
 
 // ---------------------------------------------------------------------------

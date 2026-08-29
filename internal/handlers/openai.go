@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
+	"ai-gateway/internal/secrets"
 	"ai-gateway/internal/services"
 
 	"github.com/go-chi/chi/v5"
@@ -27,10 +29,11 @@ type OpenAIHandler struct {
 	statsService  *services.StatsService
 	registry      *providers.Registry
 	toolService   *services.ToolService
+	secretMgr     *secrets.Manager
 }
 
-func NewOpenAIHandler(geminiService *services.GeminiService, clientService *services.ClientService, statsService *services.StatsService, registry *providers.Registry, toolService *services.ToolService) *OpenAIHandler {
-	return &OpenAIHandler{geminiService: geminiService, clientService: clientService, statsService: statsService, registry: registry, toolService: toolService}
+func NewOpenAIHandler(geminiService *services.GeminiService, clientService *services.ClientService, statsService *services.StatsService, registry *providers.Registry, toolService *services.ToolService, secretMgr *secrets.Manager) *OpenAIHandler {
+	return &OpenAIHandler{geminiService: geminiService, clientService: clientService, statsService: statsService, registry: registry, toolService: toolService, secretMgr: secretMgr}
 }
 
 func (h *OpenAIHandler) RegisterRoutes(r chi.Router) {
@@ -111,19 +114,38 @@ func mapUpstreamStatusToHTTP(geminiStatus int) int {
 	}
 }
 
+// resolveProvider: 组装该 client 的上游 provider。
+//
+// SEC-002（P1-03C3）key 语义：
+//   - client 密文存在 → 经 SecretManager point-of-use 解密（明文仅存在于本次请求的 provider 实例内）
+//   - client legacy 明文存在 → 不变量破坏（启动 preflight 已拒绝该状态）→ fail-closed，绝不使用明文 fallback
+//   - client 无 key → 保留既定全局回退（runtime config 的 provider），或 registry 全局 provider
 func (h *OpenAIHandler) resolveProvider(client *models.Client) (providers.Provider, error) {
 	backend := client.Backend
 	if backend == "" {
 		backend = "gemini"
 	}
 
-	if client.BackendAPIKey != "" || client.BackendBaseURL != "" {
+	hasOverride := client.BackendBaseURL != "" || client.BackendAPIKey != "" || client.BackendAPIKeyEncrypted != ""
+	if hasOverride {
 		cfg := config.ProviderConfig{
 			Type:           backend,
-			APIKey:         client.BackendAPIKey,
 			BaseURL:        client.BackendBaseURL,
 			DefaultModel:   client.BackendDefaultModel,
 			TimeoutSeconds: 120,
+		}
+		switch {
+		case client.BackendAPIKeyEncrypted != "":
+			if h.secretMgr == nil {
+				return nil, errors.New("client has an encrypted provider key but no master key is configured")
+			}
+			pt, err := h.secretMgr.DecryptClientBackendKey(client.ID, client.BackendAPIKeyEncrypted)
+			if err != nil {
+				return nil, fmt.Errorf("client provider key unavailable: %w", err)
+			}
+			cfg.APIKey = string(pt)
+		case client.BackendAPIKey != "":
+			return nil, errors.New("client has a legacy plaintext provider key; run -migrate-provider-secrets")
 		}
 		if cfg.APIKey == "" {
 			if globalP := h.geminiService.GetConfig().GetProvider(backend); globalP != nil {
