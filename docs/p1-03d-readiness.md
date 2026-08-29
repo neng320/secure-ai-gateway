@@ -1,3 +1,31 @@
+# P1-03D0.1 · WSL No-Legacy Confirmation（2026-08-29 追加）
+
+> 复核范围扩展到开发环境的 Linux/WSL 侧。**只读**：仅 ls/find/ps/ss，无任何写入。
+> （副作用说明：枚举会使已停止的 distro 短暂启动，检查完成后已 `wsl -t` 恢复停止态。）
+
+| 检查项 | Ubuntu（默认 distro） | docker-desktop（utility distro） |
+|---|---|---|
+| `/etc/ai-gateway` `/opt/ai-gateway` `/var/lib/ai-gateway` | 全部 absent | absent |
+| `/home` `/root` 下 aigateway/secure-ai-gateway 项目目录（maxdepth 3） | 0 个 | — |
+| `gateway.db` / `-wal` / `-shm` / `-journal`（/home /root /opt /etc /var/lib /srv /usr/local，maxdepth 6） | **0 个** | 0 个（/ maxdepth 4 spot check） |
+| 本项目 config.yaml（同范围） | **0 个** | 0 个 |
+| gateway 进程 | 0（distro 本处于 Stopped 态——停止的 distro 内不可能有运行进程） | 0 |
+| 8090/8091/9090 监听 | 0 | — |
+
+结合 P1-03D0 的 Windows 侧结论，正式记录：
+
+```text
+P1-03D Real Legacy Migration = NOT REQUIRED
+Reason: no operator legacy secret storage ever existed.
+        (0 deployed instance, 0 gateway.db, 0 legacy/encrypted provider secret anywhere on dev host + WSL)
+```
+
+迁移引擎（`-migrate-provider-secrets`）与其 C2/C2.1 Gate 作为**面向未来旧实例升级的受测兼容能力保留**，不因本次判定删除。
+P1-03D1 "Real Migration" 不再等待一个不存在的 DB；后续路径改为：
+**D1A Secure Global Key Provisioning → D1B Fresh-Install Secret-at-Rest Gate → SEC-002 Closure Review**（见 §10/§13）。
+
+---
+
 # P1-03D0 · Real Migration Readiness / Read-Only Preflight Report
 
 > 生成时间：2026-08-29（本机时区）
