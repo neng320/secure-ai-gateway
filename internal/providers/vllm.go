@@ -276,7 +276,7 @@ func (p *VLLMProvider) ListModels() ([]string, error) {
 		log.Printf("[vllm ListModels] Failed to read response body: %v", err)
 		return nil, err
 	}
-	log.Printf("[vllm ListModels] Response body: %s", string(body))
+	log.Printf("[vllm ListModels] Response bytes=%d", len(body))
 
 	var response struct {
 		Data []struct {

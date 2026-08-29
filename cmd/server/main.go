@@ -149,6 +149,10 @@ func main() {
 		log.Fatalf("request_body_capture: %v", err)
 	}
 	captureStore := capture.NewStore(captureSettings.Enabled, captureSettings.ExpiresAt, captureSettings.MaxBytes, captureSettings.MaxEntries)
+	if cfg.Logging.RequestBodyCapture.Enabled && !captureSettings.Enabled {
+		// 非敏感 warning：请求过启用但已失效（过期）——正文不会被捕获
+		log.Printf("request_body_capture requested but stays disabled (expired); no request bodies are captured")
+	}
 
 	// P1-03C3 运行时视图：持久化 cfg 保持 envelope-only，解密明文只进入 runtimeCfg
 	runtimeCfg, err := buildRuntimeConfig(cfg, secretMgr)

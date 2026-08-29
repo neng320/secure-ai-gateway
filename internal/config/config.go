@@ -168,7 +168,9 @@ func (l LoggingConfig) ResolveRequestBodyCapture(now time.Time) (CaptureSettings
 		return CaptureSettings{}, fmt.Errorf("request_body_capture.expires_at is not valid RFC3339")
 	}
 	if !exp.After(now) {
-		return CaptureSettings{}, fmt.Errorf("request_body_capture.expires_at is not in the future (capture stays disabled)")
+		// P1-04.1（原 P1-04C 契约）：服务在 expiry 之后启动 → 安全视为 disabled，
+		// 非 fatal（避免一次临时诊断配置过期造成服务不可用）。malformed/>24h 仍 fail-closed。
+		return CaptureSettings{}, nil
 	}
 	if exp.Sub(now) > CaptureMaxWindow {
 		return CaptureSettings{}, fmt.Errorf("request_body_capture window exceeds hard maximum of 24h")

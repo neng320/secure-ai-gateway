@@ -139,3 +139,20 @@ func TestCaptureStore_GetReturnsCopy(t *testing.T) {
 		t.Fatal("[安全回归失败] Get 必须返回副本")
 	}
 }
+
+// I. P1-04.1：>64KiB 输入 → 实际存储恰为硬上限（分配路径只复制 cap）
+func TestCaptureStore_HardCapAllocationPath(t *testing.T) {
+	s := NewStore(true, time.Now().Add(time.Hour), 64*1024, 10)
+	big := strings.Repeat("P", 100*1024)
+	s.Capture("huge", []byte(big))
+	e, ok := s.Get("huge")
+	if !ok {
+		t.Fatal("条目应存在")
+	}
+	if len(e.Body) != 64*1024 {
+		t.Fatalf("[安全回归失败] 应恰好保留 64KiB，实际 %d", len(e.Body))
+	}
+	if !e.Truncated {
+		t.Fatal("[安全回归失败] Truncated 应为 true")
+	}
+}

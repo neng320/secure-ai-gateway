@@ -126,7 +126,9 @@ func (p *OpenAICompatProvider) ChatCompletion(req *ChatRequest) ([]byte, int, er
 	}
 
 	if isDebug() {
-		log.Printf("[%s] Request to %s: %s", p.name, url, string(body))
+		// P1-04.1：DEBUG 只允许 metadata——request/response body 与完整 URL 是
+		// 无限期的正文日志通道（绕过 request_body_capture 的 memory-only 语义），已根除
+		log.Printf("[%s] request model=%s bytes=%d", p.name, req.Model, len(body))
 	}
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
@@ -149,7 +151,7 @@ func (p *OpenAICompatProvider) ChatCompletion(req *ChatRequest) ([]byte, int, er
 	}
 
 	if isDebug() {
-		log.Printf("[%s] Response: %d - %s", p.name, resp.StatusCode, string(respBody))
+		log.Printf("[%s] response status=%d bytes=%d", p.name, resp.StatusCode, len(respBody))
 	}
 
 	return respBody, resp.StatusCode, nil
@@ -177,7 +179,7 @@ func (p *OpenAICompatProvider) ChatCompletionStream(req *ChatRequest) (*http.Res
 		url = p.cfg.BaseURL + "/chat/completions"
 	}
 
-	log.Printf("[%s] Stream request to %s", p.name, url)
+	log.Printf("[%s] Stream request model=%s bytes=%d", p.name, req.Model, len(body))
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
@@ -467,7 +469,7 @@ func (p *OpenAICompatProvider) FetchModels() ([]string, error) {
 		return nil, err
 	}
 
-	log.Printf("[%s] FetchModels response body: %s", p.name, string(body))
+	log.Printf("[%s] FetchModels response status bytes=%d", p.name, len(body))
 
 	// Parse the response based on provider type
 	var models []string
