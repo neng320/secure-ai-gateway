@@ -159,6 +159,13 @@ func (l *LoginRateLimiter) SetProtectedUser(username string) {
 	delete(l.failures, normalized)
 }
 
+// ProtectedUser: 返回当前受保护账号（观测/测试用）。
+func (l *LoginRateLimiter) ProtectedUser() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.protectedUser
+}
+
 // trimExpiredLocked: 清理锁定与窗口均已过期的条目（调用方持锁）。
 func (l *LoginRateLimiter) trimExpiredLocked(now time.Time) {
 	for k, f := range l.failures {

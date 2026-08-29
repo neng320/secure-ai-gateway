@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -120,7 +121,7 @@ func TestGate_P1_02_CSRF_AllStateChangingRoutesProtected(t *testing.T) {
 // [P1-02 Gate] Setup CSRF：无 token → 403（setup-mode 环境验证）。
 func TestGate_P1_02_SetupCSRFRenforced(t *testing.T) {
 	env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-	setupH := NewSetupHandler(env.cfg, false, env.limiter)
+	setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
 	r := setupEnvRouter(env)
 	setupH.RegisterRoutes(r)
 

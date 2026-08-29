@@ -111,7 +111,11 @@ func buildAdminRouter(d gatewayDeps) (*chi.Mux, error) {
 		return nil, fmt.Errorf("admin handler: %w", err)
 	}
 
-	setupHandler := handlers.NewSetupHandler(d.cfg, d.setupMode, d.loginLimiter)
+	configPath := config.SourcePath()
+	if configPath == "" {
+		return nil, fmt.Errorf("config source path unknown; cannot wire setup persistence")
+	}
+	setupHandler := handlers.NewSetupHandler(d.cfg, d.setupMode, d.loginLimiter, configPath)
 	if setupHandler.IsSetupRequired() {
 		setupHandler.RegisterRoutes(r)
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {

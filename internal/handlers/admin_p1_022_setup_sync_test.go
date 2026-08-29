@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -18,7 +19,7 @@ import (
 
 func TestP1_022_Setup_SyncsLimiterProtectedUser(t *testing.T) {
 	env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-	setupH := NewSetupHandler(env.cfg, false, env.limiter)
+	setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
 	r := setupEnvRouter(env)
 	setupH.RegisterRoutes(r)
 

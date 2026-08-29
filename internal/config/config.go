@@ -412,6 +412,12 @@ func generateRandomString(length int) string {
 	return hex.EncodeToString(b)[:length]
 }
 
+// SourcePath: 返回当前加载的配置文件路径（Setup 等需要持久化到同一文件的组件使用）。
+// 尚未 Load 过时返回 ""。
+func SourcePath() string {
+	return configPath
+}
+
 func Save(cfg *Config) {
 	if configPath == "" {
 		return
