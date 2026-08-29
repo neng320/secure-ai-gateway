@@ -121,7 +121,14 @@ Agent 据"命令成功"继续 commit，把红灯带进 develop。
 `required_linear_history=true`（与 no-ff 合并冲突）、未要求 PR——即管理员可直接 push 绕过全部检查。
 本 Gate 之后上述缺口全部闭合。
 
-## 8. main 冻结声明
+## 8. Workflow Gate Validation Log
+
+| 日期 | PR | 结果 |
+|---|---|---|
+| 2026-08-29 | #1 (DW-01) | 正常 PR + 三项 required CI 全绿后 merge commit 合入；enforce_admins 生效，无 bypass |
+| 2026-08-29 | 本 PR（task/workflow-gate-validation） | DW-01 后的第二次全流程验证：PR → CI → merge → develop CI 复绿 |
+
+## 9. main 冻结声明
 
 ```text
 MAIN_RELEASE_FROZEN=true
