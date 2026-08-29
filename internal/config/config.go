@@ -28,12 +28,15 @@ type Config struct {
 // ProviderConfig is the unified configuration for any upstream AI backend.
 type ProviderConfig struct {
 	// Type identifies the backend: gemini, openai, anthropic, mistral, ollama, lmstudio
-	Type           string   `yaml:"type" json:"type"`
-	APIKey         string   `yaml:"api_key,omitempty" json:"api_key,omitempty"`
-	BaseURL        string   `yaml:"base_url,omitempty" json:"base_url,omitempty"`
-	DefaultModel   string   `yaml:"default_model,omitempty" json:"default_model,omitempty"`
-	AllowedModels  []string `yaml:"allowed_models,omitempty" json:"allowed_models,omitempty"`
-	TimeoutSeconds int      `yaml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	Type string `yaml:"type" json:"type"`
+	// APIKey: LEGACY 明文字段（SEC-002 迁移来源，迁移完成后必须为空）
+	APIKey string `yaml:"api_key,omitempty" json:"api_key,omitempty"`
+	// APIKeyEncrypted: 新安全存储（P1-03C1 additive），AEAD 信封 enc:v1:...
+	APIKeyEncrypted string   `yaml:"api_key_encrypted,omitempty" json:"-"`
+	BaseURL         string   `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+	DefaultModel    string   `yaml:"default_model,omitempty" json:"default_model,omitempty"`
+	AllowedModels   []string `yaml:"allowed_models,omitempty" json:"allowed_models,omitempty"`
+	TimeoutSeconds  int      `yaml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
 }
 
 // LegacyGeminiConfig supports the old config.yaml format with a top-level gemini: key.

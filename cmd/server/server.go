@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"ai-gateway/internal/auth"
@@ -24,6 +26,7 @@ import (
 	"ai-gateway/internal/handlers"
 	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/providers"
+	"ai-gateway/internal/secrets"
 	"ai-gateway/internal/services"
 	"ai-gateway/internal/templates"
 
@@ -71,6 +74,50 @@ func newGatewayDeps(cfg *config.Config, db *gorm.DB, setupMode bool) gatewayDeps
 		registry:      providers.BuildRegistry(cfg),
 		health:        handlers.NewHealthHandler(db),
 	}
+}
+
+// ensureProviderSecretsRunnable: 启动 preflight（P1-03C1）。
+// 检测明文/混合/损坏 Provider Secret → 拒绝启动（PROVIDER_SECRET_MIGRATION_REQUIRED）；
+// 检测密文 → 要求 Master Key 并逐项试解密（错误 key/key_id 不符/篡改 → 拒绝）；
+// 全部为空 → 允许无 Master Key 启动（Ollama/LM Studio 场景）。
+// 存在密文时返回已验证的 Manager（C3 runtime 解密将复用）。
+func ensureProviderSecretsRunnable(cfg *config.Config, db *gorm.DB) (*secrets.Manager, error) {
+	var items []secrets.SecretItem
+	for name, p := range cfg.Providers {
+		items = append(items, secrets.SecretItem{Kind: secrets.KindGlobal, Ref: name, Legacy: p.APIKey, Encrypted: p.APIKeyEncrypted})
+	}
+	var rows []struct {
+		ID                     string
+		Legacy                 string
+		BackendAPIKeyEncrypted string
+	}
+	if err := db.Raw("SELECT id, backend_api_key AS legacy, backend_api_key_encrypted FROM clients").Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("secrets preflight: %w", err)
+	}
+	for _, rr := range rows {
+		items = append(items, secrets.SecretItem{Kind: secrets.KindClient, Ref: rr.ID, Legacy: rr.Legacy, Encrypted: rr.BackendAPIKeyEncrypted})
+	}
+
+	res := secrets.ScanPreflight(items)
+	if res.MigrationRequired {
+		return nil, fmt.Errorf("%w (locations: %s)", secrets.ErrProviderSecretMigrationRequired, strings.Join(res.Offenders, ", "))
+	}
+	if !res.NeedMasterKey {
+		return nil, nil // 全部为空：无 Key 环境合法启动
+	}
+	key, err := secrets.LoadMasterKey(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	cipher, err := secrets.NewAESGCMCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	mgr := secrets.NewManager(cipher)
+	if err := secrets.VerifyEncryptedItems(mgr, res.EncryptedItems); err != nil {
+		return nil, err
+	}
+	return mgr, nil
 }
 
 // buildAPIRouter: 公网入口。仅 API 端点与必需 health；

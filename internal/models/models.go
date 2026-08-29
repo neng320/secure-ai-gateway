@@ -15,7 +15,10 @@ type Client struct {
 	// Backend is the provider type (e.g. "gemini", "openai", "anthropic", "mistral", "ollama", "lmstudio", etc.)
 	Backend string `gorm:"type:varchar(50);default:'gemini'" json:"backend"`
 	// BackendAPIKey is the upstream LLM API key for this client
+	// LEGACY 明文字段（SEC-002 迁移来源；迁移完成后必须为空）——不修改类型/不删除
 	BackendAPIKey string `gorm:"type:varchar(500)" json:"-"`
+	// BackendAPIKeyEncrypted: 新安全存储（P1-03C1 additive），AEAD 信封；AutoMigrate 仅新增列
+	BackendAPIKeyEncrypted string `gorm:"type:text" json:"-"`
 	// BackendBaseURL allows per-client URL override (required for Azure, useful for Ollama/LM Studio)
 	BackendBaseURL string `gorm:"type:varchar(500)" json:"backend_base_url,omitempty"`
 	// BackendDefaultModel is the default model to use when the request does not specify one
