@@ -19,6 +19,10 @@ type ClientService struct {
 	db *gorm.DB
 }
 
+// ErrClientNotFound: 稳定 sentinel（P1-05B）。RowsAffected==0 时返回——
+// handler 一律 errors.Is 判断，禁止按字符串匹配错误。
+var ErrClientNotFound = errors.New("client not found")
+
 func NewClientService(db *gorm.DB) *ClientService {
 	return &ClientService{db: db}
 }
@@ -99,22 +103,62 @@ func (s *ClientService) UpdateLastSeen(clientID string) error {
 	return s.db.Model(&models.Client{}).Where("id = ?", clientID).Update("last_seen", time.Now()).Error
 }
 
+// DeleteClient: ALL OR NOTHING（P1-05B）。client 删除与 operational data
+// （request_logs / daily_usages）清理在同一事务内；任一步 DB error → 整体
+// rollback。RowsAffected==0（id 不存在）→ ErrClientNotFound。
+// 顺序：先清 children 再删 client——即使 SQLite FK CASCADE 未生效（旧库），
+// 事务内显式清理仍保证无孤儿；FK 生效时行列删除为幂等 no-op。
 func (s *ClientService) DeleteClient(id string) error {
-	return s.db.Delete(&models.Client{}, "id = ?", id).Error
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("client_id = ?", id).Delete(&models.DailyUsage{}).Error; err != nil {
+			return fmt.Errorf("delete daily usage: %w", err)
+		}
+		if err := tx.Where("client_id = ?", id).Delete(&models.RequestLog{}).Error; err != nil {
+			return fmt.Errorf("delete request logs: %w", err)
+		}
+		res := tx.Where("id = ?", id).Delete(&models.Client{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrClientNotFound
+		}
+		return nil
+	})
+}
+
+// SetClientActive: Suspend/Resume（P1-05B）。显式目标状态优于盲 toggle；
+// UpdatedAt 同步更新。RowsAffected==0 → ErrClientNotFound。
+func (s *ClientService) SetClientActive(id string, active bool) error {
+	res := s.db.Model(&models.Client{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"is_active":  active,
+		"updated_at": time.Now(),
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrClientNotFound
+	}
+	return nil
 }
 
 func (s *ClientService) RegenerateAPIKey(clientID, keyType, keyPrefix string) (string, error) {
 	apiKey := GenerateAPIKeyWithPrefix(keyType, keyPrefix)
 	apiKeyHash := hashAPIKey(apiKey)
 
-	err := s.db.Model(&models.Client{}).Where("id = ?", clientID).Updates(map[string]interface{}{
+	res := s.db.Model(&models.Client{}).Where("id = ?", clientID).Updates(map[string]interface{}{
 		"api_key_hash": apiKeyHash,
 		"key_prefix":   keyPrefix,
 		"updated_at":   time.Now(),
-	}).Error
+	})
 
-	if err != nil {
-		return "", err
+	if res.Error != nil {
+		// 失败路径绝不让调用方拿到未入库的新明文 key
+		return "", res.Error
+	}
+	if res.RowsAffected == 0 {
+		return "", ErrClientNotFound
 	}
 
 	return apiKey, nil

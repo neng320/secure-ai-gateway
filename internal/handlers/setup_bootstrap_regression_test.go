@@ -19,6 +19,7 @@ import (
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
+	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/services"
 
@@ -152,7 +153,7 @@ func TestP1044_FreshBootstrap_SetupFlowRegression(t *testing.T) {
 	store := auth.NewSQLiteStore(db)
 	adminCfg := cfg2
 	adminCfg.Admin.SessionSecret = "p1044-session-secret"
-	adminH, err := NewAdminHandler(adminCfg, clientSvc, services.NewStatsService(db), services.NewGeminiService(db, adminCfg), services.NewDashboardHub(services.NewStatsService(db)), services.NewToolService(nil), store, limiter, nil, "", nil)
+	adminH, err := NewAdminHandler(adminCfg, clientSvc, services.NewStatsService(db), services.NewGeminiService(db, adminCfg), services.NewDashboardHub(services.NewStatsService(db)), services.NewToolService(nil), store, limiter, nil, "", nil, mw.NewRateLimiter())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -28,6 +28,20 @@ MAIN_RELEASE_FROZEN=true               ← main 保持冻结，reconciliation �
 
 **当前部署状态声明：** 本网关尚未在任何服务器部署，无真实流量、无属于运营者的真实凭证入库。入库凭证属于上游作者实例，按"已泄漏"原则处理（见 SEC-005 关闭标准）。在 SEC-001~005 全部关闭前，**禁止在公网环境运行任何实例**，开发实例仅允许绑定 loopback。
 
+### P1-05 Client Key Lifecycle 执行状态（2026-08-29）
+
+```text
+P1-05A 特征化 ✅（develop 870e584，PR #14）——零生产修改审计 + 10 个 characterization 用例
+P1-05B lifecycle consistency foundation ✅（tag secure-gateway-p1-client-lifecycle-consistency）
+  关闭：ROTATE-NOTFOUND / ORPHAN-DATA / TOGGLE-ERR-SWALLOW / METRICS-COMPARE /
+        dead Auth cache / IN_FLIGHT_DELETE_LATE_WRITE（Delete 后 late-write orphan race）
+P1-05 整体：IN PROGRESS —— REVOKED 状态 / RevokedAt / RevokedBy / Reason /
+             append-only AuditEvent foundation 尚未实现（P1-05C，待授权；统一走
+             通用 AuditEvent 而非 ClientLifecycleEvent 专表，供 P1-08 扩展）
+```
+
+SEC-001~005：本块不改变 Register 状态——**全部保持 CLOSED**。
+
 ### Hardening Backlog（非阻塞，SEC-002 保持 CLOSED）
 
 | ID | 描述 | 来源 | 状态 |

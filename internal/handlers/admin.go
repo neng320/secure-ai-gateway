@@ -18,6 +18,7 @@ import (
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
+	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
 	"ai-gateway/internal/secrets"
@@ -114,6 +115,9 @@ type AdminHandler struct {
 	configPath    string
 	capture       *capture.Store // MEMORY-ONLY 诊断正文读取（SEC-003/P1-04C）；nil = 永不可用
 	wsUpgrader    *websocket.Upgrader
+	// P1-05B：与公开 API 面共享的 RateLimiter——DeleteClient 事务成功后
+	// ResetClient(clientID) 清理运行时 bucket；ROTATE/SUSPEND/RESUME 不重置。
+	rateLimiter *mw.RateLimiter
 }
 
 type PageData struct {
@@ -126,7 +130,7 @@ type PageData struct {
 // NewAdminHandler: secretMgr 为 Provider Secret 加密/解密的唯一入口（可为 nil——
 // 未配置 Master Key 且无密文存在的部署）；configPath 是运行配置的真实来源路径，
 // 供持久化使用（禁止回到硬编码 "config.yaml"）。
-func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store, loginLimiter *auth.LoginRateLimiter, secretMgr *secrets.Manager, configPath string, captureStore *capture.Store) (*AdminHandler, error) {
+func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store, loginLimiter *auth.LoginRateLimiter, secretMgr *secrets.Manager, configPath string, captureStore *capture.Store, rateLimiter *mw.RateLimiter) (*AdminHandler, error) {
 	tmpl := template.New("admin").Funcs(template.FuncMap{
 		"formatDate":     formatDate,
 		"formatInt":      formatInt,
@@ -163,6 +167,7 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 		secretMgr:     secretMgr,
 		configPath:    configPath,
 		capture:       captureStore,
+		rateLimiter:   rateLimiter,
 		wsUpgrader: &websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -689,33 +694,64 @@ func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/clients/"+id, http.StatusFound)
 }
 
+// ToggleClient: P1-05B 修复 TOGGLE-ERR-SWALLOW。
+// 优先接受表单显式目标状态 active=true/false（优于盲 toggle）；
+// 未提供时回退为当前状态取反。DB 错误 → 500 generic；不存在 → 404。
 func (h *AdminHandler) ToggleClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	client, err := h.clientService.GetClientByID(id)
-	if err != nil || client == nil {
-		http.Error(w, "Client not found", http.StatusNotFound)
-		return
+	active := true
+	if explicit := r.FormValue("active"); explicit != "" {
+		active = explicit == "true" || explicit == "on"
+	} else {
+		client, err := h.clientService.GetClientByID(id)
+		if err != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		if client == nil {
+			http.Error(w, "Client not found", http.StatusNotFound)
+			return
+		}
+		active = !client.IsActive
 	}
 
-	client.IsActive = !client.IsActive
-	h.clientService.UpdateClient(client)
+	if err := h.clientService.SetClientActive(id, active); err != nil {
+		if errors.Is(err, services.ErrClientNotFound) {
+			http.Error(w, "Client not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to update client status", http.StatusInternalServerError)
+		return
+	}
 
 	http.Redirect(w, r, "/admin/clients/"+id, http.StatusFound)
 }
 
+// DeleteClient: P1-05B —— client 删除 ALL OR NOTHING（service 事务）成功后才
+// ResetClient 运行时限流 bucket；失败路径绝不 reset。DB error → 500 generic；
+// 不存在 → 404（禁止静默假成功）。
 func (h *AdminHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	err := h.clientService.DeleteClient(id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, services.ErrClientNotFound) {
+			http.Error(w, "Client not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to delete client", http.StatusInternalServerError)
 		return
 	}
+
+	// 事务已提交 → 清理该 client 的运行时限流 bucket
+	h.rateLimiter.ResetClient(id)
 
 	http.Redirect(w, r, "/admin/clients", http.StatusFound)
 }
 
+// RegenerateKey: P1-05B —— 不存在 client → 404（ROTATE-NOTFOUND 修复），
+// 不渲染无主 key；DB error → 500 generic。成功仍只在结果页一次性展示明文 key。
 func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	r.ParseForm()
@@ -727,11 +763,19 @@ func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 
 	apiKey, err := h.clientService.RegenerateAPIKey(id, keyType, keyPrefix)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, services.ErrClientNotFound) {
+			http.Error(w, "Client not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to regenerate API key", http.StatusInternalServerError)
 		return
 	}
 
-	client, _ := h.clientService.GetClientByID(id)
+	client, err := h.clientService.GetClientByID(id)
+	if err != nil || client == nil {
+		http.Error(w, "Client not found", http.StatusNotFound)
+		return
+	}
 
 	h.render(r, w, "client_created.html", PageData{
 		Title: "API Key Regenerated",

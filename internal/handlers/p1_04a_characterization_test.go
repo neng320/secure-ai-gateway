@@ -129,7 +129,7 @@ func newP104EnvWithStore(t *testing.T, initial http.HandlerFunc, envCapture *cap
 	store := auth.NewSQLiteStore(db)
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15*time.Minute, cfg.Admin.Username)
-	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, services.NewDashboardHub(statsService), toolService, store, limiter, nil, "", envCapture)
+	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, services.NewDashboardHub(statsService), toolService, store, limiter, nil, "", envCapture, mw.NewRateLimiter())
 	if err != nil {
 		t.Fatal(err)
 	}

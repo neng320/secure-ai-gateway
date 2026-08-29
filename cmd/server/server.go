@@ -55,6 +55,9 @@ type gatewayDeps struct {
 	secretManager *secrets.Manager
 	captureStore  *capture.Store
 	health        *handlers.HealthHandler
+	// P1-05B：RateLimiter 提升为 gateway lifecycle 共享实例——
+	// DeleteClient 事务成功后可 ResetClient(clientID)；ROTATE/SUSPEND/RESUME 不重置。
+	rateLimiter *mw.RateLimiter
 }
 
 func newGatewayDeps(cfg, runtimeCfg *config.Config, db *gorm.DB, setupMode bool, secretMgr *secrets.Manager, captureStore *capture.Store) gatewayDeps {
@@ -66,6 +69,7 @@ func newGatewayDeps(cfg, runtimeCfg *config.Config, db *gorm.DB, setupMode bool,
 	geminiService.SetOnRequestLogged(dashboardHub.NotifyUpdate)
 	loginLimiter := auth.NewLoginRateLimiter()
 	loginLimiter.Configure(cfg.Admin.LoginMaxFailures, time.Duration(cfg.Admin.LoginLockoutMinutes)*time.Minute, cfg.Admin.Username)
+	rateLimiter := mw.NewRateLimiter()
 	return gatewayDeps{
 		cfg:           cfg,
 		runtimeCfg:    runtimeCfg,
@@ -82,6 +86,7 @@ func newGatewayDeps(cfg, runtimeCfg *config.Config, db *gorm.DB, setupMode bool,
 		secretManager: secretMgr,
 		captureStore:  captureStore,
 		health:        handlers.NewHealthHandler(db),
+		rateLimiter:   rateLimiter,
 	}
 }
 
@@ -198,7 +203,9 @@ func buildAPIRouter(d gatewayDeps) *chi.Mux {
 	d.health.RegisterRoutes(r)
 
 	authMiddleware := mw.NewAuthMiddleware(d.clientService)
-	rateLimiter := mw.NewRateLimiter()
+	// P1-05B：与 Admin 面共享同一 RateLimiter 实例（gatewayDeps.rateLimiter），
+	// Delete 成功后 handler 才能 ResetClient 运行时 bucket。
+	rateLimiter := d.rateLimiter
 	proxyHandler := handlers.NewProxyHandler(d.geminiService, d.statsService, d.captureStore)
 	openaiHandler := handlers.NewOpenAIHandler(d.geminiService, d.clientService, d.statsService, d.registry, d.toolService, d.secretManager, d.captureStore)
 
@@ -224,7 +231,7 @@ func buildAdminRouter(d gatewayDeps) (*chi.Mux, error) {
 	if configPath == "" {
 		return nil, fmt.Errorf("config source path unknown; cannot wire admin persistence or setup")
 	}
-	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter, d.secretManager, configPath, d.captureStore)
+	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter, d.secretManager, configPath, d.captureStore, d.rateLimiter)
 	if err != nil {
 		return nil, fmt.Errorf("admin handler: %w", err)
 	}

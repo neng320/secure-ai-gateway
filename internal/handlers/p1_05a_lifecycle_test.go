@@ -7,15 +7,18 @@ package handlers
 //
 // Canary：P105_CLIENT_KEY_ORIGINAL / P105_CLIENT_KEY_ROTATED（明显测试串，非真实凭证）。
 //
-// 已知缺口标记：
-//   [KNOWN-GAP: P1-05 ROTATE-NOTFOUND] RegenerateAPIKey 不检查 RowsAffected
-//   [KNOWN-GAP: P1-05 ORPHAN-DATA]     DeleteClient 无级联清理
-//   [KNOWN-GAP: P1-05 METRICS-COMPARE] Metrics Basic Auth 普通字符串比较
-//   [KNOWN-GAP: P1-05 TOGGLE-ERR-SWALLOW] ToggleClient 忽略 UpdateClient 错误
+// P1-05B 修正结果（本文件内 4 项已从 [KNOWN-GAP] 转为 [P1-05B FIXED]）：
+//   [P1-05B FIXED: ROTATE-NOTFOUND]   RegenerateAPIKey 检查 RowsAffected → ErrClientNotFound
+//   [P1-05B FIXED: ORPHAN-DATA]       DeleteClient 事务内清理 + FK CASCADE → 三表全 0
+//   [P1-05B FIXED: METRICS-COMPARE]   Metrics Basic Auth 改为 SHA-256 + ConstantTimeCompare
+//   [P1-05B FIXED: TOGGLE-ERR-SWALLOW] ToggleClient 经 SetClientActive 并检查错误
+//
+// 仍留待 P1-05C：REVOKED 状态 / RevokedAt / RevokedBy / Reason / append-only AuditEvent。
 
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,12 +31,12 @@ import (
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/database"
 	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/services"
 
 	"github.com/go-chi/chi/v5"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -44,16 +47,20 @@ const (
 )
 
 type p105Env struct {
-	db        *gorm.DB
-	cfg       *config.Config
-	clientSvc *services.ClientService
-	api       http.Handler // auth middleware + 200 next
-	admin     http.Handler
+	db          *gorm.DB
+	cfg         *config.Config
+	clientSvc   *services.ClientService
+	gemini      *services.GeminiService
+	rateLimiter *mw.RateLimiter
+	api         http.Handler // auth middleware + rate limiter + 200 next
+	admin       http.Handler
 }
 
 func newP105Env(t *testing.T) *p105Env {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "p105.db")), &gorm.Config{})
+	// P1-05B：与生产 initDatabase 一致的打开路径——DSN _foreign_keys=on
+	// （连接池所有连接强制外键；late-write / ORPHAN-DATA 判定依赖它）
+	db, err := database.Open(filepath.Join(t.TempDir(), "p105.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,29 +82,33 @@ func newP105Env(t *testing.T) *p105Env {
 		Providers: map[string]config.ProviderConfig{},
 	}
 	clientSvc := services.NewClientService(db)
+	geminiSvc := services.NewGeminiService(db, cfg)
+	// P1-05B：API 面与 Admin 面共享同一 RateLimiter 实例（生产=gatewayDeps.rateLimiter）
+	sharedLimiter := mw.NewRateLimiter()
 
-	// 公开 API：auth middleware + 200 next（认证后即成功）
+	// 公开 API：auth + rate limit + 200 next（认证通过即成功）
 	authMw := mw.NewAuthMiddleware(clientSvc)
 	apiMux := chi.NewRouter()
 	apiMux.Use(authMw.Handler)
+	apiMux.Use(sharedLimiter.Middleware)
 	apiMux.Get("/v1/echo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Admin：与 buildAdminRouter 同构（复用于 regenerate 路由测试）
+	// Admin：与 buildAdminRouter 同构（复用于 regenerate/delete/toggle 路由测试）
 	statsSvc := services.NewStatsService(db)
 	store := auth.NewSQLiteStore(db)
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15*time.Minute, cfg.Admin.Username)
-	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, services.NewGeminiService(db, cfg), services.NewDashboardHub(statsSvc), services.NewToolService(nil), store, limiter, nil, "", nil)
+	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, services.NewDashboardHub(statsSvc), services.NewToolService(nil), store, limiter, nil, "", nil, sharedLimiter)
 	if err != nil {
 		t.Fatal(err)
 	}
 	adminMux := chi.NewRouter()
 	adminH.RegisterRoutes(adminMux)
 
-	return &p105Env{db: db, cfg: cfg, clientSvc: clientSvc, api: apiMux, admin: adminMux}
+	return &p105Env{db: db, cfg: cfg, clientSvc: clientSvc, gemini: geminiSvc, rateLimiter: sharedLimiter, api: apiMux, admin: adminMux}
 }
 
 // insertClientWithKey: 以指定 key 的 SHA-256 直接入库（控制 key 值为 canary）
@@ -125,6 +136,15 @@ func (e *p105Env) doAuth(t *testing.T, key string) *http.Response {
 	w := httptest.NewRecorder()
 	e.api.ServeHTTP(w, req)
 	return w.Result()
+}
+
+func (e *p105Env) countAll(t *testing.T, table string) int64 {
+	t.Helper()
+	var n int64
+	if err := e.db.Raw("SELECT count(*) FROM " + table).Scan(&n).Error; err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------------
@@ -204,27 +224,28 @@ func TestP105A_Rotate_ExistingClient_Immediate(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C. Rotation（不存在 client）：false-success 固化 → [KNOWN-GAP: ROTATE-NOTFOUND]
+// C. Rotation（不存在 client）：[P1-05B FIXED: ROTATE-NOTFOUND]
+// 现在返回 ErrClientNotFound + 空 key（不再 false-success 生成无主 key）
 // ---------------------------------------------------------------------------
 func TestP105A_Rotate_Nonexistent_FalseSuccess(t *testing.T) {
 	env := newP105Env(t)
 	key, err := env.clientSvc.RegenerateAPIKey("nonexistent-client-id", "openai", "sk-")
-	if err != nil {
-		t.Fatalf("[固化失败] 当前实现应返回 nil error（gap 前提），实际 %v", err)
+	if !errors.Is(err, services.ErrClientNotFound) {
+		t.Fatalf("[P1-05B FIXED] 不存在 client 应返回 ErrClientNotFound，实际 err=%v", err)
 	}
-	if key == "" {
-		t.Fatalf("[固化失败] 当前实现应返回生成的明文 key（gap 前提），实际空")
+	if key != "" {
+		t.Fatalf("[P1-05B FIXED] 失败路径绝不得返回未入库的明文 key，实际 %q", key)
 	}
 	var n int64
 	_ = env.db.Raw("SELECT count(*) FROM clients WHERE id = 'nonexistent-client-id'").Scan(&n).Error
 	if n != 0 {
 		t.Fatal("[固化失败] 该 id 不应存在任何行")
 	}
-	t.Log("[KNOWN-GAP: P1-05 ROTATE-NOTFOUND] 固化：不存在的 client → nil error + 生成新 key + RowsAffected=0（key 未存库，调用方拿到的 key 不可用）")
+	t.Log("[P1-05B FIXED: ROTATE-NOTFOUND] 不存在 client → ErrClientNotFound + key==\"\"（UI 侧 404，见 H 测试）")
 }
 
 // ---------------------------------------------------------------------------
-// D. Disable：实际返回 401（非 403）；403 分支不可达
+// D. Disable：实际返回 401（非 403）；403 分支已删除（不可达死分支）
 // ---------------------------------------------------------------------------
 func TestP105A_Disable_ActualStatus_401_Not403(t *testing.T) {
 	env := newP105Env(t)
@@ -249,9 +270,9 @@ func TestP105A_Disable_ActualStatus_401_Not403(t *testing.T) {
 		t.Fatalf("disabled client 响应体应为 invalid-key 语义，实际 %s", string(b))
 	}
 	if strings.Contains(string(b), "Client is disabled") {
-		t.Fatal("固化失败：403 'Client is disabled' 分支在本路径不可达（lookup 已过滤 is_active）")
+		t.Fatal("[安全回归失败] 403 'Client is disabled' 分支必须已删除")
 	}
-	t.Log("[CURRENT] 固化：Disable 实际语义 = 401 invalid-key（middleware !IsActive 403 分支不可达）")
+	t.Log("[CURRENT] 固化：Disable 实际语义 = 401 invalid-key；403 死分支已删除（P1-05B）")
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +301,7 @@ func TestP105A_ReEnable_OriginalKeyResumes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F. Delete：孤儿数据固化 → [KNOWN-GAP: ORPHAN-DATA]
+// F. Delete：[P1-05B FIXED: ORPHAN-DATA] 三表全 0（事务内清理 + FK CASCADE）
 // ---------------------------------------------------------------------------
 func TestP105A_Delete_OrphanData(t *testing.T) {
 	env := newP105Env(t)
@@ -288,7 +309,11 @@ func TestP105A_Delete_OrphanData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := env.db.Create(&models.RequestLog{ClientID: client.ID, Model: "m", StatusCode: 200}).Error; err != nil {
+	// 真实写入路径（LogRequest）+ 直接插入，覆盖两种来源的孤儿候选
+	if err := env.gemini.LogRequest(services.RequestRecord{
+		RequestID: "p105b-seed-1", ClientID: client.ID, Provider: "gemini",
+		Model: "m", StatusCode: 200, InputTokens: 10,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := env.db.Create(&models.RequestLog{ClientID: client.ID, Model: "m", StatusCode: 429}).Error; err != nil {
@@ -302,19 +327,11 @@ func TestP105A_Delete_OrphanData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	counts := func(table string) int64 {
-		var n int64
-		_ = env.db.Raw("SELECT count(*) FROM " + table).Scan(&n).Error
-		return n
+	if env.countAll(t, "clients") != 0 || env.countAll(t, "request_logs") != 0 || env.countAll(t, "daily_usages") != 0 {
+		t.Fatalf("[P1-05B FIXED] Delete 后三表应全 0：clients=%d request_logs=%d daily_usages=%d",
+			env.countAll(t, "clients"), env.countAll(t, "request_logs"), env.countAll(t, "daily_usages"))
 	}
-	if counts("clients") != 0 {
-		t.Fatalf("client 本体应删除，实际 %d", counts("clients"))
-	}
-	t.Logf("[KNOWN-GAP: P1-05 ORPHAN-DATA] 固化：Delete 后孤儿行 clients=0 request_logs=%d daily_usages=%d（均残留，无级联）",
-		counts("request_logs"), counts("daily_usages"))
-	if counts("request_logs") != 2 || counts("daily_usages") != 1 {
-		t.Fatalf("孤儿行数量不符: logs=%d usage=%d", counts("request_logs"), counts("daily_usages"))
-	}
+	t.Log("[P1-05B FIXED: ORPHAN-DATA] Delete 后 clients/request_logs/daily_usages 全 0（事务 + FK CASCADE）")
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +356,10 @@ func TestP105A_Delete_RemovesEncryptedMaterial(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H. Admin regenerate 路由：Auth+CSRF 必需；明文仅一次展示；不存在 client → 500
+// H. Admin regenerate 路由：Auth+CSRF 必需；明文仅一次展示；不存在 client → 404
+//
+//	[P1-05B FIXED: ROTATE-NOTFOUND UI 侧]
+//
 // ---------------------------------------------------------------------------
 func TestP105A_AdminRegenerate_HappyPath_OneTimeDisplay(t *testing.T) {
 	env := newP105Env(t)
@@ -392,7 +412,7 @@ func TestP105A_AdminRegenerate_HappyPath_OneTimeDisplay(t *testing.T) {
 	t.Log("[CURRENT] 固化：Regenerate 需 Auth+CSRF；明文仅结果页一次性展示；ShowClient 不重现")
 }
 
-func TestP105A_AdminRegenerate_NonexistentClient_500(t *testing.T) {
+func TestP105A_AdminRegenerate_NonexistentClient_404(t *testing.T) {
 	env := newP105Env(t)
 	token := p105AdminSessionOf(t, env)
 
@@ -404,29 +424,25 @@ func TestP105A_AdminRegenerate_NonexistentClient_500(t *testing.T) {
 	w := httptest.NewRecorder()
 	env.admin.ServeHTTP(w, req)
 	resp := w.Result()
-	// ROTATE-NOTFOUND 的 UI 侧真实呈现：false-success 的 key 被渲染进结果页（200），
-	// 管理员看到一把【无主 key】——比 500 更危险（关联 [KNOWN-GAP: ROTATE-NOTFOUND]）
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("不存在 client 的 regenerate 实际应 200（假成功渲染），当前 %d", resp.StatusCode)
+	// [P1-05B FIXED: ROTATE-NOTFOUND] UI 侧：404 + 正常错误响应，无截断页/模板错误/无主 key
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("[P1-05B FIXED] 不存在 client 的 regenerate 应 404，实际 %d", resp.StatusCode)
 	}
 	page := w.Body.String()
-	// 精确提取页面中出现的所有 sk- 形态序列
-	// 从页面提取"复制区"文本段（API Key 展示区域）
-	// 精确形态：头部先发出（200）+ 部分页面 + 尾部模板错误文本；无 key 渲染
-	if !strings.Contains(page, "Template error") {
-		t.Fatalf("[固化失败] 截断页面应含模板错误文本，实际尾部 %q", page[max(0, len(page)-160):])
+	if strings.Contains(page, "Template error") {
+		t.Fatal("[P1-05B FIXED] 不应再出现截断模板错误文本")
 	}
-	if !strings.Contains(page, "nil pointer evaluating *models.Client.Name") {
-		t.Fatalf("[固化失败] 错误应定位到 nil Client 字段访问，实际尾部 %q", page[max(0, len(page)-160):])
+	if strings.Contains(page, "nil pointer evaluating") {
+		t.Fatal("[P1-05B FIXED] 不应再出现 nil Client 渲染")
 	}
 	if strings.Contains(page, "sk-") {
-		t.Fatalf("[固化失败] 截断页面不应含明文 key（exec 失败在 key 渲染前）")
+		t.Fatal("[P1-05B FIXED] 不应渲染任何明文 key（无主 key 展示必须杜绝）")
 	}
-	t.Log("[KNOWN-GAP: P1-05 ROTATE-NOTFOUND] 固化（UI 侧）：不存在 client 的 regenerate → HTTP 200 + 截断页面 + 尾部 'Template error: nil pointer evaluating *models.Client.Name'（头部已发出故状态码滞留 200；生成的新 key 未渲染、未存库，管理员无任何错误提示）")
+	t.Log("[P1-05B FIXED: ROTATE-NOTFOUND UI 侧] 不存在 client 的 regenerate → 404 + 无模板错误 + 无 key 渲染")
 }
 
 // ---------------------------------------------------------------------------
-// Audit / 吊销字段：当前均为 0/不存在（反射断言 + 文档记录）
+// Audit / 吊销字段：当前均为 0/不存在（反射断言 + 文档记录；P1-05C 前保持）
 // ---------------------------------------------------------------------------
 func TestP105A_AuditAndRevocationAbsent(t *testing.T) {
 	var model models.Client
@@ -440,7 +456,7 @@ func TestP105A_AuditAndRevocationAbsent(t *testing.T) {
 			t.Fatalf("[固化失败] Client 模型不应有 %s（当前无生命周期状态字段）", absent)
 		}
 	}
-	t.Log("[CURRENT] 固化：无 revocation_reason / revoked_at / revoked_by 字段；无任何持久化生命周期审计事件（AUDIT_EVENT_COUNT=0，见文档）")
+	t.Log("[CURRENT] 固化：无 revocation_reason / revoked_at / revoked_by 字段；无任何持久化生命周期审计事件（P1-05C 前保持）")
 }
 
 // ---------------------------------------------------------------------------

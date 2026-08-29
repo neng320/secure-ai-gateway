@@ -135,7 +135,7 @@ func newKeyFlowEnvWithManager(t *testing.T, globalAPIKey string, manager *secret
 	openaiHandler.RegisterRoutes(apiMux)
 
 	// Admin 路由（与 buildAdminRouter 同构）
-	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, store, limiter, manager, "", nil)
+	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, store, limiter, manager, "", nil, mw.NewRateLimiter())
 	if err != nil {
 		t.Fatal(err)
 	}

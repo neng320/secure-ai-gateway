@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/models"
 
+	"github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
 )
 
@@ -234,6 +236,22 @@ func ClassifyUpstreamError(statusCode int, err error) string {
 	}
 }
 
+// isClientGoneForeignKey: 已通过认证的 in-flight 请求在 Admin Delete 之后完成的
+// late-write INSERT 会违反 request_logs/daily_usages 的 FK（SQLITE_CONSTRAINT_FOREIGNKEY）。
+// gorm 对 sqlite 驱动会翻译成 gorm.ErrForeignKeyViolated；这里再按原生错误码双保险，
+// 避免依赖翻译行为。命中即“client 已删除”，写路径静默跳过——请求本身正常结束，
+// 但绝不会为已删除 client 重新制造持久行（P1-05B IN_FLIGHT_DELETE_LATE_WRITE gate）。
+func isClientGoneForeignKey(err error) bool {
+	if errors.Is(err, gorm.ErrForeignKeyViolated) {
+		return true
+	}
+	var se sqlite3.Error
+	if errors.As(err, &se) && se.ExtendedCode == sqlite3.ErrConstraintForeignKey {
+		return true
+	}
+	return false
+}
+
 // LogRequest: 持久化一条 metadata-only 请求日志（SEC-003 / P1-04B）。
 // RequestBody / ErrorMessage 为 legacy scrub 字段，新写入恒为空——
 // 由本函数强制置空，调用方无法（也无需）传入正文。
@@ -257,6 +275,10 @@ func (s *GeminiService) LogRequest(rec RequestRecord) error {
 	}
 
 	if err := s.db.Create(entry).Error; err != nil {
+		if isClientGoneForeignKey(err) {
+			// P1-05B：client 已被删除——禁止 late-write 重建行；请求正常结束
+			return nil
+		}
 		return fmt.Errorf("failed to log request: %w", err)
 	}
 
@@ -292,6 +314,10 @@ func (s *GeminiService) updateDailyUsage(clientID string, inputTokens, outputTok
 	usage.TotalOutputTokens += outputTokens
 
 	if err := s.db.Save(&usage).Error; err != nil {
+		if isClientGoneForeignKey(err) {
+			// P1-05B：同上——client 已删除，usage 行不得重建
+			return nil
+		}
 		return fmt.Errorf("failed to update daily usage: %w", err)
 	}
 

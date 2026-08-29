@@ -61,6 +61,11 @@ type RequestLog struct {
 	// 与响应头 X-Request-ID 及全链路日志一致；绝不信任客户端提供的值。
 	RequestID string `gorm:"type:varchar(64);index" json:"request_id"`
 	ClientID  string `gorm:"type:varchar(36);index" json:"client_id"`
+	// P1-05B：FK → clients.id，ON DELETE CASCADE。约束随 CREATE TABLE 内联创建
+	// （新库 AutoMigrate 生效）；遗留旧库缺 FK 时 DeleteClient 事务内显式清理仍成立。
+	// 主要价值：Delete 之后任何 late-write INSERT 直接违反外键（被 LogRequest 静默吞掉），
+	// 从数据库层面杜绝 in-flight 旧请求重新制造孤儿行。
+	Client Client `gorm:"foreignKey:ClientID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"-"`
 	// Provider: canonical provider/backend 名称；不含 URL/query/key。
 	Provider     string `gorm:"type:varchar(50)" json:"provider"`
 	Model        string `gorm:"type:varchar(100)" json:"model"`
@@ -83,8 +88,10 @@ type RequestLog struct {
 }
 
 type DailyUsage struct {
-	ID                int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	ClientID          string    `gorm:"type:varchar(36);uniqueIndex:idx_client_date" json:"client_id"`
+	ID       int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	ClientID string `gorm:"type:varchar(36);uniqueIndex:idx_client_date" json:"client_id"`
+	// P1-05B：FK → clients.id，ON DELETE CASCADE（同 RequestLog；late-write 防线）。
+	Client            Client    `gorm:"foreignKey:ClientID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"-"`
 	Date              time.Time `gorm:"uniqueIndex:idx_client_date;index" json:"date"`
 	TotalRequests     int       `gorm:"default:0" json:"total_requests"`
 	TotalInputTokens  int       `gorm:"default:0" json:"total_input_tokens"`
