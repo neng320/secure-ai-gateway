@@ -95,6 +95,13 @@ func main() {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
 
+	// P1-03C1 启动 preflight：明文/混合/损坏 Provider Secret → 拒绝启动
+	secretMgr, err := ensureProviderSecretsRunnable(cfg, db)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	_ = secretMgr // P1-03C3 将接入 runtime 解密
+
 	deps := newGatewayDeps(cfg, db, *setupMode)
 	apiMux := buildAPIRouter(deps)
 	adminMux, err := buildAdminRouter(deps)
