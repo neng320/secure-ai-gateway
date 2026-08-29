@@ -101,8 +101,8 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 
 	store := auth.NewSQLiteStore(db)
 	limiter := auth.NewLoginRateLimiter()
-	limiter.Configure(5, 15*time.Minute, cfg.Admin.Username)                                                   // 与 newGatewayDeps 同语义
-	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, limiter, nil, "") // 认证测试不涉 Provider Secret/持久化路径
+	limiter.Configure(5, 15*time.Minute, cfg.Admin.Username)                                                        // 与 newGatewayDeps 同语义
+	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, limiter, nil, "", nil) // 认证测试不涉 Provider Secret/持久化路径
 	if err != nil {
 		t.Fatalf("NewAdminHandler: %v", err)
 	}

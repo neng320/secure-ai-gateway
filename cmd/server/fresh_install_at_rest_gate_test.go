@@ -144,7 +144,7 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := newGatewayDeps(cfg, runtimeCfg, db, false, mgr)
+	deps := newGatewayDeps(cfg, runtimeCfg, db, false, mgr, nil)
 	apiMux := buildAPIRouter(deps)
 	adminMux, err := buildAdminRouter(deps)
 	if err != nil {
@@ -261,7 +261,7 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	if cfg.Providers["openai"].APIKey != "" {
 		t.Fatal("[安全回归失败] 重启后持久化 cfg 出现明文")
 	}
-	deps2 := newGatewayDeps(cfg, runtimeCfg2, dbCheck, false, mgr2)
+	deps2 := newGatewayDeps(cfg, runtimeCfg2, dbCheck, false, mgr2, nil)
 	apiSrv2 := httptest.NewServer(buildAPIRouter(deps2))
 	defer apiSrv2.Close()
 	clientSvc2 := services.NewClientService(dbCheck) // 重启后的新句柄（db 已在停服时关闭）

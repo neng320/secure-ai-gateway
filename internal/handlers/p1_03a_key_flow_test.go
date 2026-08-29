@@ -129,13 +129,13 @@ func newKeyFlowEnvWithManager(t *testing.T, globalAPIKey string, manager *secret
 	limiter := auth.NewLoginRateLimiter()
 
 	// Public API 路由（与 buildAPIRouter 同构）
-	openaiHandler := NewOpenAIHandler(geminiService, clientService, statsService, registry, toolService, manager)
+	openaiHandler := NewOpenAIHandler(geminiService, clientService, statsService, registry, toolService, manager, nil)
 	apiMux := chi.NewRouter()
 	apiMux.Use(mw.NewAuthMiddleware(clientService).Handler)
 	openaiHandler.RegisterRoutes(apiMux)
 
 	// Admin 路由（与 buildAdminRouter 同构）
-	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, store, limiter, manager, "")
+	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, dashboardHub, toolService, store, limiter, manager, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

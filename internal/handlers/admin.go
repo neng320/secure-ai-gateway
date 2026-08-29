@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
@@ -111,6 +112,7 @@ type AdminHandler struct {
 	loginLimiter  *auth.LoginRateLimiter
 	secretMgr     *secrets.Manager
 	configPath    string
+	capture       *capture.Store // MEMORY-ONLY 诊断正文读取（SEC-003/P1-04C）；nil = 永不可用
 	wsUpgrader    *websocket.Upgrader
 }
 
@@ -124,7 +126,7 @@ type PageData struct {
 // NewAdminHandler: secretMgr 为 Provider Secret 加密/解密的唯一入口（可为 nil——
 // 未配置 Master Key 且无密文存在的部署）；configPath 是运行配置的真实来源路径，
 // 供持久化使用（禁止回到硬编码 "config.yaml"）。
-func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store, loginLimiter *auth.LoginRateLimiter, secretMgr *secrets.Manager, configPath string) (*AdminHandler, error) {
+func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store, loginLimiter *auth.LoginRateLimiter, secretMgr *secrets.Manager, configPath string, captureStore *capture.Store) (*AdminHandler, error) {
 	tmpl := template.New("admin").Funcs(template.FuncMap{
 		"formatDate":     formatDate,
 		"formatInt":      formatInt,
@@ -160,6 +162,7 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 		loginLimiter:  loginLimiter,
 		secretMgr:     secretMgr,
 		configPath:    configPath,
+		capture:       captureStore,
 		wsUpgrader: &websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -200,6 +203,9 @@ func (h *AdminHandler) RegisterRoutes(r *chi.Mux) {
 		r.Post("/admin/clients/{id}/toggle", h.ToggleClient)
 		r.Get("/admin/clients/{id}/test", h.TestClientConnection)
 		r.Get("/admin/clients/{id}/fetch-models", h.FetchClientModels)
+		// SEC-003（P1-04C）：诊断正文按需读取——仅 Admin 监听面 + RequireAuth；
+		// 禁止 server-render 进 Dashboard/正文 modal
+		r.Get("/admin/request-bodies/{requestID}", h.GetCapturedRequestBody)
 		r.Post("/admin/clients/{id}/update-models", h.UpdateClientModels)
 		r.Get("/admin/stats", h.ShowStats)
 		r.Get("/admin/stats/api", h.GetAPISTats)
@@ -963,6 +969,25 @@ func formatModelArray(models []string) string {
 	}
 	result += "]"
 	return result
+}
+
+// GetCapturedRequestBody: MEMORY-ONLY 诊断正文的按需读取端点（SEC-003/P1-04C）。
+// 纪律：RequireAuth 保护（路由注册在受保护组）；no-store/no-cache 防缓存落盘；
+// capture 关闭/过期/不存在 → 404；正文仅按需返回，绝不 server-render 进列表 HTML。
+func (h *AdminHandler) GetCapturedRequestBody(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "requestID")
+	entry, ok := h.capture.Get(id)
+	if !ok {
+		http.Error(w, "captured request body not available", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	if entry.Truncated {
+		w.Header().Set("X-Body-Truncated", "true")
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(entry.Body)
 }
 
 // HandleDashboardWS upgrades an HTTP connection to WebSocket for real-time dashboard updates.

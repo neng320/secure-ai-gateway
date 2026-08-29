@@ -127,7 +127,7 @@ func newFallbackEnv(t *testing.T) *fallbackEnv {
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15*time.Minute, adminBase.Username)
 
-	adminH, err := NewAdminHandler(cfgPersist, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, limiter, mgr, "")
+	adminH, err := NewAdminHandler(cfgPersist, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, limiter, mgr, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

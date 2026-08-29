@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/logger"
 	"ai-gateway/internal/models"
@@ -127,13 +128,20 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
+	// P1-04C：诊断正文捕获（默认 OFF；显式 opt-in、bounded、≤24h 硬过期、MEMORY-ONLY）
+	captureSettings, err := cfg.Logging.ResolveRequestBodyCapture(time.Now())
+	if err != nil {
+		log.Fatalf("request_body_capture: %v", err)
+	}
+	captureStore := capture.NewStore(captureSettings.Enabled, captureSettings.ExpiresAt, captureSettings.MaxBytes, captureSettings.MaxEntries)
+
 	// P1-03C3 运行时视图：持久化 cfg 保持 envelope-only，解密明文只进入 runtimeCfg
 	runtimeCfg, err := buildRuntimeConfig(cfg, secretMgr)
 	if err != nil {
 		log.Fatalf("runtime provider config: %v", err)
 	}
 
-	deps := newGatewayDeps(cfg, runtimeCfg, db, *setupMode, secretMgr)
+	deps := newGatewayDeps(cfg, runtimeCfg, db, *setupMode, secretMgr, captureStore)
 	apiMux := buildAPIRouter(deps)
 	adminMux, err := buildAdminRouter(deps)
 	if err != nil {

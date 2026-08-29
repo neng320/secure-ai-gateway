@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
@@ -30,10 +31,11 @@ type OpenAIHandler struct {
 	registry      *providers.Registry
 	toolService   *services.ToolService
 	secretMgr     *secrets.Manager
+	capture       *capture.Store // MEMORY-ONLY 诊断捕获（SEC-003/P1-04C）；nil = 关闭
 }
 
-func NewOpenAIHandler(geminiService *services.GeminiService, clientService *services.ClientService, statsService *services.StatsService, registry *providers.Registry, toolService *services.ToolService, secretMgr *secrets.Manager) *OpenAIHandler {
-	return &OpenAIHandler{geminiService: geminiService, clientService: clientService, statsService: statsService, registry: registry, toolService: toolService, secretMgr: secretMgr}
+func NewOpenAIHandler(geminiService *services.GeminiService, clientService *services.ClientService, statsService *services.StatsService, registry *providers.Registry, toolService *services.ToolService, secretMgr *secrets.Manager, captureStore *capture.Store) *OpenAIHandler {
+	return &OpenAIHandler{geminiService: geminiService, clientService: clientService, statsService: statsService, registry: registry, toolService: toolService, secretMgr: secretMgr, capture: captureStore}
 }
 
 func (h *OpenAIHandler) RegisterRoutes(r chi.Router) {
@@ -198,6 +200,9 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeOpenAIError(r, w, http.StatusBadRequest, "Failed to read request body", "invalid_request_error")
 		return
 	}
+
+	// SEC-003（P1-04C）：诊断捕获——仅已认证 LLM 请求的原始 inbound payload（默认关闭）
+	h.capture.Capture(middleware.GetRequestID(r), body)
 
 	if h.statsService != nil {
 		h.statsService.IncrementRequestsInProgress()
