@@ -56,15 +56,26 @@ func (c *Client) HasBackendKey() bool {
 }
 
 type RequestLog struct {
-	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	ClientID     string    `gorm:"type:varchar(36);index" json:"client_id"`
-	Model        string    `gorm:"type:varchar(100)" json:"model"`
-	StatusCode   int       `json:"status_code"`
-	InputTokens  int       `gorm:"default:0" json:"input_tokens"`
-	OutputTokens int       `gorm:"default:0" json:"output_tokens"`
-	LatencyMs    int       `json:"latency_ms"`
-	ErrorMessage string    `gorm:"type:text" json:"error_message"`
-	RequestBody  string    `gorm:"type:text" json:"request_body"`
+	ID int64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	// RequestID: 服务器生成的 128-bit crypto/rand 标识（SEC-003/P1-04B），
+	// 与响应头 X-Request-ID 及全链路日志一致；绝不信任客户端提供的值。
+	RequestID string `gorm:"type:varchar(64);index" json:"request_id"`
+	ClientID  string `gorm:"type:varchar(36);index" json:"client_id"`
+	// Provider: canonical provider/backend 名称；不含 URL/query/key。
+	Provider     string `gorm:"type:varchar(50)" json:"provider"`
+	Model        string `gorm:"type:varchar(100)" json:"model"`
+	StatusCode   int    `json:"status_code"`
+	InputTokens  int    `gorm:"default:0" json:"input_tokens"`
+	OutputTokens int    `gorm:"default:0" json:"output_tokens"`
+	LatencyMs    int    `json:"latency_ms"`
+	// ErrorCode: bounded 稳定错误码（UPSTREAM_NETWORK_ERROR/UPSTREAM_AUTH_ERROR/UPSTREAM_RATE_LIMIT/
+	// UPSTREAM_4XX/UPSTREAM_5XX/INVALID_REQUEST/INTERNAL_ERROR）——无用户正文、无 URL、无 secret。
+	ErrorCode string `gorm:"type:varchar(32)" json:"error_code"`
+	// LEGACY PRIVACY MIGRATION FIELD (SEC-003 / P1-04B)：
+	//   新写入必须恒为空（metadata-only）；列仅为兼容旧库与 P1-04D scrub 落点保留，
+	//   禁止本批 DROP/RENAME；json:"-" 防止任何 JSON 路径暴露。
+	RequestBody  string    `gorm:"type:text" json:"-"`
+	ErrorMessage string    `gorm:"type:text" json:"-"`
 	IsStreaming  bool      `gorm:"default:false" json:"is_streaming"`
 	HasTools     bool      `gorm:"default:false" json:"has_tools"`
 	ToolNames    string    `gorm:"type:varchar(500)" json:"tool_names"`

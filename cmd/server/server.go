@@ -172,6 +172,8 @@ func buildAPIRouter(d gatewayDeps) *chi.Mux {
 	r.Use(mw.Recovery)
 	r.Use(mw.SecurityHeaders)
 	r.Use(mw.MaxRequestSize(10 << 20))
+	// SEC-003（P1-04B）：全 API 面 request ID——响应头 X-Request-ID == DB RequestLog.RequestID
+	r.Use(mw.RequestID())
 
 	d.health.RegisterRoutes(r)
 

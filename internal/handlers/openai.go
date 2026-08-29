@@ -86,9 +86,12 @@ type OpenAIModel struct {
 	Permission []interface{} `json:"permission,omitempty"`
 }
 
-func writeOpenAIError(w http.ResponseWriter, statusCode int, errMsg, errType string) {
+// writeOpenAIError: 错误响应的统一出口。
+// SEC-003（P1-04B）：x-request-id 取自服务器侧 RequestID 中间件（与 DB/日志一致），
+// 不再各自生成不同的 id。
+func writeOpenAIError(r *http.Request, w http.ResponseWriter, statusCode int, errMsg, errType string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("x-request-id", "req-"+randomID(12))
+	w.Header().Set("x-request-id", middleware.GetRequestID(r))
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{
@@ -186,13 +189,13 @@ func (h *OpenAIHandler) updateClientModels(client *models.Client, provider provi
 func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	client := middleware.GetClientFromContext(r.Context())
 	if client == nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "Unauthorized", "authentication_error")
+		writeOpenAIError(r, w, http.StatusUnauthorized, "Unauthorized", "authentication_error")
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "Failed to read request body", "invalid_request_error")
+		writeOpenAIError(r, w, http.StatusBadRequest, "Failed to read request body", "invalid_request_error")
 		return
 	}
 
@@ -202,7 +205,7 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	var req OpenAIChatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "Invalid JSON in request body", "invalid_request_error")
+		writeOpenAIError(r, w, http.StatusBadRequest, "Invalid JSON in request body", "invalid_request_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
 		}
@@ -211,7 +214,7 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	provider, err := h.resolveProvider(client)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "Backend not configured: "+err.Error(), "invalid_request_error")
+		writeOpenAIError(r, w, http.StatusBadRequest, "Backend not configured: "+err.Error(), "invalid_request_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
 		}
@@ -220,7 +223,7 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	chatReq := h.buildChatRequest(req, provider, client)
 	if len(chatReq.Messages) == 0 {
-		writeOpenAIError(w, http.StatusBadRequest, "No content in messages", "invalid_request_error")
+		writeOpenAIError(r, w, http.StatusBadRequest, "No content in messages", "invalid_request_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
 		}
@@ -234,7 +237,7 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	h.handleNonStreamingRequestWithFallback(w, client, req, provider, chatReq, string(body), fallbackModels)
+	h.handleNonStreamingRequestWithFallback(w, r, client, req, provider, chatReq, string(body), fallbackModels)
 }
 
 func parseFallbackModels(fallbackStr string) []string {
@@ -369,23 +372,27 @@ func getString(m map[string]interface{}, key string) string {
 	return ""
 }
 
-func (h *OpenAIHandler) handleNonStreamingRequestWithFallback(w http.ResponseWriter, client *models.Client, req OpenAIChatRequest, provider providers.Provider, chatReq *providers.ChatRequest, requestBody string, fallbackModels []string) {
-	err := h.tryNonStreamingRequest(w, client, req, provider, chatReq, requestBody)
+func (h *OpenAIHandler) handleNonStreamingRequestWithFallback(w http.ResponseWriter, r *http.Request, client *models.Client, req OpenAIChatRequest, provider providers.Provider, chatReq *providers.ChatRequest, requestBody string, fallbackModels []string) {
+	upstreamStatus, err := h.tryNonStreamingRequest(r, w, client, req, provider, chatReq, requestBody)
 	if err == nil || len(fallbackModels) == 0 {
 		return
 	}
 
 	for _, fallbackModel := range fallbackModels {
-		log.Printf("[CHAT] Trying fallback: %s (error: %v)", fallbackModel, err)
+		// SEC-003（P1-04B）：runtime log 只允许 bounded 错误码——
+		// 不可信 upstream error body（可能回显用户内容）绝不进入日志。
+		log.Printf("[CHAT] Trying fallback: %s (upstream_error_code=%s)", fallbackModel, services.ClassifyUpstreamError(upstreamStatus, err))
 		chatReq.Model = fallbackModel
-		err = h.tryNonStreamingRequest(w, client, req, provider, chatReq, requestBody)
+		_, err = h.tryNonStreamingRequest(r, w, client, req, provider, chatReq, requestBody)
 		if err == nil {
 			return
 		}
 	}
 }
 
-func (h *OpenAIHandler) tryNonStreamingRequest(w http.ResponseWriter, client *models.Client, req OpenAIChatRequest, provider providers.Provider, chatReq *providers.ChatRequest, requestBody string) error {
+// tryNonStreamingRequest: 返回 (upstreamStatus, err)。
+// upstreamStatus：upstream HTTP 状态码（传输失败为 0）；供 fallback 记录 bounded 错误码使用。
+func (h *OpenAIHandler) tryNonStreamingRequest(r *http.Request, w http.ResponseWriter, client *models.Client, req OpenAIChatRequest, provider providers.Provider, chatReq *providers.ChatRequest, requestBody string) (int, error) {
 	start := time.Now()
 	maxToolIterations := 5
 	var toolNames []string
@@ -395,25 +402,25 @@ func (h *OpenAIHandler) tryNonStreamingRequest(w http.ResponseWriter, client *mo
 
 	if err != nil {
 		if isRetryableError(502, err.Error()) {
-			return err
+			return 0, err
 		}
-		writeOpenAIError(w, http.StatusBadGateway, "Upstream request failed: "+err.Error(), "api_error")
+		writeOpenAIError(r, w, http.StatusBadGateway, "Upstream request failed: "+err.Error(), "api_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
 		}
-		return nil
+		return 0, nil
 	}
 
 	if statusCode >= 400 {
 		errMsg := extractErrorMessage(respBody)
 		if isRetryableError(statusCode, errMsg) {
-			return fmt.Errorf("status %d: %s", statusCode, errMsg)
+			return statusCode, fmt.Errorf("status %d: %s", statusCode, errMsg)
 		}
-		writeOpenAIError(w, mapUpstreamStatusToHTTP(statusCode), errMsg, "api_error")
+		writeOpenAIError(r, w, mapUpstreamStatusToHTTP(statusCode), errMsg, "api_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
 		}
-		return nil
+		return statusCode, nil
 	}
 
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
@@ -442,7 +449,7 @@ func (h *OpenAIHandler) tryNonStreamingRequest(w http.ResponseWriter, client *mo
 				Choices: []map[string]interface{}{{"index": 0, "message": map[string]interface{}{"role": "assistant", "tool_calls": toolCallsResp}, "finish_reason": "tool_calls"}},
 				Usage:   map[string]interface{}{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
 			})
-			return nil
+			return statusCode, nil
 		}
 
 		for _, tc := range toolCalls {
@@ -462,7 +469,21 @@ func (h *OpenAIHandler) tryNonStreamingRequest(w http.ResponseWriter, client *mo
 	}
 
 	text, it, ot, _ := provider.ParseResponse(respBody)
-	h.geminiService.LogRequest(client.ID, chatReq.Model, statusCode, it, ot, latencyMs, "", requestBody, false, len(toolNames) > 0, strings.Join(toolNames, ","))
+	// SEC-003（P1-04B）：metadata-only 持久化——结构化 API 无正文/错误文本可传
+	h.geminiService.LogRequest(services.RequestRecord{
+		RequestID:    middleware.GetRequestID(r),
+		ClientID:     client.ID,
+		Provider:     provider.Name(),
+		Model:        chatReq.Model,
+		StatusCode:   statusCode,
+		InputTokens:  it,
+		OutputTokens: ot,
+		LatencyMs:    latencyMs,
+		ErrorCode:    services.ClassifyUpstreamError(statusCode, nil),
+		IsStreaming:  false,
+		HasTools:     len(toolNames) > 0,
+		ToolNames:    strings.Join(toolNames, ","),
+	})
 	RecordRequest(client.ID, chatReq.Model, fmt.Sprintf("%d", statusCode), it, ot, latencyMs)
 	if h.statsService != nil {
 		h.statsService.DecrementRequestsInProgress()
@@ -481,11 +502,11 @@ func (h *OpenAIHandler) tryNonStreamingRequest(w http.ResponseWriter, client *mo
 	if client.BackendModels == "" {
 		h.updateClientModels(client, provider)
 	}
-	return nil
+	return statusCode, nil
 }
 
 func (h *OpenAIHandler) handleStreamingRequestWithFallback(w http.ResponseWriter, r *http.Request, client *models.Client, req OpenAIChatRequest, provider providers.Provider, chatReq *providers.ChatRequest, requestBody string, fallbackModels []string) {
-	err := h.tryStreamingRequest(w, r, client, req, provider, chatReq, requestBody)
+	upstreamStatus, err := h.tryStreamingRequest(r, w, client, req, provider, chatReq, requestBody)
 	if err == nil || len(fallbackModels) == 0 {
 		return
 	}
@@ -495,29 +516,31 @@ func (h *OpenAIHandler) handleStreamingRequestWithFallback(w http.ResponseWriter
 	}
 
 	for _, fallbackModel := range fallbackModels {
-		log.Printf("[CHAT] Streaming fallback: %s", fallbackModel)
+		// SEC-003（P1-04B）：runtime log 只允许 bounded 错误码（同非流式路径）
+		log.Printf("[CHAT] Streaming fallback: %s (upstream_error_code=%s)", fallbackModel, services.ClassifyUpstreamError(upstreamStatus, err))
 		chatReq.Model = fallbackModel
-		err = h.tryStreamingRequest(w, r, client, req, provider, chatReq, requestBody)
+		_, err = h.tryStreamingRequest(r, w, client, req, provider, chatReq, requestBody)
 		if err == nil {
 			return
 		}
 	}
 }
 
-func (h *OpenAIHandler) tryStreamingRequest(w http.ResponseWriter, r *http.Request, client *models.Client, req OpenAIChatRequest, provider providers.Provider, chatReq *providers.ChatRequest, requestBody string) error {
+// tryStreamingRequest: 返回 (upstreamStatus, err)。upstreamStatus 供 fallback 记录 bounded 错误码。
+func (h *OpenAIHandler) tryStreamingRequest(r *http.Request, w http.ResponseWriter, client *models.Client, req OpenAIChatRequest, provider providers.Provider, chatReq *providers.ChatRequest, requestBody string) (int, error) {
 	start := time.Now()
 	var toolNames []string
 
 	resp, err := provider.ChatCompletionStream(chatReq)
 	if err != nil {
 		if isRetryableError(502, err.Error()) {
-			return err
+			return 0, err
 		}
-		writeOpenAIError(w, http.StatusBadGateway, "Upstream request failed: "+err.Error(), "api_error")
+		writeOpenAIError(r, w, http.StatusBadGateway, "Upstream request failed: "+err.Error(), "api_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
 		}
-		return nil
+		return 0, nil
 	}
 	defer resp.Body.Close()
 
@@ -525,13 +548,13 @@ func (h *OpenAIHandler) tryStreamingRequest(w http.ResponseWriter, r *http.Reque
 		body, _ := io.ReadAll(resp.Body)
 		errMsg := extractErrorMessage(body)
 		if isRetryableError(resp.StatusCode, errMsg) {
-			return fmt.Errorf("status %d: %s", resp.StatusCode, errMsg)
+			return resp.StatusCode, fmt.Errorf("status %d: %s", resp.StatusCode, errMsg)
 		}
-		writeOpenAIError(w, mapUpstreamStatusToHTTP(resp.StatusCode), errMsg, "api_error")
+		writeOpenAIError(r, w, mapUpstreamStatusToHTTP(resp.StatusCode), errMsg, "api_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
 		}
-		return nil
+		return resp.StatusCode, nil
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -626,7 +649,7 @@ toolLoop:
 			sendSSEChunk(w, flusher, responseID, req.Model, created, toolCallsChunk, "tool_calls")
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
-			return nil
+			return resp.StatusCode, nil
 		}
 
 		chatReq.Messages = append(chatReq.Messages, providers.ChatMessage{Role: "assistant", ToolCalls: []providers.ToolCall{{ID: toolCallID, Name: toolCallName, Arguments: toolCallArgs}}})
@@ -662,7 +685,21 @@ toolLoop:
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 
-	h.geminiService.LogRequest(client.ID, chatReq.Model, resp.StatusCode, it, ot, int(time.Since(start).Milliseconds()), "", requestBody, true, len(toolNames) > 0, strings.Join(toolNames, ","))
+	// SEC-003（P1-04B）：metadata-only 持久化——结构化 API 无正文/错误文本可传
+	h.geminiService.LogRequest(services.RequestRecord{
+		RequestID:    middleware.GetRequestID(r),
+		ClientID:     client.ID,
+		Provider:     provider.Name(),
+		Model:        chatReq.Model,
+		StatusCode:   resp.StatusCode,
+		InputTokens:  it,
+		OutputTokens: ot,
+		LatencyMs:    int(time.Since(start).Milliseconds()),
+		ErrorCode:    services.ClassifyUpstreamError(resp.StatusCode, nil),
+		IsStreaming:  true,
+		HasTools:     len(toolNames) > 0,
+		ToolNames:    strings.Join(toolNames, ","),
+	})
 	RecordRequest(client.ID, chatReq.Model, fmt.Sprintf("%d", resp.StatusCode), it, ot, int(time.Since(start).Milliseconds()))
 	if h.statsService != nil {
 		h.statsService.DecrementRequestsInProgress()
@@ -670,7 +707,7 @@ toolLoop:
 	if client.BackendModels == "" {
 		h.updateClientModels(client, provider)
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 func sendSSEChunk(w http.ResponseWriter, flusher http.Flusher, id, model string, created int64, delta map[string]interface{}, finishReason interface{}) {

@@ -196,18 +196,22 @@ func (h *DashboardHub) buildPayload() []byte {
 	// Convert request logs to serializable maps
 	logMaps := make([]map[string]interface{}, len(recentLogs))
 	for i, l := range recentLogs {
+		// SEC-003（P1-04B）：WS 只广播纯 metadata——旧 request_body presence 字段已删除，
+		// 绝不广播正文或 raw error 文本。
 		logMaps[i] = map[string]interface{}{
+			"request_id":    l.RequestID,
 			"client_id":     l.ClientID,
+			"provider":      l.Provider,
 			"model":         l.Model,
 			"status_code":   l.StatusCode,
 			"input_tokens":  l.InputTokens,
 			"output_tokens": l.OutputTokens,
 			"latency_ms":    l.LatencyMs,
+			"error_code":    l.ErrorCode,
 			"created_at":    l.CreatedAt.Format("Jan 02, 2006 15:04"),
 			"is_streaming":  l.IsStreaming,
 			"has_tools":     l.HasTools,
 			"tool_names":    l.ToolNames,
-			"request_body":  l.RequestBody != "",
 		}
 	}
 
