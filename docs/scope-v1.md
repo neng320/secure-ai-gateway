@@ -20,6 +20,12 @@
 
 **当前部署状态声明：** 本网关尚未在任何服务器部署，无真实流量、无属于运营者的真实凭证入库。入库凭证属于上游作者实例，按"已泄漏"原则处理（见 SEC-005 关闭标准）。在 SEC-001~005 全部关闭前，**禁止在公网环境运行任何实例**，开发实例仅允许绑定 loopback。
 
+### Hardening Backlog（非阻塞，SEC-002 保持 CLOSED）
+
+| ID | 描述 | 来源 | 状态 |
+|---|---|---|---|
+| P1-03D1A.1 | **Master-Key Coherence Hardening**：`-replace-provider-key` 覆盖既有 encrypted key 前，current envelope 必须能被当前 Master Key 验证/解密；若系统已有其他 encrypted secrets，新 provisioning 的 key_id 必须与现有 secret set 一致；wrong master key → 拒绝写 config（原文件 byte-for-byte 不变）。该问题不造成明文泄漏（SEC-002 关闭标准不受影响），属 Master-Key 一致性/可用性加固 | SEC-002 复验发现 | 📋 BACKLOG |
+
 ---
 
 ## 2. V1 MUST（发布必需）

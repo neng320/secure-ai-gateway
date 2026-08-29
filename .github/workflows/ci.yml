@@ -53,7 +53,8 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: '1'
-        run: go test ./...
+        # DW-01：-count=1 禁用 test cache——防止安全 Gate 回归被缓存结果掩盖
+        run: go test ./... -count=1
 
   security:
     name: Secret Scan & Repo Hygiene
