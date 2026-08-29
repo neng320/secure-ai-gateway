@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,13 +96,14 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	// ---- Phase -1: DB fail-closed（存在性 + regular file），绝不创建空库 ----
+	// 目录 / FIFO / socket / 设备文件等一切非 regular file 一律 STOP（P1-03C3.1）。
 	dbPath := cfg.Database.Path
 	st, statErr := os.Stat(dbPath)
 	if statErr != nil {
 		return nil, fmt.Errorf("migration: database %s: %w (refusing to create)", dbPath, statErr)
 	}
-	if st.IsDir() {
-		return nil, fmt.Errorf("migration: database %s is a directory — stop", dbPath)
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("migration: database %s is not a regular file — stop", dbPath)
 	}
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -116,22 +118,32 @@ func Run(opts Options) (*Result, error) {
 	}
 	defer func() { _ = sqlDB.Close() }()
 
-	// 显式 schema 检查（P1-03C2.1）：clients 表与 legacy 明文列必须存在；
-	// encrypted 列允许缺失（旧 schema）——备份完成后再做 additive 补齐。
+	// 显式 schema 检查（P1-03C2.1/C3.1）：全部必要 precondition 必须在任何 mutation
+	// （含备份后的 ADD COLUMN）之前验证完毕——后续 SELECT 依赖的 clients.id 与
+	// clients.backend_api_key 缺一即明确 STOP，绝不许出现半途 "no such column" 。
 	if !tableExists(db, "clients") {
 		return nil, fmt.Errorf("migration: schema check failed: table 'clients' not found in %s — stop", dbPath)
+	}
+	if !columnExists(db, "clients", "id") {
+		return nil, fmt.Errorf("migration: schema check failed: column 'clients.id' not found — stop")
 	}
 	if !columnExists(db, "clients", "backend_api_key") {
 		return nil, fmt.Errorf("migration: schema check failed: column 'clients.backend_api_key' not found — stop")
 	}
 	encryptedColumnReady := columnExists(db, "clients", "backend_api_key_encrypted")
 
+	// manifest 元数据（P1-03C3.1）：全部在任何 mutation 之前取得
+	var userVersion int64
+	if err := db.Raw("PRAGMA user_version").Scan(&userVersion).Error; err != nil {
+		return nil, fmt.Errorf("migration: read sqlite user_version: %w", err)
+	}
+
 	res := &Result{Phases: []string{}}
 
 	// ---- Phase 0: BACKUP（VACUUM INTO 一致性快照 + config 原始字节副本 + manifest）----
 	// 顺序硬约束（P1-03C2.1）：备份必须先于任何 schema/数据变更；
 	// config 备份写入的是上面捕获的原始字节，绝不重新序列化。
-	backupDir, err := takeBackup(db, sqlDB, cfg, opts.ConfigPath, rawCfg, opts.BackupDir, mgr.KeyID(), now())
+	backupDir, err := takeBackup(db, sqlDB, cfg, opts.ConfigPath, rawCfg, opts.BackupDir, mgr.KeyID(), encryptedColumnReady, userVersion, now())
 	if err != nil {
 		return nil, fmt.Errorf("migration: backup: %w", err)
 	}
@@ -342,11 +354,15 @@ func atomicWriteConfig(cfg *config.Config, path string) error {
 	return nil
 }
 
+// MigrationFormatVersion: 迁移快照格式的稳定版本标识（manifest 元数据，非敏感）。
+const MigrationFormatVersion = "p1-provider-secret-v1"
+
 // takeBackup: 迁移专用 recovery snapshot。
 //   - DB：VACUUM INTO（SQLite 一致性快照；离线模式无并发写者）
 //   - config：原始字节副本（P1-03C2.1：调用方在任何 mutation 之前捕获的 rawCfg，绝不重新序列化）
-//   - manifest.json：时间/路径/key_id/SHA-256；绝不包含 Master Key 或 plaintext key
-func takeBackup(db *gorm.DB, sqlDB *sql.DB, cfg *config.Config, configPath string, rawCfg []byte, backupRoot, keyID string, now time.Time) (string, error) {
+//   - manifest.json：时间/路径/key_id/SHA-256/迁移格式与 schema 状态（P1-03C3.1）；
+//     绝不包含 Master Key、plaintext key 或 encrypted envelope
+func takeBackup(db *gorm.DB, sqlDB *sql.DB, cfg *config.Config, configPath string, rawCfg []byte, backupRoot, keyID string, encryptedColumnBefore bool, sqliteUserVersion int64, now time.Time) (string, error) {
 	ts := now.UTC().Format("20060102T150405Z")
 	backupDir := filepath.Join(backupRoot, "migration-backup-"+ts)
 	// 绝不覆盖既有备份：时间戳碰撞（同秒重跑）时追加序号
@@ -383,13 +399,17 @@ func takeBackup(db *gorm.DB, sqlDB *sql.DB, cfg *config.Config, configPath strin
 	}
 
 	manifest := map[string]string{
-		"timestamp":          now.UTC().Format(time.RFC3339),
-		"source_config_path": configPath,
-		"source_db_path":     cfg.Database.Path,
-		"master_key_id":      keyID,
-		"config_sha256":      hex.EncodeToString(cfgSum[:]),
-		"db_snapshot_sha256": dbSum,
-		"sensitivity":        "contains legacy plaintext provider keys - SENSITIVE, encrypt or offline-store, never push",
+		"timestamp":                now.UTC().Format(time.RFC3339),
+		"migration_format_version": MigrationFormatVersion,
+		"source_config_path":       configPath,
+		"source_db_path":           cfg.Database.Path,
+		"master_key_id":            keyID,
+		"config_sha256":            hex.EncodeToString(cfgSum[:]),
+		"db_snapshot_sha256":       dbSum,
+		// snapshot 时 encrypted 列是否已存在（ADD COLUMN additive 升级发生之前的状态）
+		"schema_clients_backend_api_key_encrypted_before": strconv.FormatBool(encryptedColumnBefore),
+		"sqlite_user_version":                             fmt.Sprintf("%d", sqliteUserVersion),
+		"sensitivity":                                     "contains legacy plaintext provider keys - SENSITIVE, encrypt or offline-store, never push",
 	}
 	manifestRaw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
