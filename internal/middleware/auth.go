@@ -48,13 +48,15 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			log.Printf("[AUTH] Invalid Authorization header format for %s %s: %s", r.Method, r.URL.Path, authHeader[:min(20, len(authHeader))])
+			// P1-04.3：Authorization 内容（哪怕前 20 字符，短 token 可能整段）是凭证材料——绝不入日志
+			log.Printf("[AUTH] invalid authorization format for %s %s", r.Method, r.URL.Path)
 			http.Error(w, `{"error": "Invalid Authorization header format"}`, http.StatusUnauthorized)
 			return
 		}
 
 		apiKey := parts[1]
-		log.Printf("[AUTH] Trying to authenticate API key: %s... for %s %s", apiKey[:min(8, len(apiKey))], r.Method, r.URL.Path)
+		// P1-04.3：key 前缀也是凭证——认证尝试只记录 method/path
+		log.Printf("[AUTH] authentication attempt for %s %s", r.Method, r.URL.Path)
 
 		// Don't cache - always read fresh to pick up client config changes immediately
 		client, err := m.clientService.GetClientByAPIKey(apiKey)
@@ -65,7 +67,7 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 		}
 
 		if client == nil {
-			log.Printf("[AUTH] Invalid API key: %s... for %s %s", apiKey[:min(8, len(apiKey))], r.Method, r.URL.Path)
+			log.Printf("[AUTH] invalid api key for %s %s", r.Method, r.URL.Path)
 			http.Error(w, `{"error": "Invalid API key"}`, http.StatusUnauthorized)
 			return
 		}
@@ -79,7 +81,7 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 		// Update LastSeen in the background (don't wait)
 		go m.clientService.UpdateLastSeen(client.ID)
 
-		log.Printf("[AUTH] Authenticated client %s (%s) for %s %s", client.Name, client.ID, r.Method, r.URL.Path)
+		log.Printf("[AUTH] authenticated client_id=%s for %s %s", client.ID, r.Method, r.URL.Path)
 		ctx := context.WithValue(r.Context(), ClientContextKey, client)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

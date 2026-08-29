@@ -449,7 +449,7 @@ func createDefaultConfig(path string) (*Config, error) {
 	fmt.Printf("  Default credentials generated!\n")
 	fmt.Printf("===========================================\n")
 	fmt.Printf("  Username: admin\n")
-	fmt.Printf("  Password: %s\n", defaultPassword)
+	fmt.Printf("  Password: %s\n", defaultPassword) // secretlog:allow bootstrap-onetime-credential
 	fmt.Printf("  (Save this - it will not be shown again)\n")
 	fmt.Printf("===========================================\n\n")
 
@@ -477,7 +477,7 @@ func ensureDefaults(cfg Config, path string) (Config, error) {
 		fmt.Printf("\n===========================================\n")
 		fmt.Printf("  Prometheus credentials generated!\n")
 		fmt.Printf("  Username: %s\n", cfg.Prometheus.Username)
-		fmt.Printf("  Password: %s\n", cfg.Prometheus.Password)
+		fmt.Printf("  Password: %s\n", cfg.Prometheus.Password) // secretlog:allow bootstrap-onetime-credential
 		fmt.Printf("===========================================\n\n")
 	}
 
@@ -487,7 +487,7 @@ func ensureDefaults(cfg Config, path string) (Config, error) {
 		fmt.Printf("\n===========================================\n")
 		fmt.Printf("  Prometheus password generated!\n")
 		fmt.Printf("  Username: %s\n", cfg.Prometheus.Username)
-		fmt.Printf("  Password: %s\n", cfg.Prometheus.Password)
+		fmt.Printf("  Password: %s\n", cfg.Prometheus.Password) // secretlog:allow bootstrap-onetime-credential
 		fmt.Printf("===========================================\n\n")
 	}
 

@@ -15,8 +15,13 @@ fail() {
   exit 1
 }
 
-echo "==> [1/7] gofmt（仅检查 Git 跟踪的 Go 文件）"
-unformatted=$(gofmt -l $(git ls-files '*.go'))
+echo "==> [1/7] gofmt（仅检查 Git 跟踪且实际存在的 Go 文件）"
+# 过滤已 staged 删除但尚未提交的文件（避免 gofmt 报 missing file）
+tracked_go=""
+for f in $(git ls-files '*.go'); do
+  [ -f "$f" ] && tracked_go="$tracked_go $f"
+done
+unformatted=$(gofmt -l $tracked_go)
 if [ -n "$unformatted" ]; then
   fail "以下文件需要 gofmt:
 $unformatted"
