@@ -49,6 +49,11 @@ var (
 	resetPw     = flag.String("reset-password", "", "Reset admin password to the specified value")
 	migrateSec  = flag.Bool("migrate-provider-secrets", false, "Offline migration: encrypt provider secrets (PREPARE/VERIFY/FINALIZE), then exit")
 	backupDirFl = flag.String("migration-backup-dir", "", "Backup root dir for provider secret migration (required with -migrate-provider-secrets)")
+	// P1-03D1A：安全 Global Provider Key provisioning。
+	// Key 绝不允许作为 CLI 参数（防 shell history / argv 泄露）——只能 TTY 隐藏输入或显式 stdin。
+	setProvKeyFl = flag.String("set-provider-key", "", "Provider name whose API key to provision securely (hidden TTY input + confirm; or -provider-key-stdin). Never pass the key as an argument.")
+	provKeyStdin = flag.Bool("provider-key-stdin", false, "Read the provider key from stdin instead of the TTY (explicit non-interactive mode; input is never echoed)")
+	replacePKey  = flag.Bool("replace-provider-key", false, "Allow overwriting an existing encrypted provider key (deliberate replacement)")
 )
 
 func main() {
@@ -77,6 +82,16 @@ func main() {
 	// P1-03C2：显式离线迁移模式——不启动任何 HTTP listener
 	if *migrateSec {
 		runProviderSecretMigration(*configPath, *backupDirFl)
+		return
+	}
+
+	// P1-03D1A：安全 Global Provider Key provisioning——不启动任何 HTTP listener
+	if *setProvKeyFl != "" {
+		reader := newProviderKeyReader(os.Stdin, *provKeyStdin)
+		if _, err := runSetProviderKey(*configPath, *setProvKeyFl, *replacePKey, reader, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
