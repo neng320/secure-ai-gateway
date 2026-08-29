@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"ai-gateway/internal/config"
-	"ai-gateway/internal/models"
 	"ai-gateway/internal/secrets"
 
 	"gorm.io/driver/sqlite"
@@ -80,16 +79,36 @@ func Run(opts Options) (*Result, error) {
 	}
 	mgr := secrets.NewManager(cipher)
 
-	cfg, err := config.Load(opts.ConfigPath)
+	// ---- Phase -2: 配置纯读取 + 原始字节捕获（P1-03C2.1：任何 mutation 之前）----
+	// 绝不使用有副作用的 config.Load（缺失会建默认配置、ensureDefaults 会写回）：
+	// 文件缺失 / 解析失败一律 STOP，不创建、不补写、不落任何默认值。
+	rawCfg, err := os.ReadFile(opts.ConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("migration: config %s: %w (refusing to continue)", opts.ConfigPath, err)
+	}
+	cfg, err := config.LoadExistingForMigration(opts.ConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("migration: load config: %w", err)
 	}
+	if cfg.Database.Path == "" {
+		return nil, fmt.Errorf("migration: database.path is empty in config — stop")
+	}
 
-	db, err := gorm.Open(sqlite.Open(cfg.Database.Path), &gorm.Config{
+	// ---- Phase -1: DB fail-closed（存在性 + regular file），绝不创建空库 ----
+	dbPath := cfg.Database.Path
+	st, statErr := os.Stat(dbPath)
+	if statErr != nil {
+		return nil, fmt.Errorf("migration: database %s: %w (refusing to create)", dbPath, statErr)
+	}
+	if st.IsDir() {
+		return nil, fmt.Errorf("migration: database %s is a directory — stop", dbPath)
+	}
+
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("migration: open db %s: %w", cfg.Database.Path, err)
+		return nil, fmt.Errorf("migration: open db %s: %w", dbPath, err)
 	}
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -97,15 +116,35 @@ func Run(opts Options) (*Result, error) {
 	}
 	defer func() { _ = sqlDB.Close() }()
 
+	// 显式 schema 检查（P1-03C2.1）：clients 表与 legacy 明文列必须存在；
+	// encrypted 列允许缺失（旧 schema）——备份完成后再做 additive 补齐。
+	if !tableExists(db, "clients") {
+		return nil, fmt.Errorf("migration: schema check failed: table 'clients' not found in %s — stop", dbPath)
+	}
+	if !columnExists(db, "clients", "backend_api_key") {
+		return nil, fmt.Errorf("migration: schema check failed: column 'clients.backend_api_key' not found — stop")
+	}
+	encryptedColumnReady := columnExists(db, "clients", "backend_api_key_encrypted")
+
 	res := &Result{Phases: []string{}}
 
-	// ---- Phase 0: BACKUP（VACUUM INTO 一致性快照 + config 副本 + manifest）----
-	backupDir, err := takeBackup(db, sqlDB, cfg, opts.ConfigPath, opts.BackupDir, mgr.KeyID(), now())
+	// ---- Phase 0: BACKUP（VACUUM INTO 一致性快照 + config 原始字节副本 + manifest）----
+	// 顺序硬约束（P1-03C2.1）：备份必须先于任何 schema/数据变更；
+	// config 备份写入的是上面捕获的原始字节，绝不重新序列化。
+	backupDir, err := takeBackup(db, sqlDB, cfg, opts.ConfigPath, rawCfg, opts.BackupDir, mgr.KeyID(), now())
 	if err != nil {
 		return nil, fmt.Errorf("migration: backup: %w", err)
 	}
 	res.BackupDir = backupDir
 	res.Phases = append(res.Phases, "BACKUP")
+
+	// ---- Phase 0.5: additive schema upgrade（备份之后；仅 ADD COLUMN，绝不 drop/rename）----
+	if !encryptedColumnReady {
+		if err := db.Exec("ALTER TABLE clients ADD COLUMN backend_api_key_encrypted text").Error; err != nil {
+			return nil, fmt.Errorf("migration: additive schema upgrade (ADD COLUMN backend_api_key_encrypted): %w", err)
+		}
+		res.Phases = append(res.Phases, "SCHEMA-ADD")
+	}
 
 	// ---- 清点（只统计数量；位置 ID 仅在 STOP 错误中出现）----
 	type globalTarget struct {
@@ -169,6 +208,8 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	// ---- PHASE 1: PREPARE（DB 事务写 encrypted；config 原子替换写 encrypted；legacy 暂留）----
+	// 原生 SQL 写入（P1-03C2.1）：迁移引擎承诺的最小 schema 只有 id/backend_api_key(+encrypted)，
+	// 不得依赖 gorm Update 自动维护的 updated_at 等列（旧库可能没有）。
 	err = db.Transaction(func(tx *gorm.DB) error {
 		for _, c := range clients {
 			if c.state != secrets.SecretLegacyOnly {
@@ -178,8 +219,7 @@ func Run(opts Options) (*Result, error) {
 			if err != nil {
 				return fmt.Errorf("prepare client:%s: %w", c.id, err)
 			}
-			if err := tx.Model(&models.Client{}).Where("id = ?", c.id).
-				Update("backend_api_key_encrypted", env).Error; err != nil {
+			if err := tx.Exec("UPDATE clients SET backend_api_key_encrypted = ? WHERE id = ?", env, c.id).Error; err != nil {
 				return fmt.Errorf("prepare client:%s write: %w", c.id, err)
 			}
 		}
@@ -232,7 +272,8 @@ func Run(opts Options) (*Result, error) {
 			return nil, verifyFail("client", rr.ID)
 		}
 	}
-	cfgVerify, err := config.Load(opts.ConfigPath)
+	// 纯读取重载（P1-03C2.1）：VERIFY 阶段绝不触发 ensureDefaults 写回
+	cfgVerify, err := config.LoadExistingForMigration(opts.ConfigPath)
 	if err != nil {
 		return nil, err
 	}
@@ -256,8 +297,7 @@ func Run(opts Options) (*Result, error) {
 			if rr.Encrypted == "" || rr.Legacy == "" {
 				continue
 			}
-			if err := tx.Model(&models.Client{}).Where("id = ?", rr.ID).
-				Update("backend_api_key", "").Error; err != nil {
+			if err := tx.Exec("UPDATE clients SET backend_api_key = '' WHERE id = ?", rr.ID).Error; err != nil {
 				return fmt.Errorf("clear client:%s: %w", rr.ID, err)
 			}
 			res.FinalizedClients++
@@ -304,9 +344,9 @@ func atomicWriteConfig(cfg *config.Config, path string) error {
 
 // takeBackup: 迁移专用 recovery snapshot。
 //   - DB：VACUUM INTO（SQLite 一致性快照；离线模式无并发写者）
-//   - config：字节级副本
+//   - config：原始字节副本（P1-03C2.1：调用方在任何 mutation 之前捕获的 rawCfg，绝不重新序列化）
 //   - manifest.json：时间/路径/key_id/SHA-256；绝不包含 Master Key 或 plaintext key
-func takeBackup(db *gorm.DB, sqlDB *sql.DB, cfg *config.Config, configPath, backupRoot, keyID string, now time.Time) (string, error) {
+func takeBackup(db *gorm.DB, sqlDB *sql.DB, cfg *config.Config, configPath string, rawCfg []byte, backupRoot, keyID string, now time.Time) (string, error) {
 	ts := now.UTC().Format("20060102T150405Z")
 	backupDir := filepath.Join(backupRoot, "migration-backup-"+ts)
 	// 绝不覆盖既有备份：时间戳碰撞（同秒重跑）时追加序号
@@ -331,16 +371,12 @@ func takeBackup(db *gorm.DB, sqlDB *sql.DB, cfg *config.Config, configPath, back
 	}
 	_ = res
 
-	// config 副本
-	srcCfg, err := os.ReadFile(configPath)
-	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(filepath.Join(backupDir, "config.yaml"), srcCfg, 0600); err != nil {
+	// config 原始字节副本（任何 mutation 之前捕获）
+	if err := os.WriteFile(filepath.Join(backupDir, "config.yaml"), rawCfg, 0600); err != nil {
 		return "", err
 	}
 
-	cfgSum := sha256.Sum256(srcCfg)
+	cfgSum := sha256.Sum256(rawCfg)
 	dbSum, err := fileSHA256(snapshotPath)
 	if err != nil {
 		return "", err
@@ -372,4 +408,23 @@ func fileSHA256(path string) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// tableExists / columnExists: 显式 schema 检查（P1-03C2.1）。
+// 表名/列名均为本包内常量调用，不构成注入面；目标是不让 "no such column"
+// 这类模糊错误出现在半途——schema 不符合预期在开库后立即明确 STOP。
+func tableExists(db *gorm.DB, table string) bool {
+	var n int64
+	if err := db.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '" + table + "'").Scan(&n).Error; err != nil {
+		return false
+	}
+	return n > 0
+}
+
+func columnExists(db *gorm.DB, table, column string) bool {
+	var n int64
+	if err := db.Raw("SELECT count(*) FROM pragma_table_info('" + table + "') WHERE name = '" + column + "'").Scan(&n).Error; err != nil {
+		return false
+	}
+	return n > 0
 }

@@ -29,8 +29,9 @@ type Config struct {
 type ProviderConfig struct {
 	// Type identifies the backend: gemini, openai, anthropic, mistral, ollama, lmstudio
 	Type string `yaml:"type" json:"type"`
-	// APIKey: LEGACY 明文字段（SEC-002 迁移来源，迁移完成后必须为空）
-	APIKey string `yaml:"api_key,omitempty" json:"api_key,omitempty"`
+	// APIKey: LEGACY 明文字段（SEC-002 迁移来源，迁移完成后必须为空）。
+	// json:"-"（P1-03C2.1）：legacy 明文与密文信封同样绝不允许进入任何 JSON 序列化路径。
+	APIKey string `yaml:"api_key,omitempty" json:"-"`
 	// APIKeyEncrypted: 新安全存储（P1-03C1 additive），AEAD 信封 enc:v1:...
 	APIKeyEncrypted string   `yaml:"api_key_encrypted,omitempty" json:"-"`
 	BaseURL         string   `yaml:"base_url,omitempty" json:"base_url,omitempty"`
@@ -226,6 +227,60 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	return &cfg, nil
+}
+
+// LoadExistingForMigration: 面向离线迁移引擎的纯读取加载器（P1-03C2.1）。
+//
+// 与 Load 的语义差异（迁移安全性硬约束）：
+//   - 文件不存在   → 错误（绝不 createDefaultConfig）
+//   - 解析失败     → 错误（绝不修改文件）
+//   - 不生成 default password / session secret / prometheus password（ensureDefaults 不参与）
+//   - 全程不写任何文件；不触碰包级 configPath 状态
+//
+// 仅做内存中的规范化（不落盘）：legacy 顶层 gemini 段并入 Providers、
+// provider Type/TimeoutSeconds 缺省补齐——迁移引擎需要按 provider 名清点。
+func LoadExistingForMigration(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: read %s: %w", path, err)
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+
+	if cfg.Providers == nil {
+		cfg.Providers = make(map[string]ProviderConfig)
+	}
+
+	if cfg.Gemini != nil {
+		if _, exists := cfg.Providers["gemini"]; !exists {
+			timeout := cfg.Gemini.TimeoutSeconds
+			if timeout == 0 {
+				timeout = 120
+			}
+			cfg.Providers["gemini"] = ProviderConfig{
+				Type:           "gemini",
+				APIKey:         cfg.Gemini.APIKey,
+				DefaultModel:   cfg.Gemini.DefaultModel,
+				AllowedModels:  cfg.Gemini.AllowedModels,
+				TimeoutSeconds: timeout,
+			}
+		}
+		cfg.Gemini = nil
+	}
+
+	for name, p := range cfg.Providers {
+		if p.TimeoutSeconds == 0 {
+			p.TimeoutSeconds = 120
+			cfg.Providers[name] = p
+		}
+		if p.Type == "" {
+			p.Type = name
+			cfg.Providers[name] = p
+		}
+	}
 	return &cfg, nil
 }
 
