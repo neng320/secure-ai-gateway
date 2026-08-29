@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"html/template"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -28,45 +27,48 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-var wsUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// SEC-004（P1-02C）：Admin WS 仅接受同源浏览器连接。
-	// - 严格 URL 解析比较，不做子串/后缀判断（admin.example.com.evil.example ≠ 同源）
-	// - 缺失 Origin 一律拒绝（浏览器必带 Origin；当前不存在必须支持的非浏览器 WS 客户端）
-	// - 不信任 X-Forwarded-*（Admin 走 loopback/隧道，无代理改写场景）
-	// - 端口：两侧都显式时必须一致；任一侧隐式默认端口时以 host 一致为准
-	CheckOrigin: func(r *http.Request) bool {
-		return wsOriginAllowed(r)
-	},
-}
-
-// wsOriginAllowed: Origin 的 host 与请求 Host 规范化后必须同源。
-func wsOriginAllowed(r *http.Request) bool {
+// wsOriginAllowed: 严格同源校验——scheme + hostname + effective port 全部一致。
+// effective port：显式端口优先，否则 scheme 默认端口（http=80 / https=443）。
+// Host 头按期望 scheme 解析（Admin 面浏览器访问的 scheme 即该值）。
+// 缺失 Origin 拒绝；不做子串/后缀判断；不信任 X-Forwarded-*。
+func wsOriginAllowed(r *http.Request, expectedScheme string) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return false
 	}
 	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+	if err != nil || u.Host == "" {
 		return false
 	}
-	oh, op, oerr := net.SplitHostPort(u.Host)
-	if oerr != nil {
-		oh, op = u.Host, ""
-	}
-	rh, rp, rerr := net.SplitHostPort(r.Host)
-	if rerr != nil {
-		rh, rp = r.Host, ""
-	}
-	if oh == "" || rh == "" || !strings.EqualFold(oh, rh) {
+	if !strings.EqualFold(u.Scheme, expectedScheme) {
 		return false
 	}
-	// 两侧端口都显式时必须一致；任一侧隐式默认端口 → host 一致即视为同源
-	if op != "" && rp != "" && op != rp {
+	oh := u.Hostname()
+	if oh == "" {
 		return false
 	}
-	return true
+	ru, err := url.Parse(expectedScheme + "://" + r.Host)
+	if err != nil {
+		return false
+	}
+	rh := ru.Hostname()
+	if rh == "" || !strings.EqualFold(oh, rh) {
+		return false
+	}
+	return effectivePort(u.Scheme, u.Port()) == effectivePort(expectedScheme, ru.Port())
+}
+
+// effectivePort: 显式端口优先，否则 scheme 默认端口
+func effectivePort(scheme, port string) string {
+	if port != "" {
+		return port
+	}
+	switch strings.ToLower(scheme) {
+	case "https":
+		return "443"
+	default:
+		return "80"
+	}
 }
 
 func KnownProviderTypes() []string {
@@ -106,6 +108,7 @@ type AdminHandler struct {
 	templates     *template.Template
 	sessionStore  auth.Store
 	loginLimiter  *auth.LoginRateLimiter
+	wsUpgrader    *websocket.Upgrader
 }
 
 type PageData struct {
@@ -133,6 +136,12 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 
 	gob.Register(time.Time{})
 
+	// SEC-004（P1-02.1）：WS 期望 scheme 由 admin.cookie_secure 权威决定
+	expectedScheme := "http"
+	if cfg.Admin.CookieSecure {
+		expectedScheme = "https"
+	}
+
 	return &AdminHandler{
 		cfg:           cfg,
 		clientService: clientService,
@@ -143,6 +152,14 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 		templates:     tmpl,
 		sessionStore:  sessionStore,
 		loginLimiter:  loginLimiter,
+		wsUpgrader: &websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			// SEC-004（P1-02.1）：严格同源——scheme + hostname + effective port 全比较
+			CheckOrigin: func(r *http.Request) bool {
+				return wsOriginAllowed(r, expectedScheme)
+			},
+		},
 	}, nil
 }
 
@@ -318,14 +335,11 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if username != h.cfg.Admin.Username {
-		h.loginLimiter.RecordFailure(username)
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
-
-	err := bcrypt.CompareHashAndPassword([]byte(h.cfg.Admin.PasswordHash), []byte(password))
-	if err != nil {
+	// P1-02.1：无论 username 是否存在都执行等价 bcrypt 校验，消除响应时间差异
+	// （不存在用户名提前返回会让攻击者枚举出真实管理员名）
+	usernameOK := username == h.cfg.Admin.Username
+	passwordOK := bcrypt.CompareHashAndPassword([]byte(h.cfg.Admin.PasswordHash), []byte(password)) == nil
+	if !usernameOK || !passwordOK {
 		h.loginLimiter.RecordFailure(username)
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
@@ -899,7 +913,7 @@ func formatModelArray(models []string) string {
 
 // HandleDashboardWS upgrades an HTTP connection to WebSocket for real-time dashboard updates.
 func (h *AdminHandler) HandleDashboardWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	conn, err := h.wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[WS] Upgrade failed: %v", err)
 		return

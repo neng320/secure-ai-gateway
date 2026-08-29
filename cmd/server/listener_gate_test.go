@@ -346,3 +346,25 @@ func mustBuildAdmin(t *testing.T, deps gatewayDeps) chiRouter {
 	}
 	return r
 }
+
+// [P1-02.1 Gate] Admin 面请求体上限恢复：超大 POST 必须被拒（413/400/401 类），正常路径不受影响。
+func TestGateListener_AdminBodyLimit(t *testing.T) {
+	env := newTestGateway(t, false, false)
+
+	big := strings.Repeat("A", (10<<20)+1024) // 10MiB + 1KB
+	req, _ := http.NewRequest("POST", env.admin.URL+"/admin/login", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("oversize request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound {
+		t.Fatalf("[安全回归失败] 超限 body 未被拒绝: %d", resp.StatusCode)
+	}
+
+	// 对照：正常小请求路径仍可用（登录页 200）
+	if got := get(t, env.admin.URL+"/admin/login"); got != http.StatusOK {
+		t.Fatalf("对照请求期望 200，实际 %d", got)
+	}
+}

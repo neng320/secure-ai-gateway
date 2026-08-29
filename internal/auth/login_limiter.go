@@ -21,8 +21,10 @@ const (
 	DefaultLoginMaxFailures = 5
 	// DefaultLoginLockout: 锁定时长（同时是失败窗口：窗口外失败自动过期重计）
 	DefaultLoginLockout = 15 * time.Minute
-	// maxTrackedUsernames: 追踪条目上限（防恶意刷不同用户名撑爆内存）
+	// maxTrackedUsernames: 非 保护账号 的追踪条目上限（防恶意刷不同用户名撑爆内存）
 	maxTrackedUsernames = 10000
+	// maxTrackedUsernameLen: 追踪 key 的最大长度（超长用户名截断，防止巨型 map key）
+	maxTrackedUsernameLen = 255
 )
 
 type loginFailure struct {
@@ -32,12 +34,16 @@ type loginFailure struct {
 }
 
 // LoginRateLimiter: 按 username 维度限制登录失败。
+//
+// protectedUsername（受保护账号，即真实管理员）享有硬保障：
+// 容量满时其失败记录仍被追踪，攻击者无法通过刷满随机用户名关闭对它的防爆破。
 type LoginRateLimiter struct {
-	mu          sync.Mutex
-	failures    map[string]*loginFailure
-	maxFailures int
-	lockout     time.Duration
-	now         func() time.Time // 可注入时钟（测试用）
+	mu            sync.Mutex
+	failures      map[string]*loginFailure
+	maxFailures   int
+	lockout       time.Duration
+	now           func() time.Time // 可注入时钟（测试用）
+	protectedUser string
 }
 
 func NewLoginRateLimiter() *LoginRateLimiter {
@@ -49,8 +55,8 @@ func NewLoginRateLimiter() *LoginRateLimiter {
 	}
 }
 
-// Configure 覆盖默认阈值（来自 admin.login_max_failures / login_lockout_minutes）。
-func (l *LoginRateLimiter) Configure(maxFailures int, lockout time.Duration) {
+// Configure 覆盖默认阈值并指定受保护账号（来自 admin.* 配置）。
+func (l *LoginRateLimiter) Configure(maxFailures int, lockout time.Duration, protectedUsername string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if maxFailures > 0 {
@@ -59,13 +65,22 @@ func (l *LoginRateLimiter) Configure(maxFailures int, lockout time.Duration) {
 	if lockout > 0 {
 		l.lockout = lockout
 	}
+	l.protectedUser = l.normalize(protectedUsername)
+}
+
+// normalize: 追踪 key 截断（安全方向：截断碰撞只会累计更保守的失败计数）
+func (l *LoginRateLimiter) normalize(username string) string {
+	if len(username) > maxTrackedUsernameLen {
+		return username[:maxTrackedUsernameLen]
+	}
+	return username
 }
 
 // Allow 判断该 username 当前是否允许尝试登录（未锁定）。
 func (l *LoginRateLimiter) Allow(username string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	f, ok := l.failures[username]
+	f, ok := l.failures[l.normalize(username)]
 	if !ok {
 		return true
 	}
@@ -80,7 +95,7 @@ func (l *LoginRateLimiter) Allow(username string) bool {
 func (l *LoginRateLimiter) RetryAfter(username string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	f, ok := l.failures[username]
+	f, ok := l.failures[l.normalize(username)]
 	if !ok {
 		return 0
 	}
@@ -92,15 +107,19 @@ func (l *LoginRateLimiter) RetryAfter(username string) int {
 }
 
 // RecordFailure 记录一次失败；达到阈值即进入锁定窗口。
+//
+// 容量语义（P1-02.1 修正）：受保护账号不受容量限制——攻击者刷满随机用户名
+// 也绝不能关闭对真实管理员的防爆破；仅对非保护账号应用容量上限。
 func (l *LoginRateLimiter) RecordFailure(username string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
+	username = l.normalize(username)
 
-	if len(l.failures) >= maxTrackedUsernames {
-		// 容量保护：先清过期；仍满则拒绝追踪新条目（该用户名走普通失败流）
+	if username != l.protectedUser && len(l.failures) >= maxTrackedUsernames {
+		// 容量保护（仅非保护账号）：先清过期；仍满则放弃追踪该随机用户名
 		l.trimExpiredLocked(now)
-		if len(l.failures) >= maxTrackedUsernames {
+		if _, isProtected := l.failures[username]; !isProtected && len(l.failures) >= maxTrackedUsernames {
 			return
 		}
 	}
@@ -125,7 +144,7 @@ func (l *LoginRateLimiter) RecordFailure(username string) {
 func (l *LoginRateLimiter) RecordSuccess(username string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.failures, username)
+	delete(l.failures, l.normalize(username))
 }
 
 // trimExpiredLocked: 清理锁定与窗口均已过期的条目（调用方持锁）。
