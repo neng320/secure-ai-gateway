@@ -134,7 +134,7 @@ func newGateEnv(t *testing.T, encryptedGlobal bool) *gateEnv {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	t.Cleanup(func() {
@@ -170,18 +170,18 @@ func newGateEnv(t *testing.T, encryptedGlobal bool) *gateEnv {
 // createGateClient: 建一个网关 client 并返回其网关 API Key（明文）
 func (e *gateEnv) createGateClient(t *testing.T, backend, overrideBaseURL string, overrideKeyEnv string) (string, string) {
 	t.Helper()
-	client, gwKey, err := e.clientSvc.CreateClient("gate-client", "", "openai", "sk-", e.cfg)
+	client, gwKey, err := e.clientSvc.CreateClient("gate-client", "", "openai", "sk-", e.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.Backend = backend // service 层默认 gemini，显式指定
+	updates := map[string]interface{}{"backend": backend} // service 层默认 gemini，显式指定
 	if overrideBaseURL != "" {
-		client.BackendBaseURL = overrideBaseURL
+		updates["backend_base_url"] = overrideBaseURL
 	}
 	if overrideKeyEnv != "" {
-		client.BackendAPIKeyEncrypted = overrideKeyEnv
+		updates["backend_api_key_encrypted"] = overrideKeyEnv
 	}
-	if err := e.clientSvc.UpdateClient(client); err != nil {
+	if err := e.clientSvc.UpdateClientSettings(client.ID, updates); err != nil {
 		t.Fatal(err)
 	}
 	return client.ID, gwKey
@@ -262,9 +262,10 @@ func TestMigrationGate_ClientEncryptedOverride_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.BackendBaseURL = e.upstream.URL + "/v1"
-	client.BackendAPIKeyEncrypted = envC
-	if err := e.clientSvc.UpdateClient(client); err != nil {
+	if err := e.clientSvc.UpdateClientSettings(client.ID, map[string]interface{}{
+		"backend_base_url":          e.upstream.URL + "/v1",
+		"backend_api_key_encrypted": envC,
+	}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -276,6 +276,7 @@ func autoMigrate(db *gorm.DB) error {
 		&models.RequestLog{},
 		&models.DailyUsage{},
 		&models.AdminSession{},
+		&models.AuditEvent{}, // P1-05C：通用审计事件（additive new table）
 	)
 }
 

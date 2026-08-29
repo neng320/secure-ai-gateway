@@ -184,8 +184,8 @@ func (h *OpenAIHandler) updateClientModels(client *models.Client, provider provi
 		return
 	}
 
-	client.BackendModels = string(modelsJSON)
-	h.clientService.UpdateClient(client)
+	// P1-05C：dedicated bounded update——绝不整行 Save（§4）
+	_ = h.clientService.UpdateClientModels(client.ID, string(modelsJSON))
 }
 
 func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) {

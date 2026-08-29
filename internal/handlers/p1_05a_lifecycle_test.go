@@ -48,6 +48,7 @@ const (
 
 type p105Env struct {
 	db          *gorm.DB
+	dbPath      string
 	cfg         *config.Config
 	clientSvc   *services.ClientService
 	gemini      *services.GeminiService
@@ -60,11 +61,12 @@ func newP105Env(t *testing.T) *p105Env {
 	t.Helper()
 	// P1-05B：与生产 initDatabase 一致的打开路径——DSN _foreign_keys=on
 	// （连接池所有连接强制外键；late-write / ORPHAN-DATA 判定依赖它）
-	db, err := database.Open(filepath.Join(t.TempDir(), "p105.db"))
+	dbPath := filepath.Join(t.TempDir(), "p105.db")
+	db, err := database.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -108,7 +110,7 @@ func newP105Env(t *testing.T) *p105Env {
 	adminMux := chi.NewRouter()
 	adminH.RegisterRoutes(adminMux)
 
-	return &p105Env{db: db, cfg: cfg, clientSvc: clientSvc, gemini: geminiSvc, rateLimiter: sharedLimiter, api: apiMux, admin: adminMux}
+	return &p105Env{db: db, dbPath: dbPath, cfg: cfg, clientSvc: clientSvc, gemini: geminiSvc, rateLimiter: sharedLimiter, api: apiMux, admin: adminMux}
 }
 
 // insertClientWithKey: 以指定 key 的 SHA-256 直接入库（控制 key 值为 canary）
@@ -152,7 +154,7 @@ func (e *p105Env) countAll(t *testing.T, table string) int64 {
 // ---------------------------------------------------------------------------
 func TestP105A_Create_PlaintextOneTime_HashOnly(t *testing.T) {
 	env := newP105Env(t)
-	c, key, err := env.clientSvc.CreateClient("p105-create", "desc", "openai", "sk-", env.cfg)
+	c, key, err := env.clientSvc.CreateClient("p105-create", "desc", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +196,7 @@ func TestP105A_Rotate_ExistingClient_Immediate(t *testing.T) {
 		t.Fatalf("rotate 前原 key 应 200，实际 %d", resp.StatusCode)
 	}
 
-	newKey, err := env.clientSvc.RegenerateAPIKey(c.ID, "openai", "sk-")
+	newKey, err := env.clientSvc.RegenerateAPIKey(c.ID, "openai", "sk-", "test-admin", "P105C rotate reason")
 	if err != nil || newKey == "" || newKey == p105OriginalKey {
 		t.Fatalf("RegenerateAPIKey 应返回新 key: err=%v key=%q", err, newKey)
 	}
@@ -229,7 +231,7 @@ func TestP105A_Rotate_ExistingClient_Immediate(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105A_Rotate_Nonexistent_FalseSuccess(t *testing.T) {
 	env := newP105Env(t)
-	key, err := env.clientSvc.RegenerateAPIKey("nonexistent-client-id", "openai", "sk-")
+	key, err := env.clientSvc.RegenerateAPIKey("nonexistent-client-id", "openai", "sk-", "test-admin", "P105C rotate reason")
 	if !errors.Is(err, services.ErrClientNotFound) {
 		t.Fatalf("[P1-05B FIXED] 不存在 client 应返回 ErrClientNotFound，实际 err=%v", err)
 	}
@@ -254,8 +256,7 @@ func TestP105A_Disable_ActualStatus_401_Not403(t *testing.T) {
 		t.Fatalf("disable 前应 200，实际 %d", resp.StatusCode)
 	}
 
-	c.IsActive = false
-	if err := env.clientSvc.UpdateClient(c); err != nil {
+	if err := env.clientSvc.SuspendClient(c.ID, "test-admin", "P105C suspend reason"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -282,16 +283,14 @@ func TestP105A_ReEnable_OriginalKeyResumes(t *testing.T) {
 	env := newP105Env(t)
 	c := env.insertClientWithKey(t, "p105-res", p105OriginalKey, true)
 
-	c.IsActive = false
-	if err := env.clientSvc.UpdateClient(c); err != nil {
+	if err := env.clientSvc.SuspendClient(c.ID, "test-admin", "P105C suspend reason"); err != nil {
 		t.Fatal(err)
 	}
 	if resp := env.doAuth(t, p105OriginalKey); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("suspend 后应 401，实际 %d", resp.StatusCode)
 	}
 
-	c.IsActive = true
-	if err := env.clientSvc.UpdateClient(c); err != nil {
+	if err := env.clientSvc.ResumeClient(c.ID, "test-admin", ""); err != nil {
 		t.Fatal(err)
 	}
 	if resp := env.doAuth(t, p105OriginalKey); resp.StatusCode != http.StatusOK {
@@ -305,7 +304,7 @@ func TestP105A_ReEnable_OriginalKeyResumes(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105A_Delete_OrphanData(t *testing.T) {
 	env := newP105Env(t)
-	client, _, err := env.clientSvc.CreateClient("p105-del", "", "openai", "sk-", env.cfg)
+	client, _, err := env.clientSvc.CreateClient("p105-del", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +322,7 @@ func TestP105A_Delete_OrphanData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := env.clientSvc.DeleteClient(client.ID); err != nil {
+	if err := env.clientSvc.DeleteClient(client.ID, "test-admin", "P105C delete reason"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -344,7 +343,7 @@ func TestP105A_Delete_RemovesEncryptedMaterial(t *testing.T) {
 		Update("backend_api_key_encrypted", p105Envelope).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := env.clientSvc.DeleteClient(c.ID); err != nil {
+	if err := env.clientSvc.DeleteClient(c.ID, "test-admin", "P105C delete reason"); err != nil {
 		t.Fatal(err)
 	}
 	var n int64
@@ -363,7 +362,7 @@ func TestP105A_Delete_RemovesEncryptedMaterial(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105A_AdminRegenerate_HappyPath_OneTimeDisplay(t *testing.T) {
 	env := newP105Env(t)
-	client, _, err := env.clientSvc.CreateClient("p105-hreg", "", "openai", "sk-", env.cfg)
+	client, _, err := env.clientSvc.CreateClient("p105-hreg", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +379,7 @@ func TestP105A_AdminRegenerate_HappyPath_OneTimeDisplay(t *testing.T) {
 	}
 
 	// 合法 POST → 200，页面出现新明文 key
-	form := url.Values{"key_type": {"openai"}, "key_prefix": {"sk-"}}
+	form := url.Values{"key_type": {"openai"}, "key_prefix": {"sk-"}, "reason": {"P105C rotate reason"}}
 	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/regenerate", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
@@ -416,7 +415,7 @@ func TestP105A_AdminRegenerate_NonexistentClient_404(t *testing.T) {
 	env := newP105Env(t)
 	token := p105AdminSessionOf(t, env)
 
-	form := url.Values{"key_type": {"openai"}, "key_prefix": {"sk-"}}
+	form := url.Values{"key_type": {"openai"}, "key_prefix": {"sk-"}, "reason": {"P105C rotate reason"}}
 	req := httptest.NewRequest("POST", "/admin/clients/nonexistent-id/regenerate", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
@@ -442,7 +441,7 @@ func TestP105A_AdminRegenerate_NonexistentClient_404(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Audit / 吊销字段：当前均为 0/不存在（反射断言 + 文档记录；P1-05C 前保持）
+// Audit / 吊销字段：P1-05C —— Revoked* 三字段已加入；仍无 Status/AuditEvents 持久字段
 // ---------------------------------------------------------------------------
 func TestP105A_AuditAndRevocationAbsent(t *testing.T) {
 	var model models.Client
@@ -451,12 +450,20 @@ func TestP105A_AuditAndRevocationAbsent(t *testing.T) {
 	for i := 0; i < typ.NumField(); i++ {
 		have[typ.Field(i).Name] = true
 	}
-	for _, absent := range []string{"RevokedAt", "RevokationReason", "RevokedBy", "Status", "AuditEvents"} {
-		if have[absent] {
-			t.Fatalf("[固化失败] Client 模型不应有 %s（当前无生命周期状态字段）", absent)
+	// P1-05C（§1）：RevokedAt/RevokedBy/RevocationReason 存在（additive nullable）
+	for _, present := range []string{"RevokedAt", "RevokedBy", "RevocationReason"} {
+		if !have[present] {
+			t.Fatalf("[P1-05C FIXED] Client 模型应有 %s", present)
 		}
 	}
-	t.Log("[CURRENT] 固化：无 revocation_reason / revoked_at / revoked_by 字段；无任何持久化生命周期审计事件（P1-05C 前保持）")
+	// 不新增持久化 Status 字段（状态必须从 RevokedAt+IsActive 派生，§1 冻结设计）；
+	// AuditEvents 关联字段也不在（审计走独立 audit_events 表）
+	for _, absent := range []string{"Status", "AuditEvents"} {
+		if have[absent] {
+			t.Fatalf("[固化失败] Client 模型不应有 %s（无第二份状态真相/无嵌入事件）", absent)
+		}
+	}
+	t.Log("[P1-05C FIXED] RevokedAt/RevokedBy/RevocationReason 已加入（additive）；仍无 Status 持久字段")
 }
 
 // ---------------------------------------------------------------------------

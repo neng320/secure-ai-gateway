@@ -65,7 +65,7 @@ func newTestGateway(t *testing.T, prometheusEnabled, setupRequired bool) *gatewa
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	t.Cleanup(func() {
@@ -140,7 +140,7 @@ func TestGateListener_PublicAPI(t *testing.T) {
 		t.Fatalf("public /v1/models 无 key 期望 401，实际 %d", got)
 	}
 
-	client, apiKey, err := env.deps.clientService.CreateClient("gate", "", "openai", "sk-", env.cfg)
+	client, apiKey, err := env.deps.clientService.CreateClient("gate", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}

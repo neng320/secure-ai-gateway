@@ -90,7 +90,7 @@ func newFallbackEnv(t *testing.T) *fallbackEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -144,22 +144,22 @@ func newFallbackEnv(t *testing.T) *fallbackEnv {
 // createFallbackClient: 建 client 并按需设置 encrypted override / BaseURL override
 func (e *fallbackEnv) createFallbackClient(t *testing.T, overrideKey string, overrideBase string) *models.Client {
 	t.Helper()
-	client, _, err := e.clientSvc.CreateClient("fb", "", "openai", "sk-", e.cfgPersist)
+	client, _, err := e.clientSvc.CreateClient("fb", "", "openai", "sk-", e.cfgPersist, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.Backend = "openai"
+	updates := map[string]interface{}{"backend": "openai"}
 	if overrideBase != "" {
-		client.BackendBaseURL = overrideBase
+		updates["backend_base_url"] = overrideBase
 	}
 	if overrideKey != "" {
 		env, encErr := e.manager.EncryptClientBackendKey(client.ID, []byte(overrideKey))
 		if encErr != nil {
 			t.Fatal(encErr)
 		}
-		client.BackendAPIKeyEncrypted = env
+		updates["backend_api_key_encrypted"] = env
 	}
-	if err := e.clientSvc.UpdateClient(client); err != nil {
+	if err := e.clientSvc.UpdateClientSettings(client.ID, updates); err != nil {
 		t.Fatal(err)
 	}
 	return client

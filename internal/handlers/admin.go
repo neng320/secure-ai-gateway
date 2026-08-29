@@ -205,6 +205,8 @@ func (h *AdminHandler) RegisterRoutes(r *chi.Mux) {
 		r.Post("/admin/clients/{id}/update", h.UpdateClient)
 		r.Post("/admin/clients/{id}/delete", h.DeleteClient)
 		r.Post("/admin/clients/{id}/regenerate", h.RegenerateKey)
+		// P1-05C：Permanent REVOKE（terminal state；reason + confirm_revoke=REVOKE 必填）
+		r.Post("/admin/clients/{id}/revoke", h.RevokeClient)
 		r.Post("/admin/clients/{id}/toggle", h.ToggleClient)
 		r.Get("/admin/clients/{id}/test", h.TestClientConnection)
 		r.Get("/admin/clients/{id}/fetch-models", h.FetchClientModels)
@@ -547,34 +549,46 @@ func (h *AdminHandler) CreateClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, apiKey, err := h.clientService.CreateClient(name, description, keyType, keyPrefix, h.cfg)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	st := map[string]interface{}{
+		"backend":               backend,
+		"backend_base_url":      backendBaseURL,
+		"backend_default_model": backendDefaultModel,
+		"system_prompt":         systemPrompt,
+		"tool_mode":             toolMode,
+		"fallback_models":       fallbackModels,
+		"server_tools":          serverTools,
 	}
 
-	client.Backend = backend
-	client.BackendBaseURL = backendBaseURL
-	client.BackendDefaultModel = backendDefaultModel
-	client.SystemPrompt = systemPrompt
-	client.ToolMode = toolMode
-	client.FallbackModels = fallbackModels
-	client.ServerTools = serverTools
-
-	// SEC-002（P1-03C3）：client Provider Key 只存密文。表单明文即刻消费为信封，
-	// legacy 字段保持空——绝不写 client.BackendAPIKey。
-	if backendAPIKey != "" {
-		env, encErr := h.encryptClientKey(client.ID, backendAPIKey)
-		if encErr != nil {
-			_ = h.clientService.DeleteClient(client.ID) // 补偿：不留半创建 client
-			http.Error(w, encErr.message, encErr.status)
+	// P1-05C：actor 由服务端可信身份决定（§6），绝不信任表单 actor 字段。
+	// Provider key 加密与 settings 持久化由 service 放进同一 create+audit transaction；
+	// 失败时不留下半创建 client，也不需要事后补偿 Delete。
+	var encryptionErr *keyOpError
+	client, apiKey, err := h.clientService.CreateClientWithSettings(
+		name, description, keyType, keyPrefix, h.cfg, h.cfg.Admin.Username,
+		func(clientID string) (map[string]interface{}, error) {
+			settings := make(map[string]interface{}, len(st)+1)
+			for key, value := range st {
+				settings[key] = value
+			}
+			// SEC-002（P1-03C3）：明文 provider key 只在此处消费为 AEAD 信封，
+			// legacy 字段保持空——绝不写 client.BackendAPIKey。
+			if backendAPIKey != "" {
+				env, encErr := h.encryptClientKey(clientID, backendAPIKey)
+				if encErr != nil {
+					encryptionErr = encErr
+					return nil, errors.New("provider key encryption failed")
+				}
+				settings["backend_api_key_encrypted"] = env
+			}
+			return settings, nil
+		},
+	)
+	if err != nil {
+		if encryptionErr != nil {
+			http.Error(w, encryptionErr.message, encryptionErr.status)
 			return
 		}
-		client.BackendAPIKeyEncrypted = env
-	}
-	if err := h.clientService.UpdateClient(client); err != nil {
-		_ = h.clientService.DeleteClient(client.ID) // 补偿：不留半创建 client
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed to create client", http.StatusInternalServerError)
 		return
 	}
 
@@ -592,7 +606,11 @@ func (h *AdminHandler) ShowClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	client, err := h.clientService.GetClientByID(id)
-	if err != nil || client == nil {
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if client == nil {
 		http.Error(w, "Client not found", http.StatusNotFound)
 		return
 	}
@@ -612,58 +630,48 @@ func (h *AdminHandler) ShowClient(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// UpdateClient: P1-05C —— 普通 settings 更新改走 allowlist（UpdateClientSettings）。
+// 结构上不可能写入 APIKeyHash / IsActive / RevokedAt / RevokedBy / RevocationReason
+// （§4：整行 Save 的 lifecycle footgun 已消灭；REVOKED 不能被普通编辑复活）。
 func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	r.ParseForm()
-	name := r.Form.Get("name")
-	description := r.Form.Get("description")
-	isActive := r.Form.Get("is_active") == "on"
-	backend := r.Form.Get("backend")
 	backendAPIKey := r.Form.Get("backend_api_key")
 	clearBackendKey := r.Form.Get("clear_backend_api_key") == "on"
-	backendBaseURL := r.Form.Get("backend_base_url")
-	backendDefaultModel := r.Form.Get("backend_default_model")
-	systemPrompt := r.Form.Get("system_prompt")
-	toolMode := r.Form.Get("tool_mode")
-	fallbackModels := r.Form.Get("fallback_models")
-	serverTools := r.Form.Get("server_tools") == "on"
-	rateLimitMinute := parseInt(r.Form.Get("rate_limit_minute"), 60)
-	rateLimitHour := parseInt(r.Form.Get("rate_limit_hour"), 1000)
-	rateLimitDay := parseInt(r.Form.Get("rate_limit_day"), 10000)
-	quotaInputTokens := parseInt(r.Form.Get("quota_input_tokens"), 1000000)
-	quotaOutputTokens := parseInt(r.Form.Get("quota_output_tokens"), 500000)
-	quotaRequests := parseInt(r.Form.Get("quota_requests"), 1000)
-	maxInputTokens := parseInt(r.Form.Get("max_input_tokens"), 1000000)
-	maxOutputTokens := parseInt(r.Form.Get("max_output_tokens"), 8192)
-	modelsList := r.Form.Get("models_list")
 
-	client, err := h.clientService.GetClientByID(id)
-	if err != nil || client == nil {
-		http.Error(w, "Client not found", http.StatusNotFound)
-		return
+	st := map[string]interface{}{
+		"name":                    r.Form.Get("name"),
+		"description":             r.Form.Get("description"),
+		"backend":                 r.Form.Get("backend"),
+		"backend_base_url":        r.Form.Get("backend_base_url"),
+		"backend_default_model":   r.Form.Get("backend_default_model"),
+		"system_prompt":           r.Form.Get("system_prompt"),
+		"tool_mode":               r.Form.Get("tool_mode"),
+		"fallback_models":         r.Form.Get("fallback_models"),
+		"server_tools":            r.Form.Get("server_tools") == "on",
+		"rate_limit_minute":       parseInt(r.Form.Get("rate_limit_minute"), 60),
+		"rate_limit_hour":         parseInt(r.Form.Get("rate_limit_hour"), 1000),
+		"rate_limit_day":          parseInt(r.Form.Get("rate_limit_day"), 10000),
+		"quota_input_tokens_day":  parseInt(r.Form.Get("quota_input_tokens_day"), 1000000),
+		"quota_output_tokens_day": parseInt(r.Form.Get("quota_output_tokens_day"), 500000),
+		"quota_requests_day":      parseInt(r.Form.Get("quota_requests_day"), 1000),
+		"max_input_tokens":        parseInt(r.Form.Get("max_input_tokens"), 1000000),
+		"max_output_tokens":       parseInt(r.Form.Get("max_output_tokens"), 8192),
+	}
+	if modelsList := r.Form.Get("models_list"); modelsList != "" {
+		st["backend_models"] = modelsList
 	}
 
-	client.Name = name
-	client.Description = description
-	client.IsActive = isActive
-	client.Backend = backend
-	client.BackendBaseURL = backendBaseURL
-	client.BackendDefaultModel = backendDefaultModel
-	client.SystemPrompt = systemPrompt
-	client.ToolMode = toolMode
-	client.FallbackModels = fallbackModels
-	client.ServerTools = serverTools
-	client.RateLimitMinute = rateLimitMinute
-	client.RateLimitHour = rateLimitHour
-	client.RateLimitDay = rateLimitDay
-	client.QuotaInputTokensDay = quotaInputTokens
-	client.QuotaOutputTokensDay = quotaOutputTokens
-	client.QuotaRequestsDay = quotaRequests
-	client.MaxInputTokens = maxInputTokens
-	client.MaxOutputTokens = maxOutputTokens
-	if modelsList != "" {
-		client.BackendModels = modelsList
+	// 先确认存在性（404 contract 与 UpdateClientSettings 的 not-found 判定）
+	client, err := h.clientService.GetClientByID(id)
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if client == nil {
+		http.Error(w, "Client not found", http.StatusNotFound)
+		return
 	}
 
 	// SEC-002（P1-03C3）key 更新语义（取代旧 "blank=清空" 的危险默认）：
@@ -673,74 +681,58 @@ func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 	//   clear_backend_api_key → 显式清除
 	switch {
 	case clearBackendKey:
-		client.BackendAPIKey = ""
-		client.BackendAPIKeyEncrypted = ""
+		st["backend_api_key_encrypted"] = ""
 	case backendAPIKey != "":
 		env, kerr := h.encryptClientKey(client.ID, backendAPIKey)
 		if kerr != nil {
 			http.Error(w, kerr.message, kerr.status)
 			return
 		}
-		client.BackendAPIKeyEncrypted = env
-		client.BackendAPIKey = ""
+		st["backend_api_key_encrypted"] = env
 	}
 
-	err = h.clientService.UpdateClient(client)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := h.clientService.UpdateClientSettings(id, st); err != nil {
+		http.Error(w, "Failed to update client", http.StatusInternalServerError)
 		return
 	}
 
 	http.Redirect(w, r, "/admin/clients/"+id, http.StatusFound)
 }
 
-// ToggleClient: P1-05B 修复 TOGGLE-ERR-SWALLOW。
-// 优先接受表单显式目标状态 active=true/false（优于盲 toggle）；
-// 未提供时回退为当前状态取反。DB 错误 → 500 generic；不存在 → 404。
+// ToggleClient: P1-05C —— 语义改为显式 Suspend/Resume（§13）。
+// active=false → SuspendClient（reason required）；active=true → ResumeClient（reason optional）。
+// 表单缺失目标状态 → 400（杜绝盲 toggle 的隐式行为）。
 func (h *AdminHandler) ToggleClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	active := true
-	if explicit := r.FormValue("active"); explicit != "" {
-		active = explicit == "true" || explicit == "on"
-	} else {
-		client, err := h.clientService.GetClientByID(id)
-		if err != nil {
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-		if client == nil {
-			http.Error(w, "Client not found", http.StatusNotFound)
-			return
-		}
-		active = !client.IsActive
+	raw := r.FormValue("active")
+	var err error
+	switch {
+	case raw == "true" || raw == "on":
+		err = h.clientService.ResumeClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
+	case raw == "false":
+		err = h.clientService.SuspendClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
+	default:
+		http.Error(w, "Missing target state (active=true/false)", http.StatusBadRequest)
+		return
 	}
-
-	if err := h.clientService.SetClientActive(id, active); err != nil {
-		if errors.Is(err, services.ErrClientNotFound) {
-			http.Error(w, "Client not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to update client status", http.StatusInternalServerError)
+	if err != nil {
+		h.writeLifecycleError(w, err, "Failed to update client status")
 		return
 	}
 
 	http.Redirect(w, r, "/admin/clients/"+id, http.StatusFound)
 }
 
-// DeleteClient: P1-05B —— client 删除 ALL OR NOTHING（service 事务）成功后才
-// ResetClient 运行时限流 bucket；失败路径绝不 reset。DB error → 500 generic；
-// 不存在 → 404（禁止静默假成功）。
+// DeleteClient: P1-05B/C —— client 删除 ALL OR NOTHING（service 事务，含
+// CLIENT_DELETED audit）成功后才 ResetClient 运行时限流 bucket；失败路径绝不 reset。
+// reason required（§5）；不存在 → 404。
 func (h *AdminHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	err := h.clientService.DeleteClient(id)
+	err := h.clientService.DeleteClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
 	if err != nil {
-		if errors.Is(err, services.ErrClientNotFound) {
-			http.Error(w, "Client not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to delete client", http.StatusInternalServerError)
+		h.writeLifecycleError(w, err, "Failed to delete client")
 		return
 	}
 
@@ -750,7 +742,7 @@ func (h *AdminHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/clients", http.StatusFound)
 }
 
-// RegenerateKey: P1-05B —— 不存在 client → 404（ROTATE-NOTFOUND 修复），
+// RegenerateKey: P1-05B/C —— 不存在 client → 404；REVOKED → 409；reason required → 400；
 // 不渲染无主 key；DB error → 500 generic。成功仍只在结果页一次性展示明文 key。
 func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -761,18 +753,19 @@ func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	keyPrefix := r.Form.Get("key_prefix")
 
-	apiKey, err := h.clientService.RegenerateAPIKey(id, keyType, keyPrefix)
+	// P1-05C：ROTATE 必须携带 reason（§5）
+	apiKey, err := h.clientService.RegenerateAPIKey(id, keyType, keyPrefix, h.cfg.Admin.Username, r.Form.Get("reason"))
 	if err != nil {
-		if errors.Is(err, services.ErrClientNotFound) {
-			http.Error(w, "Client not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to regenerate API key", http.StatusInternalServerError)
+		h.writeLifecycleError(w, err, "Failed to regenerate API key")
 		return
 	}
 
 	client, err := h.clientService.GetClientByID(id)
-	if err != nil || client == nil {
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if client == nil {
 		http.Error(w, "Client not found", http.StatusNotFound)
 		return
 	}
@@ -786,6 +779,49 @@ func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 			"Regen":  true,
 		},
 	})
+}
+
+// RevokeClient: P1-05C —— Permanent REVOKE（终端状态）。要求 reason + 显式确认
+// confirm_revoke=REVOKE（缺失 → 400）。actor 由服务端可信身份决定（§6，忽略表单
+// actor/revoked_by）。成功 commit 后才 ResetClient 运行时限流 bucket（§14）。
+func (h *AdminHandler) RevokeClient(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	if r.FormValue("confirm_revoke") != "REVOKE" {
+		http.Error(w, "Confirmation required: confirm_revoke=REVOKE", http.StatusBadRequest)
+		return
+	}
+	err := h.clientService.RevokeClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
+	if err != nil {
+		h.writeLifecycleError(w, err, "Failed to revoke client")
+		return
+	}
+
+	// 事务已提交 → 释放该 client 的运行时限流 bucket（§14；rollback 绝不 reset）
+	h.rateLimiter.ResetClient(id)
+
+	http.Redirect(w, r, "/admin/clients/"+id, http.StatusFound)
+}
+
+// writeLifecycleError: P1-05C HTTP 错误契约（§17）：
+//
+//	not found → 404；invalid reason → 400；invalid transition / already revoked /
+//	resume revoked / rotate revoked → 409；其余（DB/audit 失败）→ 500 generic。
+//
+// 错误响应绝不含 raw SQLite/audit 错误、key/hash、reason 全文。
+func (h *AdminHandler) writeLifecycleError(w http.ResponseWriter, err error, genericMsg string) {
+	switch {
+	case errors.Is(err, services.ErrClientNotFound):
+		http.Error(w, "Client not found", http.StatusNotFound)
+	case errors.Is(err, services.ErrInvalidLifecycleReason):
+		http.Error(w, "Invalid lifecycle reason", http.StatusBadRequest)
+	case errors.Is(err, services.ErrClientRevoked),
+		errors.Is(err, services.ErrInvalidLifecycleTransition):
+		http.Error(w, "Invalid lifecycle transition", http.StatusConflict)
+	default:
+		log.Printf("[ADMIN] lifecycle operation failed: %v", err)
+		http.Error(w, genericMsg, http.StatusInternalServerError)
+	}
 }
 
 func (h *AdminHandler) ShowServerTools(w http.ResponseWriter, r *http.Request) {
@@ -976,7 +1012,11 @@ func (h *AdminHandler) FetchClientModels(w http.ResponseWriter, r *http.Request)
 	}
 
 	client.BackendModels = formatModelArray(models)
-	h.clientService.UpdateClient(client)
+	if err := h.clientService.UpdateClientModels(client.ID, client.BackendModels); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"success":false,"error":"Failed to persist models"}`)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"success":true,"models":[%s]}`, formatStringArray(models))
@@ -989,13 +1029,20 @@ func (h *AdminHandler) UpdateClientModels(w http.ResponseWriter, r *http.Request
 	models := r.Form["models"]
 
 	client, err := h.clientService.GetClientByID(id)
-	if err != nil || client == nil {
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if client == nil {
 		http.Error(w, "Client not found", http.StatusNotFound)
 		return
 	}
 
-	client.BackendModels = formatModelArray(models)
-	h.clientService.UpdateClient(client)
+	// P1-05C：dedicated bounded update——不再整行 Save（§4）
+	if err := h.clientService.UpdateClientModels(id, formatModelArray(models)); err != nil {
+		http.Error(w, "Failed to update models", http.StatusInternalServerError)
+		return
+	}
 
 	http.Redirect(w, r, "/admin/clients/"+id, http.StatusFound)
 }
@@ -1638,12 +1685,25 @@ var adminTemplates = []byte(`
                             </a>
                         </td>
                         <td class="px-6 py-4">
+                            {{if eq .LifecycleState "REVOKED"}}
+                            <span class="px-3 py-1 text-xs font-medium rounded-full bg-red-500/20 text-red-400">REVOKED</span>
+                            {{else if eq .LifecycleState "SUSPENDED"}}
+                            <form method="POST" action="/admin/clients/{{.ID}}/toggle" class="flex items-center space-x-2">
+                                <input type="hidden" name="csrf_token" value="{{$root.CSRFToken}}">
+                                <input type="hidden" name="active" value="true">
+                                <input type="text" name="reason" placeholder="Resume reason (optional)" class="px-2 py-1 bg-gray-900 border border-gray-600 text-white text-xs rounded-lg w-40">
+                                <button type="submit" class="px-3 py-1 text-xs font-medium rounded-full bg-amber-500/20 text-amber-400 hover:opacity-80 transition-opacity">Resume</button>
+                            </form>
+                            {{else}}
                             <form method="POST" action="/admin/clients/{{.ID}}/toggle">
-                                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-                                <button type="submit" class="px-3 py-1 text-xs font-medium rounded-full {{if .IsActive}}bg-green-500/20 text-green-400{{else}}bg-red-500/20 text-red-400{{end}} hover:opacity-80 transition-opacity">
-                                    {{if .IsActive}}Active{{else}}Disabled{{end}}
+                                <input type="hidden" name="csrf_token" value="{{$root.CSRFToken}}">
+                                <input type="hidden" name="active" value="false">
+                                <input type="text" name="reason" placeholder="Suspend reason (required)" class="px-2 py-1 bg-gray-900 border border-gray-600 text-white text-xs rounded-lg w-40">
+                                <button type="submit" class="px-3 py-1 text-xs font-medium rounded-full bg-green-500/20 text-green-400 hover:opacity-80 transition-opacity">
+                                    Suspend
                                 </button>
                             </form>
+                            {{end}}
                         </td>
                         <td class="px-6 py-4">
                             <div class="flex items-center space-x-2">
@@ -1806,11 +1866,8 @@ var adminTemplates = []byte(`
                         <span class="text-white font-semibold text-sm">{{slice (index .Data "Client").Name 0 1}}</span>
                     </div>
                     <span class="text-xl font-bold text-white">{{(index .Data "Client").Name}}</span>
-                    {{if (index .Data "Client").IsActive}}
-                    <span class="px-2 py-0.5 text-xs font-medium bg-green-500/20 text-green-400 rounded-full">Active</span>
-                    {{else}}
-                    <span class="px-2 py-0.5 text-xs font-medium bg-red-500/20 text-red-400 rounded-full">Disabled</span>
-                    {{end}}
+                    <!-- P1-05C：三态显示（ACTIVE / SUSPENDED / REVOKED，派生自 RevokedAt+IsActive） -->
+                    <span class="px-2 py-0.5 text-xs font-medium rounded-full {{if eq (index .Data "Client").LifecycleState "REVOKED"}}bg-red-600/20 text-red-400{{else if eq (index .Data "Client").LifecycleState "SUSPENDED"}}bg-amber-500/20 text-amber-400{{else}}bg-green-500/20 text-green-400{{end}}">{{(index .Data "Client").LifecycleState}}</span>
                 </div>
                 <div class="flex items-center space-x-1">
                     <a href="/admin/dashboard" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Dashboard</a>
@@ -1835,6 +1892,15 @@ var adminTemplates = []byte(`
     </nav>
 
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- P1-05C：REVOKED 元数据（仅 Admin HTML；json:"-" 不进任何 JSON 路径） -->
+        {{if (index .Data "Client").RevokedAt}}
+        <div class="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6 text-sm space-y-1">
+            <p class="text-red-300 font-medium">REVOKED — permanent terminal state（该 client 的 key 永久失效，不可恢复、不可轮换）</p>
+            <p class="text-gray-400">Revoked At: {{(index .Data "Client").RevokedAt.Format "2006-01-02 15:04:05"}}</p>
+            <p class="text-gray-400">Revoked By: {{(index .Data "Client").RevokedBy}}</p>
+            <p class="text-gray-400">Reason: {{(index .Data "Client").RevocationReason}}</p>
+        </div>
+        {{end}}
         <script>
         var clientID = "{{(index .Data "Client").ID}}";
         
@@ -1927,15 +1993,15 @@ var adminTemplates = []byte(`
                         </div>
                         <div>
                             <label class="block text-gray-400 text-sm font-medium mb-2">Quota (requests/day)</label>
-                            <input type="number" name="quota_requests" value="{{(index .Data "Client").QuotaRequestsDay}}" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <input type="number" name="quota_requests_day" value="{{(index .Data "Client").QuotaRequestsDay}}" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
                         </div>
                         <div>
                             <label class="block text-gray-400 text-sm font-medium mb-2">Quota (input tokens)</label>
-                            <input type="number" name="quota_input_tokens" value="{{(index .Data "Client").QuotaInputTokensDay}}" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <input type="number" name="quota_input_tokens_day" value="{{(index .Data "Client").QuotaInputTokensDay}}" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
                         </div>
                         <div>
                             <label class="block text-gray-400 text-sm font-medium mb-2">Quota (output tokens/day)</label>
-                            <input type="number" name="quota_output_tokens" value="{{(index .Data "Client").QuotaOutputTokensDay}}" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <input type="number" name="quota_output_tokens_day" value="{{(index .Data "Client").QuotaOutputTokensDay}}" class="w-full px-4 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
                         </div>
                         <div>
                             <label class="block text-gray-400 text-sm font-medium mb-2">Max input tokens/request</label>
@@ -2036,10 +2102,8 @@ var adminTemplates = []byte(`
                     </div>
 
                     <div class="flex items-center justify-between">
-                        <label class="flex items-center text-gray-300">
-                            <input type="checkbox" name="is_active" {{if (index .Data "Client").IsActive}}checked{{end}} class="w-5 h-5 rounded bg-gray-900 border-gray-600 text-blue-600 focus:ring-blue-500">
-                            <span class="ml-2">Active</span>
-                        </label>
+                        <!-- P1-05C：settings 更新不允许改 IsActive（lifecycle 由下方 Lifecycle Actions 管理） -->
+                        <p class="text-gray-500 text-sm">Lifecycle state is managed in Lifecycle Actions below.</p>
                         <button type="submit" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition-colors">Save Changes</button>
                     </div>
                 </form>
@@ -2050,14 +2114,56 @@ var adminTemplates = []byte(`
                 <h3 class="text-lg font-semibold text-white mb-6">Danger Zone</h3>
                 
                 <div class="space-y-4">
+                    <!-- P1-05C：Lifecycle Actions——Suspend（reason 必填）/ Resume（reason 可选） -->
+                    {{if not (index .Data "Client").RevokedAt}}
+                    <div class="p-4 bg-gray-900/50 rounded-xl">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="text-white font-medium">Suspend / Resume</p>
+                                <p class="text-gray-500 text-sm">Suspend requires a reason; resume keeps the original key.</p>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/toggle" class="flex items-center space-x-2">
+                                    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                                    <input type="hidden" name="active" value="false">
+                                    <input type="text" name="reason" placeholder="Suspend reason (required)" class="px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg w-44">
+                                    <button type="submit" class="px-3 py-2 bg-amber-600/20 text-amber-400 border border-amber-600/50 rounded-lg hover:bg-amber-600/30 transition-colors">Suspend</button>
+                                </form>
+                                <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/toggle" class="flex items-center space-x-2">
+                                    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                                    <input type="hidden" name="active" value="true">
+                                    <input type="text" name="reason" placeholder="Resume reason (optional)" class="px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg w-44">
+                                    <button type="submit" class="px-3 py-2 bg-green-600/20 text-green-400 border border-green-600/50 rounded-lg hover:bg-green-600/30 transition-colors">Resume</button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                    {{end}}
+
+                    <!-- P1-05C：Permanent Revoke（terminal；reason + 显式确认必填） -->
+                    <div class="p-4 bg-red-500/10 rounded-xl border border-red-500/30">
+                        <div>
+                            <p class="text-white font-medium">Revoke Client <span class="text-red-400 text-xs font-bold">(PERMANENT)</span></p>
+                            <p class="text-gray-500 text-sm">Terminal state: the key is permanently invalidated. Resume / Rotate / Suspend are then rejected.</p>
+                        </div>
+                        <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/revoke" class="mt-2 flex items-center space-x-2" onsubmit="return confirm('Permanently revoke this client? This cannot be undone.')">
+                            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                            <input type="text" name="reason" placeholder="Revocation reason (required)" class="px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg w-56">
+                            <input type="text" name="confirm_revoke" placeholder="Type REVOKE to confirm" class="px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg w-44">
+                            <button type="submit" class="px-4 py-2 bg-red-600/20 text-red-400 border border-red-600/50 rounded-lg hover:bg-red-600/30 transition-colors">Revoke</button>
+                        </form>
+                    </div>
+
+                    {{if not (index .Data "Client").RevokedAt}}
                     <div class="p-4 bg-gray-900/50 rounded-xl">
                         <div class="flex items-center justify-between">
                             <div>
                                 <p class="text-white font-medium">Regenerate API Key</p>
-                                <p class="text-gray-500 text-sm">Invalidates the current key and generates a new one</p>
+                                <p class="text-gray-500 text-sm">Invalidates the current key and generates a new one (reason required)</p>
                             </div>
                             <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/regenerate" class="flex items-center space-x-2">
                                 <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                                <input type="text" name="reason" placeholder="Rotation reason (required)" class="px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg w-44">
                                 <select name="key_type" onchange="toggleRegenPrefix(this)" class="px-3 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-500">
                                     <option value="gemini">gm_</option>
                                     <option value="openai">sk-</option>
@@ -2069,6 +2175,7 @@ var adminTemplates = []byte(`
                             </form>
                         </div>
                     </div>
+                    {{end}}
                     <script>function toggleRegenPrefix(el) { var input = el.nextElementSibling; input.className = el.value === 'custom' ? 'px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-500 w-24' : 'hidden px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-500 w-24'; }</script>
                     
                     <div class="p-4 bg-red-500/10 rounded-xl border border-red-500/30">
@@ -2077,8 +2184,9 @@ var adminTemplates = []byte(`
                                 <p class="text-white font-medium">Delete Client</p>
                                 <p class="text-gray-500 text-sm">Permanently delete this client and all associated data</p>
                             </div>
-                            <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/delete" onsubmit="return confirm('Are you sure? This cannot be undone.')">
+                            <form method="POST" action="/admin/clients/{{(index .Data "Client").ID}}/delete" onsubmit="return confirm('Are you sure? This cannot be undone.')" class="flex items-center space-x-2">
                                 <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                                <input type="text" name="reason" placeholder="Deletion reason (required)" class="px-2 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg w-44">
                                 <button type="submit" class="px-4 py-2 bg-red-600/20 text-red-400 border border-red-600/50 rounded-lg hover:bg-red-600/30 transition-colors">Delete</button>
                             </form>
                         </div>
