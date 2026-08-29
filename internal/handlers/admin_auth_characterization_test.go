@@ -439,7 +439,7 @@ func withTempWorkingDir(t *testing.T, fn func()) {
 func TestSetupChar_UnsetPassword_SetupReachableWithoutAuth(t *testing.T) {
 	withTempWorkingDir(t, func() {
 		env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-		setupH := NewSetupHandler(env.cfg, false, env.limiter)
+		setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
 		r := setupEnvRouter(env)
 		setupH.RegisterRoutes(r)
 
@@ -453,7 +453,7 @@ func TestSetupChar_UnsetPassword_SetupReachableWithoutAuth(t *testing.T) {
 // [NORMAL] 已设密码后 setup 必须关闭。
 func TestSetupChar_PasswordSet_SetupRedirectsAway(t *testing.T) {
 	env := newAuthEnv(t)
-	setupH := NewSetupHandler(env.cfg, false, env.limiter)
+	setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
 	r := setupEnvRouter(env)
 	setupH.RegisterRoutes(r)
 	resp := doReq(r, "GET", "/setup", nil)
@@ -466,7 +466,7 @@ func TestSetupChar_PasswordSet_SetupRedirectsAway(t *testing.T) {
 func TestSetupChar_CompletesAndThenLoginWorks(t *testing.T) {
 	withTempWorkingDir(t, func() {
 		env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-		setupH := NewSetupHandler(env.cfg, false, env.limiter)
+		setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
 		r := setupEnvRouter(env)
 		setupH.RegisterRoutes(r)
 

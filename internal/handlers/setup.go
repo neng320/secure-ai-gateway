@@ -19,12 +19,14 @@ type SetupHandler struct {
 	cfg          *config.Config
 	setupMode    bool
 	loginLimiter *auth.LoginRateLimiter
+	configPath   string
 }
 
 // NewSetupHandler: loginLimiter 必须与 AdminHandler 共享同一实例（P1-02.2），
 // 以便 Setup 修改管理员用户名后同步 limiter 的受保护身份。
-func NewSetupHandler(cfg *config.Config, setupMode bool, loginLimiter *auth.LoginRateLimiter) *SetupHandler {
-	return &SetupHandler{cfg: cfg, setupMode: setupMode, loginLimiter: loginLimiter}
+// configPath: 实际加载的配置文件路径（P1-02.3）——禁止再硬编码 "config.yaml"。
+func NewSetupHandler(cfg *config.Config, setupMode bool, loginLimiter *auth.LoginRateLimiter, configPath string) *SetupHandler {
+	return &SetupHandler{cfg: cfg, setupMode: setupMode, loginLimiter: loginLimiter, configPath: configPath}
 }
 
 func (h *SetupHandler) IsSetupRequired() bool {
@@ -119,21 +121,33 @@ func (h *SetupHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.cfg.Admin.Username = username
-	h.cfg.Admin.PasswordHash = string(hash)
-
-	if h.cfg.Admin.SessionSecret == "" {
-		h.cfg.Admin.SessionSecret = generateRandomString(32)
+	// P1-02.3：配置文件路径未知时 fail-closed，绝不猜测 cwd 下的 config.yaml
+	if h.configPath == "" {
+		h.showError(w, "Config source path unknown; refusing to persist credentials")
+		return
 	}
 
-	h.cfg.Prometheus.Enabled = true
-	h.cfg.Prometheus.Username = "prometheus"
-	h.cfg.Prometheus.Password = generateRandomString(20)
+	// P1-02.3：candidate 配置——先在副本上修改并持久化，成功后才切换运行态。
+	// 保存失败时：运行态 Admin/Prometheus 与 limiter 受保护身份全部保持原值。
+	// （浅拷贝共享 Providers map；Setup 仅修改值字段，不触碰 map，安全。）
+	candidate := *h.cfg
+	candidate.Admin.Username = username
+	candidate.Admin.PasswordHash = string(hash)
+	if candidate.Admin.SessionSecret == "" {
+		candidate.Admin.SessionSecret = generateRandomString(32)
+	}
+	candidate.Prometheus.Enabled = true
+	candidate.Prometheus.Username = "prometheus"
+	candidate.Prometheus.Password = generateRandomString(20)
 
-	if err := config.SaveConfig(h.cfg, "config.yaml"); err != nil {
+	if err := config.SaveConfig(&candidate, h.configPath); err != nil {
 		h.showError(w, "Failed to save config: "+err.Error())
 		return
 	}
+
+	// 持久化成功 → 原子切换运行态
+	h.cfg.Admin = candidate.Admin
+	h.cfg.Prometheus = candidate.Prometheus
 
 	// P1-02.2：配置成功保存后才同步 limiter 的受保护身份（避免保存失败但内存已变）。
 	// 同时清除新用户名的失败记录，让成功的 Setup 从干净登录状态开始。
