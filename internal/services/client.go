@@ -55,13 +55,14 @@ func (s *ClientService) CreateClient(name, description, keyType, keyPrefix strin
 
 func (s *ClientService) GetClientByAPIKey(apiKey string) (*models.Client, error) {
 	apiKeyHash := hashAPIKey(apiKey)
-	log.Printf("[CLIENT] Looking up API key: %s... (hash: %x)", apiKey[:min(8, len(apiKey))], apiKeyHash[:8])
+	// P1-04.2：key 前缀也是凭证材料——日志只允许哈希片段
+	log.Printf("[CLIENT] Looking up API key (hash: %x)", apiKeyHash[:8])
 
 	var client models.Client
 	err := s.db.Where("api_key_hash = ? AND is_active = ?", apiKeyHash, true).First(&client).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("[CLIENT] No client found for key: %s...", apiKey[:min(8, len(apiKey))])
+			log.Printf("[CLIENT] No client found for key (hash: %x)", apiKeyHash[:8])
 			return nil, nil
 		}
 		return nil, err
