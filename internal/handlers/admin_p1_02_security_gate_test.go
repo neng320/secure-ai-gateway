@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ai-gateway/internal/services"
 )
 
 // [P1-02 Gate] 全部管理 state-changing POST 路由：
@@ -22,30 +24,25 @@ func TestGate_P1_02_CSRF_AllStateChangingRoutesProtected(t *testing.T) {
 	token := gateLogin(t, env)
 	csrf := csrfFor(env, token)
 	sessionHdr := map[string][]string{"Cookie": {sessionCookieName + "=" + token}}
-	// 先建一个真实 client，拿 id 供 {id} 类路由使用
-	createForm := url.Values{"name": {"gate-client"}, "backend": {"openai"}}
-	createReq := httptest.NewRequest("POST", "/admin/clients", strings.NewReader(createForm.Encode()))
-	createReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	for k, v := range sessionHdr {
-		createReq.Header[k] = v
+	// 先经 clientService 建一个真实 client，拿真实 id 供 {id} 类路由使用
+	// （避免假 id 触发 RegenerateKey 对 nil client 渲染模板错误的噪音）
+	clientService := services.NewClientService(env.db)
+	client, _, err := clientService.CreateClient("gate-client", "", "openai", "sk-", env.cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	createReq.Header.Set("X-CSRF-Token", csrf)
-	w := httptest.NewRecorder()
-	env.router.ServeHTTP(w, createReq)
-	if w.Result().StatusCode == http.StatusForbidden {
-		t.Fatal("[安全回归失败] 携带合法 CSRF 的创建请求被拒")
-	}
+	realID := client.ID
 
 	routes := []struct {
 		method string
 		path   string
 	}{
 		{"POST", "/admin/clients"},
-		{"POST", "/admin/clients/gate-client-id/update"},
-		{"POST", "/admin/clients/gate-client-id/delete"},
-		{"POST", "/admin/clients/gate-client-id/regenerate"},
-		{"POST", "/admin/clients/gate-client-id/toggle"},
-		{"POST", "/admin/clients/gate-client-id/update-models"},
+		{"POST", "/admin/clients/" + realID + "/update"},
+		{"POST", "/admin/clients/" + realID + "/delete"},
+		{"POST", "/admin/clients/" + realID + "/regenerate"},
+		{"POST", "/admin/clients/" + realID + "/toggle"},
+		{"POST", "/admin/clients/" + realID + "/update-models"},
 		{"POST", "/admin/server-tools"},
 	}
 

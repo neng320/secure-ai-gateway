@@ -131,8 +131,13 @@ func TestP1_023_Setup_SaveFailure_RuntimeUnchanged(t *testing.T) {
 	cfg := minimalSetupCfg()
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15, cfg.Admin.Username)
-	// 指向不存在目录 → SaveConfig 必然失败（跨平台确定性注入）
-	failingPath := filepath.Join(dir, "no-such-dir", "gateway.yaml")
+	// 确定性失败注入：父路径是一个已存在的【文件】→ saveConfig 的 MkdirAll 必失败。
+	// （不能用"不存在目录"——saveConfig 会 MkdirAll 自动建目录导致保存意外成功）
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.WriteFile(blocked, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	failingPath := filepath.Join(blocked, "gateway.yaml")
 	setupH, _ := newSetupHandlerForTest(t, cfg, failingPath)
 	r := newSetupTestRouter(t, setupH)
 
