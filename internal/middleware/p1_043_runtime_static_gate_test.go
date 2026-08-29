@@ -17,7 +17,7 @@ package middleware
 //     .RequestBody / .ErrorMessage / .BackendAPIKey / .Password / .Token / .Secret
 //   - string(body...) 转换、proxy 环境变量值
 //   - len(...) 字节计数、URL.Path（path-only）、apiKeyHash[:N]（哈希片段）
-//     显式放行；`secretlog:allow <reason>` 行级标记可精确豁免（bootstrap 一次性凭证显示）
+//     显式放行；P1-04.4 起注释型豁免机制整体废除（生产源码 marker 计数必须为 0）
 //
 // runtime canary（auth_canary_test.go 及 p1_041/p1_042 各用例）仍是主证明。
 
@@ -88,16 +88,6 @@ func sensitiveValueIdent(name string) bool {
 	return false
 }
 
-// hasAllowMarker: 调用所在源码行是否带 secretlog:allow 标记
-func hasAllowMarker(srcLines []string, startLine, endLine int) bool {
-	for i := startLine - 1; i <= endLine-1 && i >= 0 && i < len(srcLines); i++ {
-		if strings.Contains(srcLines[i], "secretlog:allow") {
-			return true
-		}
-	}
-	return false
-}
-
 // scanLogSinks: 解析单个 Go 源文件，返回日志 sink 违规描述（空 = 干净）
 func scanLogSinks(t *testing.T, fset *token.FileSet, filename string, src string) []string {
 	t.Helper()
@@ -105,7 +95,6 @@ func scanLogSinks(t *testing.T, fset *token.FileSet, filename string, src string
 	if err != nil {
 		t.Fatalf("static gate: parse %s: %v", filename, err)
 	}
-	srcLines := strings.Split(src, "\n")
 	var findings []string
 	add := func(line int, kind, detail string) {
 		findings = append(findings, fmt.Sprintf("%s:%d %s: %s", filename, line, kind, detail))
@@ -140,12 +129,6 @@ func scanLogSinks(t *testing.T, fset *token.FileSet, filename string, src string
 		}
 		if !isLog {
 			return true
-		}
-
-		startLine := fset.Position(call.Pos()).Line
-		endLine := fset.Position(call.End()).Line
-		if hasAllowMarker(srcLines, startLine, endLine) {
-			return true // 精确豁免（须带 reason，见各调用点注释）
 		}
 
 		for _, arg := range call.Args[skipFormatString(call):] {
@@ -298,6 +281,13 @@ func TestP1043_StaticGate_RuntimeWide(t *testing.T) {
 	}
 	t.Logf("required-file coverage: %d/%d present", len(required), len(required))
 
+	// P1-04.4：注释型豁免机制已整体废除——生产源码不得存在任何 marker 残留
+	for name, src := range sources {
+		if strings.Contains(src, "secretlog:allow") {
+			t.Fatalf("[安全回归失败] 生产源码存在 secretlog:allow 豁免残留: %s", name)
+		}
+	}
+
 	var allFindings []string
 	scannedWithSinks := map[string]bool{}
 	for name, src := range sources {
@@ -333,6 +323,7 @@ func TestP1043_StaticGate_SyntheticFixtures(t *testing.T) {
 		{"G: authHeader slice [:20] multiline", "package p\nimport \"log\"\nfunc f(authHeader string) {\n\tlog.Printf(\n\t\t\"auth: %s\",\n\t\tauthHeader[:20],\n\t)\n}\n"},
 		{"H: token passthrough", "package p\nimport \"log\"\nfunc f(token string) {\n\tlog.Printf(\"token=%s\", token)\n}\n"},
 		{"I: password field selector", "package p\nimport \"log\"\nfunc f(cfg *C) {\n\tlog.Printf(\"pw=%s\", cfg.Password)\n}\n"},
+		{"J: password stdout with allow-marker comment still FAIL", "package p\nimport \"log\"\nfunc f(password string) {\n	fmt.Printf(\"Password: %s\\n\", password) // secretlog:allow bootstrap\n}\n"},
 	}
 	for _, tc := range violations {
 		t.Run(tc.name, func(t *testing.T) {
@@ -353,7 +344,6 @@ func TestP1043_StaticGate_SyntheticFixtures(t *testing.T) {
 		{"safe: URL.Path (path-only)", "package p\nimport \"log\"\nfunc f(r *R) {\n\tlog.Printf(\"rejected %s\", r.URL.Path)\n}\n"},
 		{"safe: hash fragment (precise allow)", "package p\nimport \"log\"\nfunc f(apiKeyHash []byte) {\n\tlog.Printf(\"lookup (hash: %x)\", apiKeyHash[:8])\n}\n"},
 		{"safe: method/path per card", "package p\nimport \"log\"\nfunc f(r *R) {\n\tlog.Printf(\"invalid api key method=%s path=%s\", r.Method, r.URL.Path)\n}\n"},
-		{"safe: allow marker honored", "package p\nimport \"fmt\"\nfunc f(defaultPassword string) {\n\tfmt.Printf(\"Password: %s\\n\", defaultPassword) // secretlog:allow bootstrap-onetime-credential\n}\n"},
 	}
 	for _, tc := range safe {
 		t.Run(tc.name, func(t *testing.T) {
