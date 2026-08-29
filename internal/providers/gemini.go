@@ -55,13 +55,15 @@ func (p *GeminiProvider) ChatCompletion(req *ChatRequest) ([]byte, int, error) {
 	}
 
 	body := p.buildRequestBody(req)
-	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", p.cfg.BaseURL, model, p.cfg.APIKey)
+	// SEC-002（P1-03C3）：key 走 header，不进 URL/query
+	url := fmt.Sprintf("%s/models/%s:generateContent", p.cfg.BaseURL, model)
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", p.cfg.APIKey)
 
 	client := getHTTPClient()
 	client.Timeout = time.Duration(p.cfg.TimeoutSeconds) * time.Second
@@ -86,13 +88,15 @@ func (p *GeminiProvider) ChatCompletionStream(req *ChatRequest) (*http.Response,
 	}
 
 	body := p.buildRequestBody(req)
-	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse&key=%s", p.cfg.BaseURL, model, p.cfg.APIKey)
+	// SEC-002（P1-03C3）：key 走 header
+	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", p.cfg.BaseURL, model)
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", p.cfg.APIKey)
 
 	client := getHTTPClient()
 	client.Timeout = time.Duration(p.cfg.TimeoutSeconds) * time.Second
@@ -196,8 +200,14 @@ func (p *GeminiProvider) TestConnection() (string, bool, error) {
 	if p.cfg.APIKey == "" {
 		return "API key not configured", false, nil
 	}
-	url := "https://generativelanguage.googleapis.com/v1/models?key=" + p.cfg.APIKey
-	resp, err := http.Get(url)
+	// SEC-002（P1-03C3）：key 走 header
+	req, err := http.NewRequest("GET", "https://generativelanguage.googleapis.com/v1/models", nil)
+	if err != nil {
+		return "Failed to create request: " + err.Error(), false, err
+	}
+	req.Header.Set("x-goog-api-key", p.cfg.APIKey)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "Failed to connect: " + err.Error(), false, err
 	}
@@ -212,8 +222,14 @@ func (p *GeminiProvider) FetchModels() ([]string, error) {
 	if p.cfg.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured")
 	}
-	url := "https://generativelanguage.googleapis.com/v1/models?key=" + p.cfg.APIKey
-	resp, err := http.Get(url)
+	// SEC-002（P1-03C3）：key 走 header
+	req, err := http.NewRequest("GET", "https://generativelanguage.googleapis.com/v1/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-goog-api-key", p.cfg.APIKey)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

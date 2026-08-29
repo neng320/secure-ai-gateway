@@ -187,8 +187,9 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Transfer-Encoding", "chunked")
 
+	// SEC-002（P1-03C3）：key 走 header（原实现 URL 以 "key=" 结尾且从未拼接——顺带修复该断链）
 	baseURL := h.geminiService.GetBaseURL()
-	url := baseURL + "/models/" + model + ":streamGenerateContent?key="
+	url := baseURL + "/models/" + model + ":streamGenerateContent"
 
 	req, err := http.NewRequest("POST", url, strings.NewReader(string(body)))
 	if err != nil {
@@ -197,6 +198,9 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	if apiKey := h.geminiService.GetAPIKey(); apiKey != "" {
+		req.Header.Set("x-goog-api-key", apiKey)
+	}
 
 	clientHTTP := &http.Client{
 		Timeout: 120 * time.Second,

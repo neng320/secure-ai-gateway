@@ -118,8 +118,8 @@ func (s *GeminiService) ForwardRequest(model string, body []byte) ([]byte, int, 
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", baseURL, model, gp.APIKey)
-	log.Printf("[GEMINI] URL: %s", url)
+	// SEC-002（P1-03C3）：key 走 x-goog-api-key header，不再进 URL/query
+	url := fmt.Sprintf("%s/models/%s:generateContent", baseURL, model)
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
@@ -127,6 +127,7 @@ func (s *GeminiService) ForwardRequest(model string, body []byte) ([]byte, int, 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", gp.APIKey)
 
 	client := &http.Client{
 		Timeout: time.Duration(gp.TimeoutSeconds) * time.Second,
@@ -158,8 +159,8 @@ func (s *GeminiService) ForwardStreamRequest(model string, body []byte) (*http.R
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse&key=%s", baseURL, model, gp.APIKey)
-	log.Printf("[GEMINI] Stream URL: %s", url)
+	// SEC-002（P1-03C3）：key 走 header，不进 URL/query
+	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", baseURL, model)
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
@@ -167,6 +168,7 @@ func (s *GeminiService) ForwardStreamRequest(model string, body []byte) (*http.R
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", gp.APIKey)
 
 	client := &http.Client{
 		Timeout: time.Duration(gp.TimeoutSeconds) * time.Second,
@@ -268,6 +270,11 @@ func ParseGeminiResponse(body []byte) (int, int, error) {
 	return resp.UsageMetadata.PromptTokenCount, resp.UsageMetadata.CandidatesTokenCount, nil
 }
 
+// GetAPIKey: 返回 gemini provider 的 API Key（proxy 流式路径 header 用）。
+func (s *GeminiService) GetAPIKey() string {
+	return s.geminiProvider().APIKey
+}
+
 func (s *GeminiService) GetBaseURL() string {
 	return "https://generativelanguage.googleapis.com/v1beta"
 }
@@ -278,9 +285,14 @@ func (s *GeminiService) TestConnection() (string, bool, error) {
 		return "API key not configured", false, nil
 	}
 
-	url := "https://generativelanguage.googleapis.com/v1/models?key=" + gp.APIKey
+	// SEC-002（P1-03C3）：key 走 header
+	req, err := http.NewRequest("GET", "https://generativelanguage.googleapis.com/v1/models", nil)
+	if err != nil {
+		return "Failed to create request: " + err.Error(), false, err
+	}
+	req.Header.Set("x-goog-api-key", gp.APIKey)
 
-	resp, err := http.Get(url)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "Failed to connect: " + err.Error(), false, err
 	}
@@ -302,9 +314,14 @@ func (s *GeminiService) FetchAvailableModels() ([]string, error) {
 	models := make([]string, 0)
 
 	for _, baseURL := range []string{"https://generativelanguage.googleapis.com/v1", "https://generativelanguage.googleapis.com/v1beta"} {
-		url := baseURL + "/models?key=" + gp.APIKey
+		// SEC-002（P1-03C3）：key 走 header
+		req, err := http.NewRequest("GET", baseURL+"/models", nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("x-goog-api-key", gp.APIKey)
 
-		resp, err := http.Get(url)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			continue
 		}
