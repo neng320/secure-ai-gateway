@@ -31,6 +31,7 @@ import (
 
 	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/database"
 	"ai-gateway/internal/logger"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/requestlogscrub"
@@ -38,9 +39,7 @@ import (
 	"ai-gateway/internal/secrets"
 
 	_ "ai-gateway/docs"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 )
 
 var (
@@ -252,9 +251,9 @@ func runProviderSecretMigration(configPath, backupDir string) {
 }
 
 func initDatabase(cfg *config.Config) (*gorm.DB, error) {
-	db, err := gorm.Open(sqlite.Open(cfg.Database.Path), &gorm.Config{
-		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
-	})
+	// P1-05B：统一经 internal/database.Open —— DSN 级 _foreign_keys=on，
+	// 连接池新建连接也强制执行外键（late-write / ORPHAN-DATA 防线）。
+	db, err := database.Open(cfg.Database.Path)
 	if err != nil {
 		return nil, err
 	}

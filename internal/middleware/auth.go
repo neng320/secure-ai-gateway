@@ -5,36 +5,21 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"time"
 
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/services"
-
-	"github.com/patrickmn/go-cache"
 )
+
+// P1-05B：AuthMiddleware 的认证缓存机制（缓存字段、失效入口、缓存查询辅助）
+// 已整体移除——认证始终直接 DB lookup，rotate/delete/suspend 之后
+// 下一请求零 sleep 即反映。
 
 type AuthMiddleware struct {
 	clientService *services.ClientService
-	cache         *cache.Cache
 }
 
 func NewAuthMiddleware(clientService *services.ClientService) *AuthMiddleware {
-	return &AuthMiddleware{
-		clientService: clientService,
-		cache:         cache.New(5*time.Minute, 10*time.Minute),
-	}
-}
-
-// InvalidateCache removes a client from the auth cache so fresh data is used
-func (m *AuthMiddleware) InvalidateCache(clientID string) {
-	m.cache.Delete("client:*" + clientID)
-	// Also try the hash-based key
-	keys := m.cache.Items()
-	for k := range keys {
-		if strings.Contains(k, clientID) {
-			m.cache.Delete(k)
-		}
-	}
+	return &AuthMiddleware{clientService: clientService}
 }
 
 func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
@@ -58,7 +43,6 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 		// P1-04.3：key 前缀也是凭证——认证尝试只记录 method/path
 		log.Printf("[AUTH] authentication attempt for %s %s", r.Method, r.URL.Path)
 
-		// Don't cache - always read fresh to pick up client config changes immediately
 		client, err := m.clientService.GetClientByAPIKey(apiKey)
 		if err != nil {
 			log.Printf("[AUTH] Error looking up client: %v", err)
@@ -66,15 +50,13 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 			return
 		}
 
+		// P1-05B：SUSPENDED / ROTATED-old / DELETED / random invalid 统一 401 Invalid API key。
+		// GetClientByAPIKey 已过滤 is_active=true（查不到即视为不存在），
+		// 不提供“这个 key 存在但被 suspend”的 credential-validity oracle。
+		// 旧 403 "Client is disabled" 不可达死分支已删除——401 是 deliberate contract。
 		if client == nil {
 			log.Printf("[AUTH] invalid api key for %s %s", r.Method, r.URL.Path)
 			http.Error(w, `{"error": "Invalid API key"}`, http.StatusUnauthorized)
-			return
-		}
-
-		if !client.IsActive {
-			log.Printf("[AUTH] Client %s is disabled", client.ID)
-			http.Error(w, `{"error": "Client is disabled"}`, http.StatusForbidden)
 			return
 		}
 
@@ -85,25 +67,6 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), ClientContextKey, client)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-func (m *AuthMiddleware) getClientFromCacheOrDB(apiKey string) (*models.Client, error) {
-	cacheKey := "client:" + apiKey
-
-	if cached, found := m.cache.Get(cacheKey); found {
-		return cached.(*models.Client), nil
-	}
-
-	client, err := m.clientService.GetClientByAPIKey(apiKey)
-	if err != nil {
-		return nil, err
-	}
-
-	if client != nil {
-		m.cache.Set(cacheKey, client, 5*time.Minute)
-	}
-
-	return client, nil
 }
 
 type contextKey string

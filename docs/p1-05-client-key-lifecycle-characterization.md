@@ -2,7 +2,8 @@
 
 > 审计对象：tag `secure-gateway-p1-request-log-privacy.5`（develop `55f258e`）时点。
 > 本阶段**生产行为 0 修改**；仅审计 + characterization tests + 本文档。
-> 测试：`internal/handlers/p1_05a_lifecycle_test.go`（10 用例，全部 PASS，其中 3 个标记 `[KNOWN-GAP: P1-05 ...]`）。
+> 测试：`internal/handlers/p1_05a_lifecycle_test.go`（10 用例，全部 PASS）。
+> **P1-05B 已修正全部 4 项 [KNOWN-GAP]（见 §7 Correction Results）；P1-05 整体仍 IN PROGRESS（P1-05C：REVOKED/Reason/Audit）。**
 
 ## 1. 生命周期数据流（ISSUE → STORE → AUTHENTICATE → SUSPEND → RE-ENABLE → ROTATE → REVOKE → DELETE → CLEANUP → AUDIT）
 
@@ -79,3 +80,50 @@ Audit         需要持久化 append-only 事件（P1-05 专表 vs P1-08 AuditEv
 ```
 
 **P1-05B 建议修复顺序**：① `RegenerateAPIKey`/`DeleteClient` 的 RowsAffected 检查与 false-success 根除（含 UI nil-防护）；② 显式 SUSPENDED/REVOKED 状态 + 吊销元数据；③ 级联清理策略（request_logs/daily_usages + RateLimiter 重置）；④ 生命周期审计事件；⑤ Metrics constant-time 比较；⑥ auth cache 死代码处置。
+**执行结果见 §7 —— ①③⑤⑥ 及"Delete 后 in-flight late-write"已在 P1-05B 完成；②④ 留待 P1-05C。**
+
+---
+
+## 7. P1-05B Correction Results（lifecycle consistency foundation，tag `secure-gateway-p1-client-lifecycle-consistency`）
+
+### 7.1 关闭清单（原 [KNOWN-GAP] / 新发现 → 修复 → 证据）
+
+| 项 | P1-05A 固化现状 | P1-05B 修复 | 证据 |
+|---|---|---|---|
+| ROTATE-NOTFOUND | `RegenerateAPIKey` nil error + 生成无主 key；UI 200 + 截断模板 | service 返回 `ErrClientNotFound` + `key==""`；Admin 404，无模板错误/无 key 渲染 | `TestP105A_Rotate_Nonexistent_FalseSuccess`（[P1-05B FIXED]）、`TestP105A_AdminRegenerate_NonexistentClient_404`、`TestP105B_Regenerate_Nonexistent_ErrAnd404` |
+| ORPHAN-DATA | Delete 后 request_logs/daily_usages 孤儿残留 | DeleteClient 单事务（children 先删 → client 后删，RowsAffected 检查）+ FK ON DELETE CASCADE（双保险）；三表恒 0 | `TestP105A_Delete_OrphanData`（[P1-05B FIXED]）、`TestP105B_Delete_Existing_AllTablesZero`、`TestP105B_ForeignKeys_OnAllPooledConnections` |
+| TOGGLE-ERR-SWALLOW | `ToggleClient` 忽略 `UpdateClient` 错误 | 新增 `SetClientActive(id, active)`（RowsAffected→ErrClientNotFound）；handler 检查错误：404/500 generic；表单支持显式 `active=true/false` | `TestP105B_Toggle_DbErrorNotSwallowed`（DROP TABLE 注入 → 500 且不泄露 raw error） |
+| METRICS-COMPARE | `username != h.username \|\| password != h.password` 普通比较 | SHA-256 定长化 ×2 + `subtle.ConstantTimeCompare`，两比较均执行（位与合并，无 secret-dependent short-circuit） | `TestP105B_MetricsBasicAuth_ConstantTimeContract`（200/401×3）+ `TestP105B_StaticGate_MetricsConstantTime` |
+| dead Auth cache | `AuthMiddleware.cache` / `getClientFromCacheOrDB` / `InvalidateCache` 零调用方 | 全部删除（含 auth.go 内 go-cache import）；认证始终直接 DB lookup | `TestP105B_StaticGate_DeadCacheRemoved`；行为证明：rotate/delete/suspend 下一请求零 sleep 即反映（既有 B/D/E/F 用例） |
+| RateLimiter 死接线 | `ResetClient` 零调用方；limiter 为 buildAPIRouter 局部对象 | limiter 提升为 `gatewayDeps.rateLimiter` 共享实例（API+Admin 同一对象）；Delete 事务成功后才 `ResetClient(clientID)`；**ROTATE/SUSPEND/RESUME 一律不 reset**（防轮换刷额度） | `TestP105B_Rotate_InheritsRateLimitState`（rotate 后 remaining 继承为 0 → 429）、`TestP105B_Delete_ResetsRateLimitBucket`（delete 后同 ID 重建 → 200）、静态 Gate `TestP105B_StaticGate_RateLimiterSharedInstance`（NewRateLimiter 恰 1 处）+ `ResetClientOnlyOnDelete`（调用恰 1 处） |
+
+### 7.2 新发现：IN_FLIGHT_DELETE_LATE_WRITE（本阶段核心 Acceptance）
+
+**发现**：Delete cleanup 不能只做 `DELETE client → DELETE request_logs → DELETE daily_usages`——已通过认证的 **in-flight request** 在 Delete 返回后才完成时，`LogRequest()` 仍会无条件 Create `RequestLog` 并 upsert `DailyUsage`，重新制造孤儿数据（check-then-write TOCTOU 的持久化侧等价物）。
+
+**最终解决（方案 A：DB-level referential integrity）**：
+
+```text
+1. models：RequestLog.ClientID / DailyUsage.ClientID 增加 FK → clients(id)
+   ON UPDATE CASCADE ON DELETE CASCADE（gorm constraint tag，AutoMigrate 内联建表）
+2. internal/database.Open：DSN 级 _foreign_keys=on——PRAGMA foreign_keys 是
+   connection-scoped，DSN 参数保证连接池【每个新连接】都强制外键
+   （测试用 SetMaxIdleConns(0) 逐个取新连接验证 PRAGMA==1）
+3. DeleteClient：单事务 children-first 清理 + client 删除（RowsAffected 检查），
+   任一步失败整体 ROLLBACK
+4. LogRequest/updateDailyUsage：INSERT 命中 FK violation（client 已删）→ 静默跳过
+   （isClientGoneForeignKey 双保险：gorm.ErrForeignKeyViolated + sqlite3 原生错误码）
+   → 旧请求正常结束，零孤儿
+```
+
+**Gate（channel barrier，无 sleep）**：认证放行 → 旧请求阻塞在日志写入前 → Admin Delete 成功 → 放行旧请求完成 → 等全部写入结束 → `clients=0 / request_logs=0 / daily_usages=0`。
+证据：`TestP105B_Delete_InFlightLateWrite_Barrier`；还有不经 barrier 的精简证明 `TestP105B_LogRequest_FKViolation_GracefulSkip` 与事务回滚注入 `TestP105B_Delete_TransactionFailure_Rollback`（AFTER DELETE 触发器 RAISE(ABORT) → 三表原值保留）。
+
+**遗留边界**：既有旧库（AutoMigrate 之前创建、无法 ALTER ADD CONSTRAINT 的 SQLite）可能缺 FK——此时 late-write 防线退化为 DeleteClient 事务内显式清理（孤儿仍不可能产生于 Delete 路径本身），但 late-write INSERT 不报 FK 错；本仓库无运营者存量库（SEC-002：0 实例），新库全部内联 FK。
+
+### 7.3 其余落实
+
+- **Suspend/Resume 契约统一**：SUSPENDED / ROTATED-old / DELETED / random invalid 全部 401 `Invalid API key`（deliberate contract，不提供 credential-validity oracle）；middleware 的 `if !client.IsActive { 403 }` **死分支删除**（`GetClientByAPIKey` 查询已含 is_active 过滤）。
+- **Prometheus residue 政策（正式记录）**：`client_id` label 系列属 private metrics listener 的 process-lifetime operational telemetry，不含 credential，进程重启即消失 → `ON_DELETE = retain until process restart`（本阶段不扩大重构范围）。
+- **静态/交付 Gate**：`TestP105B_StaticGate_*` 6 项——死亡标识符、RowsAffected≥3、ResetClient 恰 1 调用、常量时间比较、共享实例、DSN 外键。
+- **正确性注记**：P1-05B 不取消已开始的 upstream 请求；要求的是 Delete 后禁止新认证、并禁止旧 in-flight 请求重建 client-owned 持久行。

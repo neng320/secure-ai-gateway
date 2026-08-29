@@ -29,6 +29,7 @@ import (
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
+	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/secrets"
 	"ai-gateway/internal/services"
@@ -127,7 +128,7 @@ func newFallbackEnv(t *testing.T) *fallbackEnv {
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15*time.Minute, adminBase.Username)
 
-	adminH, err := NewAdminHandler(cfgPersist, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, limiter, mgr, "", nil)
+	adminH, err := NewAdminHandler(cfgPersist, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, limiter, mgr, "", nil, mw.NewRateLimiter())
 	if err != nil {
 		t.Fatal(err)
 	}

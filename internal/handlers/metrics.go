@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -114,9 +116,26 @@ func (h *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.promHandler.ServeHTTP(w, r)
 }
 
+// authenticate: P1-05B（METRICS-COMPARE 修复）——fixed-length constant-time 比较。
+// 双方先 SHA-256 定长化，再用 subtle.ConstantTimeCompare 逐一比较 username 与
+// password，两次比较都无条件执行（位与合并，不存在 secret-dependent short-circuit）。
+// 不向日志输出任何 credential 材料。
 func (h *MetricsHandler) authenticate(w http.ResponseWriter, r *http.Request) bool {
 	username, password, ok := r.BasicAuth()
-	if !ok || username != h.username || password != h.password {
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Prometheus Metrics"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+
+	uRecv := sha256.Sum256([]byte(username))
+	uCfg := sha256.Sum256([]byte(h.username))
+	pRecv := sha256.Sum256([]byte(password))
+	pCfg := sha256.Sum256([]byte(h.password))
+
+	uOk := subtle.ConstantTimeCompare(uRecv[:], uCfg[:])
+	pOk := subtle.ConstantTimeCompare(pRecv[:], pCfg[:])
+	if uOk&pOk != 1 {
 		w.Header().Set("WWW-Authenticate", `Basic realm="Prometheus Metrics"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
