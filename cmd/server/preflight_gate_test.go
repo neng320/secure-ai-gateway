@@ -187,6 +187,39 @@ func TestPreflightGate_AllEmpty_NoMasterKey_Passes(t *testing.T) {
 	}
 }
 
+// P1-03C3 · Manager availability：空系统 + 恰好配置一个合法 Master Key →
+// 返回非 nil Manager（Admin 才能在空系统上安全新增第一个 Provider Secret）
+func TestPreflightGate_AllEmpty_ValidMasterKey_ManagerAvailable(t *testing.T) {
+	cfg, db := newPreflightFixture(t)
+	t.Setenv("AIGATEWAY_MASTER_KEY", testMasterKeyB64)
+	mgr, err := ensureProviderSecretsRunnable(cfg, db)
+	if err != nil {
+		t.Fatalf("[安全回归失败] 全空 + 合法 Master Key 应构造 Manager，实际 %v", err)
+	}
+	if mgr == nil {
+		t.Fatal("[安全回归失败] 空系统 + Master Key 已配置时 Manager 不应为 nil——否则第一个 secret 无法加密新增")
+	}
+}
+
+// P1-03C3 · 空系统 + 双源冲突 → fail-closed（运营者配置了 Secret 基础设施但配置错误）
+func TestPreflightGate_AllEmpty_ConflictingSources_Refused(t *testing.T) {
+	cfg, db := newPreflightFixture(t)
+	t.Setenv("AIGATEWAY_MASTER_KEY", testMasterKeyB64)
+	t.Setenv("AIGATEWAY_MASTER_KEY_FILE", "C:\\nonexistent\\master.key")
+	if _, err := ensureProviderSecretsRunnable(cfg, db); err == nil {
+		t.Fatal("[安全回归失败] 空系统 + 双源冲突应拒绝启动")
+	}
+}
+
+// P1-03C3 · 空系统 + Master Key 格式非法 → fail-closed
+func TestPreflightGate_AllEmpty_InvalidMasterKey_Refused(t *testing.T) {
+	cfg, db := newPreflightFixture(t)
+	t.Setenv("AIGATEWAY_MASTER_KEY", "not-valid-base64-!!!")
+	if _, err := ensureProviderSecretsRunnable(cfg, db); err == nil {
+		t.Fatal("[安全回归失败] 空系统 + 非法 Master Key 应拒绝启动")
+	}
+}
+
 // Client 侧密文同样受 preflight 保护（正确 key 通过）
 func TestPreflightGate_ClientEncrypted_CorrectKey_Passes(t *testing.T) {
 	cfg, db := newPreflightFixture(t)

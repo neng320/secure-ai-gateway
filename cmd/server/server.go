@@ -36,8 +36,11 @@ import (
 )
 
 // gatewayDeps 汇集三个监听面共享的构造依赖。
+// cfg 与 runtimeCfg 必须区分（P1-03C3）：cfg 是持久化视图（Provider Key 只含信封，
+// 供 Admin/Setup/SaveConfig 使用）；runtimeCfg 是运行时视图（已解密明文，仅供上游调用）。
 type gatewayDeps struct {
 	cfg           *config.Config
+	runtimeCfg    *config.Config
 	db            *gorm.DB
 	setupMode     bool
 	clientService *services.ClientService
@@ -48,12 +51,13 @@ type gatewayDeps struct {
 	sessionStore  auth.Store
 	loginLimiter  *auth.LoginRateLimiter
 	registry      *providers.Registry
+	secretManager *secrets.Manager
 	health        *handlers.HealthHandler
 }
 
-func newGatewayDeps(cfg *config.Config, db *gorm.DB, setupMode bool) gatewayDeps {
+func newGatewayDeps(cfg, runtimeCfg *config.Config, db *gorm.DB, setupMode bool, secretMgr *secrets.Manager) gatewayDeps {
 	clientService := services.NewClientService(db)
-	geminiService := services.NewGeminiService(db, cfg)
+	geminiService := services.NewGeminiService(db, runtimeCfg)
 	statsService := services.NewStatsService(db)
 	toolService := services.NewToolService(cfg.ServerTools.Tools)
 	dashboardHub := services.NewDashboardHub(statsService)
@@ -62,6 +66,7 @@ func newGatewayDeps(cfg *config.Config, db *gorm.DB, setupMode bool) gatewayDeps
 	loginLimiter.Configure(cfg.Admin.LoginMaxFailures, time.Duration(cfg.Admin.LoginLockoutMinutes)*time.Minute, cfg.Admin.Username)
 	return gatewayDeps{
 		cfg:           cfg,
+		runtimeCfg:    runtimeCfg,
 		db:            db,
 		setupMode:     setupMode,
 		clientService: clientService,
@@ -71,9 +76,34 @@ func newGatewayDeps(cfg *config.Config, db *gorm.DB, setupMode bool) gatewayDeps
 		toolService:   toolService,
 		sessionStore:  auth.NewSQLiteStore(db),
 		loginLimiter:  loginLimiter,
-		registry:      providers.BuildRegistry(cfg),
+		registry:      providers.BuildRegistry(runtimeCfg),
+		secretManager: secretMgr,
 		health:        handlers.NewHealthHandler(db),
 	}
+}
+
+// buildRuntimeConfig: 从持久化 cfg 派生运行时视图（P1-03C3）。
+// 逐 provider 解密 APIKeyEncrypted → 明文仅写入副本；持久化 cfg 永不被触碰
+// （对副本的一切修改都不会回流，SaveConfig 序列化的仍是 envelope-only 视图）。
+// 禁止把解密结果写回 cfg.Providers[name].APIKey。
+func buildRuntimeConfig(persistent *config.Config, mgr *secrets.Manager) (*config.Config, error) {
+	rc := *persistent
+	rc.Providers = make(map[string]config.ProviderConfig, len(persistent.Providers))
+	for name, p := range persistent.Providers {
+		if p.APIKeyEncrypted != "" {
+			if mgr == nil {
+				return nil, fmt.Errorf("provider %q has an encrypted key but no master key is configured", name)
+			}
+			pt, err := mgr.DecryptGlobalProviderKey(name, p.APIKeyEncrypted)
+			if err != nil {
+				return nil, fmt.Errorf("provider %q key unavailable: %w", name, err)
+			}
+			p.APIKey = string(pt)
+			p.APIKeyEncrypted = ""
+		}
+		rc.Providers[name] = p
+	}
+	return &rc, nil
 }
 
 // ensureProviderSecretsRunnable: 启动 preflight（P1-03C1）。
@@ -103,7 +133,22 @@ func ensureProviderSecretsRunnable(cfg *config.Config, db *gorm.DB) (*secrets.Ma
 		return nil, fmt.Errorf("%w (locations: %s)", secrets.ErrProviderSecretMigrationRequired, strings.Join(res.Offenders, ", "))
 	}
 	if !res.NeedMasterKey {
-		return nil, nil // 全部为空：无 Key 环境合法启动
+		// 全部为空：无 Master Key 配置 → 无需 Manager，合法启动（Ollama/LM Studio 场景）。
+		// 恰好配置一个合法 Master Key → 仍构造 Manager（P1-03C3）：
+		// 空系统也要能安全新增第一个 Provider Secret（明文保存被禁止）。
+		// 双源冲突 / 格式错误 → fail-closed（运营者明确配置了 Secret 基础设施但配置错误）。
+		if os.Getenv(secrets.EnvMasterKey) == "" && os.Getenv(secrets.EnvMasterKeyFile) == "" {
+			return nil, nil
+		}
+		key, err := secrets.LoadMasterKey(os.Getenv)
+		if err != nil {
+			return nil, err
+		}
+		cipher, err := secrets.NewAESGCMCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		return secrets.NewManager(cipher), nil
 	}
 	key, err := secrets.LoadMasterKey(os.Getenv)
 	if err != nil {
@@ -133,7 +178,7 @@ func buildAPIRouter(d gatewayDeps) *chi.Mux {
 	authMiddleware := mw.NewAuthMiddleware(d.clientService)
 	rateLimiter := mw.NewRateLimiter()
 	proxyHandler := handlers.NewProxyHandler(d.geminiService, d.statsService)
-	openaiHandler := handlers.NewOpenAIHandler(d.geminiService, d.clientService, d.statsService, d.registry, d.toolService)
+	openaiHandler := handlers.NewOpenAIHandler(d.geminiService, d.clientService, d.statsService, d.registry, d.toolService, d.secretManager)
 
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware.Handler)
@@ -153,15 +198,15 @@ func buildAdminRouter(d gatewayDeps) (*chi.Mux, error) {
 	// P1-02.1：Admin 面恢复请求体上限（与原单端口行为一致；更细粒度校验属 P1-07）
 	r.Use(mw.MaxRequestSize(10 << 20))
 
-	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter)
+	configPath := config.SourcePath()
+	if configPath == "" {
+		return nil, fmt.Errorf("config source path unknown; cannot wire admin persistence or setup")
+	}
+	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter, d.secretManager, configPath)
 	if err != nil {
 		return nil, fmt.Errorf("admin handler: %w", err)
 	}
 
-	configPath := config.SourcePath()
-	if configPath == "" {
-		return nil, fmt.Errorf("config source path unknown; cannot wire setup persistence")
-	}
 	setupHandler := handlers.NewSetupHandler(d.cfg, d.setupMode, d.loginLimiter, configPath)
 	if setupHandler.IsSetupRequired() {
 		setupHandler.RegisterRoutes(r)

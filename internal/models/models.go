@@ -49,6 +49,12 @@ type Client struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// HasBackendKey: 是否配置了 per-client Provider Key（legacy 明文或 encrypted 信封）。
+// 仅供 Admin UI 判定"已配置"状态展示——绝不返回 key 材料本身（P1-03C3 遮罩显示）。
+func (c *Client) HasBackendKey() bool {
+	return c.BackendAPIKey != "" || c.BackendAPIKeyEncrypted != ""
+}
+
 type RequestLog struct {
 	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	ClientID     string    `gorm:"type:varchar(36);index" json:"client_id"`

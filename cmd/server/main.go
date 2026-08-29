@@ -111,9 +111,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-	_ = secretMgr // P1-03C3 将接入 runtime 解密
 
-	deps := newGatewayDeps(cfg, db, *setupMode)
+	// P1-03C3 运行时视图：持久化 cfg 保持 envelope-only，解密明文只进入 runtimeCfg
+	runtimeCfg, err := buildRuntimeConfig(cfg, secretMgr)
+	if err != nil {
+		log.Fatalf("runtime provider config: %v", err)
+	}
+
+	deps := newGatewayDeps(cfg, runtimeCfg, db, *setupMode, secretMgr)
 	apiMux := buildAPIRouter(deps)
 	adminMux, err := buildAdminRouter(deps)
 	if err != nil {
