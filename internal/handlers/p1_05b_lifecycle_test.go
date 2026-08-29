@@ -442,13 +442,17 @@ func TestP105B_Delete_ResetsRateLimitBucket(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105B_Toggle_DbErrorNotSwallowed(t *testing.T) {
 	env := newP105Env(t)
-	client, _, err := env.clientSvc.CreateClient("p105b-tog", "", "openai", "sk-", env.cfg)
+	// P1-05C §0 correction：必须保存真实 generated key——禁止用固定无效 key 证明 401
+	client, generatedKey, err := env.clientSvc.CreateClient("p105b-tog", "", "openai", "sk-", env.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	token := p105AdminSessionOf(t, env)
 
-	// 正常路径：显式目标状态 active=false → 302，随后 401
+	// 正常路径：generated key 全链路——200 → active=false(302) → 401 → active=true(302) → 200
+	if resp := env.doAuth(t, generatedKey); resp.StatusCode != http.StatusOK {
+		t.Fatalf("[I] toggle 前 generated key 应 200，实际 %d", resp.StatusCode)
+	}
 	form := url.Values{"active": {"false"}}
 	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/toggle", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -459,8 +463,22 @@ func TestP105B_Toggle_DbErrorNotSwallowed(t *testing.T) {
 	if w.Result().StatusCode != http.StatusFound {
 		t.Fatalf("[I] toggle 成功应 302，实际 %d", w.Result().StatusCode)
 	}
-	if resp := env.doAuth(t, p105OriginalKey); resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("[I] toggle 后应 401，实际 %d", resp.StatusCode)
+	if resp := env.doAuth(t, generatedKey); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("[I] suspend 后 generated key 应 401，实际 %d", resp.StatusCode)
+	}
+
+	formOn := url.Values{"active": {"true"}}
+	reqOn := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/toggle", strings.NewReader(formOn.Encode()))
+	reqOn.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	reqOn.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	reqOn.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, token))
+	wOn := httptest.NewRecorder()
+	env.admin.ServeHTTP(wOn, reqOn)
+	if wOn.Result().StatusCode != http.StatusFound {
+		t.Fatalf("[I] resume toggle 应 302，实际 %d", wOn.Result().StatusCode)
+	}
+	if resp := env.doAuth(t, generatedKey); resp.StatusCode != http.StatusOK {
+		t.Fatalf("[I] resume 后同一 generated key 应 200，实际 %d", resp.StatusCode)
 	}
 
 	// 不存在 id → 404（显式状态路径经 SetClientActive ErrClientNotFound）
