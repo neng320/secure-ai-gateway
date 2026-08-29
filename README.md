@@ -397,3 +397,21 @@ internal/
 ## License
 
 MIT
+
+
+## Request Logging Privacy (SEC-003)
+
+The gateway logs **metadata only** by default: request ID, client, provider, model, status, tokens, latency, bounded error codes. Prompt/request/response bodies and raw upstream error text are **never persisted**.
+
+Temporary diagnostic request-body capture is available and **off by default**:
+
+```yaml
+logging:
+  request_body_capture:
+    enabled: true          # explicit opt-in
+    expires_at: 2026-08-30T12:00:00Z   # RFC3339, future, hard window <= 24h
+    max_bytes: 16384       # default 16KiB, hard cap 64KiB
+    max_entries: 100       # default 100, hard cap 1000
+```
+
+Captured bodies live **in memory only** (never in SQLite, files or logs), expire automatically, and can be read on demand via `GET /admin/request-bodies/{requestID}` (admin listener, authenticated, no-store). Legacy databases containing persisted prompt content are rejected at startup; an explicit irreversible offline scrub is available via `-scrub-request-log-content -confirm-destructive-scrub`. See `docs/adr/ADR-007-request-logging-privacy.md`.
