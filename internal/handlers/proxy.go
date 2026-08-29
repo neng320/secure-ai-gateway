@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/capture"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/services"
@@ -18,10 +19,11 @@ import (
 type ProxyHandler struct {
 	geminiService *services.GeminiService
 	statsService  *services.StatsService
+	capture       *capture.Store // MEMORY-ONLY 诊断捕获（SEC-003/P1-04C）；nil = 关闭
 }
 
-func NewProxyHandler(geminiService *services.GeminiService, statsService *services.StatsService) *ProxyHandler {
-	return &ProxyHandler{geminiService: geminiService, statsService: statsService}
+func NewProxyHandler(geminiService *services.GeminiService, statsService *services.StatsService, captureStore *capture.Store) *ProxyHandler {
+	return &ProxyHandler{geminiService: geminiService, statsService: statsService, capture: captureStore}
 }
 
 func (h *ProxyHandler) RegisterRoutes(r chi.Router) {
@@ -70,6 +72,9 @@ func (h *ProxyHandler) GenerateContent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	// SEC-003（P1-04C）：诊断捕获在 cap 之前——始终为原始 inbound payload（且默认关闭）
+	h.capture.Capture(middleware.GetRequestID(r), body)
 
 	body = h.capOutputTokens(client, body)
 
@@ -193,6 +198,9 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 	// SEC-003（P1-04B）：补齐 gemini 流式路径的 metadata-only RequestLog
 	// （此前该路径完全无 RequestLog；正文照旧不入持久层）
 	streamStart := time.Now()
+
+	// SEC-003（P1-04C）：诊断捕获在 cap 之前（原始 inbound payload；默认关闭）
+	h.capture.Capture(middleware.GetRequestID(r), body)
 
 	body = h.capOutputTokens(client, body)
 

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/handlers"
 	mw "ai-gateway/internal/middleware"
@@ -52,10 +53,11 @@ type gatewayDeps struct {
 	loginLimiter  *auth.LoginRateLimiter
 	registry      *providers.Registry
 	secretManager *secrets.Manager
+	captureStore  *capture.Store
 	health        *handlers.HealthHandler
 }
 
-func newGatewayDeps(cfg, runtimeCfg *config.Config, db *gorm.DB, setupMode bool, secretMgr *secrets.Manager) gatewayDeps {
+func newGatewayDeps(cfg, runtimeCfg *config.Config, db *gorm.DB, setupMode bool, secretMgr *secrets.Manager, captureStore *capture.Store) gatewayDeps {
 	clientService := services.NewClientService(db)
 	geminiService := services.NewGeminiService(db, runtimeCfg)
 	statsService := services.NewStatsService(db)
@@ -78,6 +80,7 @@ func newGatewayDeps(cfg, runtimeCfg *config.Config, db *gorm.DB, setupMode bool,
 		loginLimiter:  loginLimiter,
 		registry:      providers.BuildRegistry(runtimeCfg),
 		secretManager: secretMgr,
+		captureStore:  captureStore,
 		health:        handlers.NewHealthHandler(db),
 	}
 }
@@ -179,8 +182,8 @@ func buildAPIRouter(d gatewayDeps) *chi.Mux {
 
 	authMiddleware := mw.NewAuthMiddleware(d.clientService)
 	rateLimiter := mw.NewRateLimiter()
-	proxyHandler := handlers.NewProxyHandler(d.geminiService, d.statsService)
-	openaiHandler := handlers.NewOpenAIHandler(d.geminiService, d.clientService, d.statsService, d.registry, d.toolService, d.secretManager)
+	proxyHandler := handlers.NewProxyHandler(d.geminiService, d.statsService, d.captureStore)
+	openaiHandler := handlers.NewOpenAIHandler(d.geminiService, d.clientService, d.statsService, d.registry, d.toolService, d.secretManager, d.captureStore)
 
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware.Handler)
@@ -204,7 +207,7 @@ func buildAdminRouter(d gatewayDeps) (*chi.Mux, error) {
 	if configPath == "" {
 		return nil, fmt.Errorf("config source path unknown; cannot wire admin persistence or setup")
 	}
-	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter, d.secretManager, configPath)
+	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter, d.secretManager, configPath, d.captureStore)
 	if err != nil {
 		return nil, fmt.Errorf("admin handler: %w", err)
 	}

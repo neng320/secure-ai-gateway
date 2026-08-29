@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -116,6 +118,76 @@ type DatabaseConfig struct {
 type LoggingConfig struct {
 	Level string `yaml:"level"`
 	File  string `yaml:"file"`
+	// RequestBodyCapture: 临时诊断正文捕获（SEC-003 / P1-04C）。
+	// 默认 OFF；启用须显式 expires_at（RFC3339，未来，且距校验时刻 ≤24h）。
+	// 正文仅存内存（bounded），绝不写 SQLite/文件/日志。
+	RequestBodyCapture RequestBodyCaptureConfig `yaml:"request_body_capture"`
+}
+
+// RequestBodyCaptureConfig: 诊断捕获配置。
+// 硬约束：max_bytes 默认 16KiB / 硬上限 64KiB；max_entries 默认 100 / 硬上限 1000；
+// 超限 fail closed（拒绝启动）。
+type RequestBodyCaptureConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ExpiresAt  string `yaml:"expires_at"`
+	MaxBytes   int    `yaml:"max_bytes"`
+	MaxEntries int    `yaml:"max_entries"`
+}
+
+const (
+	CaptureMaxBytesDefault   = 16 * 1024
+	CaptureMaxBytesHardCap   = 64 * 1024
+	CaptureMaxEntriesDefault = 100
+	CaptureMaxEntriesHardCap = 1000
+	CaptureMaxWindow         = 24 * time.Hour
+)
+
+// CaptureSettings: 校验后的捕获运行参数（Enabled=false 时其余字段无意义）。
+type CaptureSettings struct {
+	Enabled    bool
+	ExpiresAt  time.Time
+	MaxBytes   int
+	MaxEntries int
+}
+
+// ResolveRequestBodyCapture: 校验并解析捕获配置（SEC-003 fail-closed）。
+//   - 未启用 → OFF（其余字段不生效）
+//   - 启用时：expires_at 必须为合法 RFC3339 且严格在未来、窗口 ≤24h
+//   - max_bytes/max_entries：0 取默认；负数或超硬上限 → 错误（拒绝启动）
+func (l LoggingConfig) ResolveRequestBodyCapture(now time.Time) (CaptureSettings, error) {
+	c := l.RequestBodyCapture
+	if !c.Enabled {
+		return CaptureSettings{}, nil
+	}
+	raw := strings.TrimSpace(c.ExpiresAt)
+	if raw == "" {
+		return CaptureSettings{}, fmt.Errorf("request_body_capture.enabled=true requires expires_at (RFC3339, within 24h)")
+	}
+	exp, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return CaptureSettings{}, fmt.Errorf("request_body_capture.expires_at is not valid RFC3339")
+	}
+	if !exp.After(now) {
+		return CaptureSettings{}, fmt.Errorf("request_body_capture.expires_at is not in the future (capture stays disabled)")
+	}
+	if exp.Sub(now) > CaptureMaxWindow {
+		return CaptureSettings{}, fmt.Errorf("request_body_capture window exceeds hard maximum of 24h")
+	}
+	maxBytes := c.MaxBytes
+	if maxBytes == 0 {
+		maxBytes = CaptureMaxBytesDefault
+	}
+	if maxBytes < 0 || maxBytes > CaptureMaxBytesHardCap {
+		return CaptureSettings{}, fmt.Errorf("request_body_capture.max_bytes must be within [1, %d]", CaptureMaxBytesHardCap)
+	}
+	maxEntries := c.MaxEntries
+	if maxEntries == 0 {
+		maxEntries = CaptureMaxEntriesDefault
+	}
+	if maxEntries < 0 || maxEntries > CaptureMaxEntriesHardCap {
+		return CaptureSettings{}, fmt.Errorf("request_body_capture.max_entries must be within [1, %d]", CaptureMaxEntriesHardCap)
+	}
+	return CaptureSettings{Enabled: true, ExpiresAt: exp, MaxBytes: maxBytes, MaxEntries: maxEntries}, nil
 }
 
 type PrometheusConfig struct {

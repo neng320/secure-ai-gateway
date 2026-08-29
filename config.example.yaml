@@ -107,3 +107,14 @@ database:
 logging:
   level: info
   file: ./logs/gateway.log
+  # SEC-003/P1-04C：临时诊断正文捕获（MEMORY-ONLY，默认 OFF）
+  # - 默认不捕获任何请求正文；prompt 正文绝不写入 SQLite/文件/日志
+  # - 仅临时诊断时显式开启：必须设 expires_at（RFC3339，未来，距启用时刻 ≤24h 硬上限）
+  # - max_bytes 默认 16KiB（硬上限 64KiB）；max_entries 默认 100（硬上限 1000）；超限拒绝启动
+  # - 到期自动停用并清空；重启后自然消失
+  # - 开启时正文仅可经 /admin/request-bodies/{requestID}（RequireAuth + no-store）按需读取
+  request_body_capture:
+    enabled: false
+    expires_at: ""
+    max_bytes: 16384
+    max_entries: 100

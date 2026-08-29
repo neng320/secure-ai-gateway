@@ -74,7 +74,7 @@ func newTestGateway(t *testing.T, prometheusEnabled, setupRequired bool) *gatewa
 		}
 	})
 
-	deps := newGatewayDeps(cfg, cfg, db, false, nil) // listener gate：无 Provider Secret 场景，运行时视图==持久化视图
+	deps := newGatewayDeps(cfg, cfg, db, false, nil, nil) // listener gate：无 Provider Secret 场景，运行时视图==持久化视图
 	apiMux := buildAPIRouter(deps)
 	adminMux, err := buildAdminRouter(deps)
 	if err != nil {

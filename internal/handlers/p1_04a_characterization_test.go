@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
 	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
@@ -41,7 +42,9 @@ const (
 // p104Env: 正文数据流测试环境（proxy + openai + admin 三路由同构 buildAPIRouter/buildAdminRouter）
 type p104Env struct {
 	db            *gorm.DB
+	dbPath        string
 	cfg           *config.Config
+	capture       *capture.Store
 	clientService *services.ClientService
 	api           http.Handler
 	admin         http.Handler
@@ -52,6 +55,12 @@ type p104Env struct {
 }
 
 func newP104Env(t *testing.T, initial http.HandlerFunc) *p104Env {
+	t.Helper()
+	return newP104EnvWithStore(t, initial, nil)
+}
+
+// newP104EnvWithStore: 允许注入诊断捕获 store（P1-04C；nil = 捕获关闭）
+func newP104EnvWithStore(t *testing.T, initial http.HandlerFunc, envCapture *capture.Store) *p104Env {
 	t.Helper()
 	env := &p104Env{behavior: initial}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,10 +80,13 @@ func newP104Env(t *testing.T, initial http.HandlerFunc) *p104Env {
 	t.Cleanup(upstream.Close)
 	env.upstreamURL = upstream.URL
 
-	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "p104.db")), &gorm.Config{})
+	dbPath := filepath.Join(t.TempDir(), "p104.db")
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	env.dbPath = dbPath
+	env.capture = envCapture
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
 		t.Fatal(err)
 	}
@@ -103,8 +115,8 @@ func newP104Env(t *testing.T, initial http.HandlerFunc) *p104Env {
 	toolService := services.NewToolService(nil)
 
 	// Public API（与 buildAPIRouter 同构：RequestID + proxy + openai，含 client 认证）
-	proxyHandler := NewProxyHandler(geminiService, statsService)
-	openaiHandler := NewOpenAIHandler(geminiService, clientService, statsService, registry, toolService, nil)
+	proxyHandler := NewProxyHandler(geminiService, statsService, envCapture)
+	openaiHandler := NewOpenAIHandler(geminiService, clientService, statsService, registry, toolService, nil, envCapture)
 	apiMux := chi.NewRouter()
 	apiMux.Use(mw.RequestID())
 	apiMux.Use(mw.NewAuthMiddleware(clientService).Handler)
@@ -117,7 +129,7 @@ func newP104Env(t *testing.T, initial http.HandlerFunc) *p104Env {
 	store := auth.NewSQLiteStore(db)
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15*time.Minute, cfg.Admin.Username)
-	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, services.NewDashboardHub(statsService), toolService, store, limiter, nil, "")
+	adminHandler, err := NewAdminHandler(cfg, clientService, statsService, geminiService, services.NewDashboardHub(statsService), toolService, store, limiter, nil, "", envCapture)
 	if err != nil {
 		t.Fatal(err)
 	}

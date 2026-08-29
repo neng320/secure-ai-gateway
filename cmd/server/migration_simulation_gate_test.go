@@ -153,7 +153,7 @@ func newGateEnv(t *testing.T, encryptedGlobal bool) *gateEnv {
 		t.Fatalf("buildRuntimeConfig: %v", err)
 	}
 
-	deps := newGatewayDeps(cfg, runtimeCfg, db, false, mgr)
+	deps := newGatewayDeps(cfg, runtimeCfg, db, false, mgr, nil)
 	apiMux := buildAPIRouter(deps)
 	adminMux, err := buildAdminRouter(deps)
 	if err != nil {
