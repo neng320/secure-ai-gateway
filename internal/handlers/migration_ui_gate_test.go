@@ -153,7 +153,7 @@ func TestMigrationGate_ResolveProvider_LegacyPlaintext_FailClosed(t *testing.T) 
 		Update("backend_api_key", canaryClient).Error; err != nil {
 		t.Fatal(err)
 	}
-	gwKey, err := env.clientService.RegenerateAPIKey(client.ID, "openai", "sk-")
+	gwKey, err := env.clientService.RegenerateAPIKey(client.ID, "openai", "sk-", "test-admin", "P105C rotate reason")
 	if err != nil {
 		t.Fatal(err)
 	}

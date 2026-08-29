@@ -3,7 +3,7 @@
 > 审计对象：tag `secure-gateway-p1-request-log-privacy.5`（develop `55f258e`）时点。
 > 本阶段**生产行为 0 修改**；仅审计 + characterization tests + 本文档。
 > 测试：`internal/handlers/p1_05a_lifecycle_test.go`（10 用例，全部 PASS）。
-> **P1-05B 已修正全部 4 项 [KNOWN-GAP]（见 §7 Correction Results）；P1-05 整体仍 IN PROGRESS（P1-05C：REVOKED/Reason/Audit）。**
+> **P1-05B 已修正全部 4 项 [KNOWN-GAP]（见 §7 Correction Results）；P1-05C 已完成 REVOKED/Reason/Audit foundation（见 §8），P1-05 整体 COMPLETE。**
 
 ## 1. 生命周期数据流（ISSUE → STORE → AUTHENTICATE → SUSPEND → RE-ENABLE → ROTATE → REVOKE → DELETE → CLEANUP → AUDIT）
 
@@ -127,3 +127,26 @@ Audit         需要持久化 append-only 事件（P1-05 专表 vs P1-08 AuditEv
 - **Prometheus residue 政策（正式记录）**：`client_id` label 系列属 private metrics listener 的 process-lifetime operational telemetry，不含 credential，进程重启即消失 → `ON_DELETE = retain until process restart`（本阶段不扩大重构范围）。
 - **静态/交付 Gate**：`TestP105B_StaticGate_*` 6 项——死亡标识符、RowsAffected≥3、ResetClient 恰 1 调用、常量时间比较、共享实例、DSN 外键。
 - **正确性注记**：P1-05B 不取消已开始的 upstream 请求；要求的是 Delete 后禁止新认证、并禁止旧 in-flight 请求重建 client-owned 持久行。
+
+---
+
+## 8. P1-05C Final Lifecycle Semantics
+
+P1-05C 在 P1-05B 的 lifecycle consistency foundation 上增加永久吊销与通用审计底座。状态不新增持久化 `Status` 字段，始终由 `RevokedAt` 与 `IsActive` 推导：
+
+| State | Derived condition | Key/auth behavior | Allowed transitions |
+|---|---|---|---|
+| `ACTIVE` | `RevokedAt IS NULL` and `IsActive = true` | current key authenticates | suspend, revoke, rotate, delete |
+| `SUSPENDED` | `RevokedAt IS NULL` and `IsActive = false` | current key returns the same generic `401 Invalid API key` | resume, revoke, rotate, delete |
+| `REVOKED` | `RevokedAt IS NOT NULL` | `APIKeyHash IS NULL`; all old keys permanently return generic `401` | delete only; ordinary metadata/settings edits remain allowed but cannot alter lifecycle columns |
+| `DELETED` | client row absent | no client authentication; retained audit target ID | terminal absence |
+
+`REVOKED` is terminal: suspend, resume, rotate, and repeat revoke return the stable invalid-transition error (`HTTP 409`). Revoke writes `IsActive=false`, `RevokedAt`, trusted `RevokedBy`, normalized bounded `RevocationReason`, and SQL `NULL` `APIKeyHash` in one transaction. Multiple revoked clients therefore do not collide on the unique hash index.
+
+Lifecycle reasons are trimmed, valid UTF-8, non-empty for rotate/suspend/revoke/delete, at most 256 Unicode code points, and reject CR/LF and control characters. Resume accepts an empty reason but validates it when supplied. Admin actor identity is taken from the server-side configured admin username; submitted `actor`, `actor_id`, and `revoked_by` form fields are ignored.
+
+The generic `AuditEvent` schema stores only fixed action, trusted actor, client target, bounded reason, timestamp, and server-generated event ID. Create, rotate, suspend, resume, revoke, and delete each append exactly one event in the same SQLite transaction as the mutation; an audit insert failure rolls back the mutation. Delete removes client-owned request logs and daily usage but leaves the `CLIENT_DELETED` event because `AuditEvent` has no client foreign key.
+
+The application boundary is append/read-only (`RecordTx` and `List`); it is not a claim of database-level immutability, tamper evidence, hash chaining, retention, or complete audit coverage. Those controls remain P1-08 scope.
+
+Evidence: `internal/handlers/p1_05c_lifecycle_test.go` A–Z acceptance suite, `internal/handlers/p1_05c_static_gate_test.go` source gates, and `docs/adr/ADR-008-client-lifecycle-audit-foundation.md`.

@@ -87,7 +87,7 @@ func newP104EnvWithStore(t *testing.T, initial http.HandlerFunc, envCapture *cap
 	}
 	env.dbPath = dbPath
 	env.capture = envCapture
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -149,17 +149,18 @@ func (e *p104Env) setBehavior(h http.HandlerFunc) {
 // newP104Client: 建网关 client 并返回 (clientID, 网关 API key)
 func (e *p104Env) newP104Client(t *testing.T, name, backend, baseURLOverride string) (string, string) {
 	t.Helper()
-	client, gwKey, err := e.clientService.CreateClient(name, "", "openai", "sk-", e.cfg)
+	client, gwKey, err := e.clientService.CreateClient(name, "", "openai", "sk-", e.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
+	updates := map[string]interface{}{}
 	if backend != "" {
-		client.Backend = backend
+		updates["backend"] = backend
 	}
 	if baseURLOverride != "" {
-		client.BackendBaseURL = baseURLOverride
+		updates["backend_base_url"] = baseURLOverride
 	}
-	if err := e.clientService.UpdateClient(client); err != nil {
+	if err := e.clientService.UpdateClientSettings(client.ID, updates); err != nil {
 		t.Fatal(err)
 	}
 	return client.ID, gwKey
@@ -454,8 +455,7 @@ func TestP104B_Fixed_RuntimeLog_BoundedErrorCodeOnly(t *testing.T) {
 	if err != nil || client == nil {
 		t.Fatal("client 不存在")
 	}
-	client.FallbackModels = "fallback-x"
-	if err := env.clientService.UpdateClient(client); err != nil {
+	if err := env.clientService.UpdateClientSettings(client.ID, map[string]interface{}{"fallback_models": "fallback-x"}); err != nil {
 		t.Fatal(err)
 	}
 

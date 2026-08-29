@@ -1,0 +1,113 @@
+package audit
+
+// P1-05C · Generic AuditEvent Foundation（application append-only）
+//
+// 生产 Audit service 只提供：
+//   Append（同事务写入）与 Read。
+// 不提供 Update / Delete——生产代码绝不允许
+//   db.Model(&AuditEvent{}).Updates(...) 或 db.Delete(&AuditEvent{}...)。
+//
+// 边界声明：本包是 application append-only foundation，不是 P1-08 的
+// 数据库级 tamper-evidence / hash chain / retention / operator anti-tamper。
+// 完整不可变审计子系统由 P1-08 负责（见 docs/adr/ADR-008）。
+
+import (
+	"fmt"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"ai-gateway/internal/models"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+// 固定 action 常量（§10）——禁止自由字符串拼接；审计写入按白名单校验。
+const (
+	ActionClientCreated    = "CLIENT_CREATED"
+	ActionClientKeyRotated = "CLIENT_KEY_ROTATED"
+	ActionClientSuspended  = "CLIENT_SUSPENDED"
+	ActionClientResumed    = "CLIENT_RESUMED"
+	ActionClientRevoked    = "CLIENT_REVOKED"
+	ActionClientDeleted    = "CLIENT_DELETED"
+)
+
+// allowedActions: 审计写入白名单（静态 Gate 断言生产 action 只能来自常量）。
+var allowedActions = map[string]bool{
+	ActionClientCreated:    true,
+	ActionClientKeyRotated: true,
+	ActionClientSuspended:  true,
+	ActionClientResumed:    true,
+	ActionClientRevoked:    true,
+	ActionClientDeleted:    true,
+}
+
+func IsKnownAction(action string) bool {
+	return allowedActions[action]
+}
+
+type Service struct {
+	db *gorm.DB
+}
+
+func NewService(db *gorm.DB) *Service {
+	return &Service{db: db}
+}
+
+func validateBoundedField(name, value string, maxRunes int, required bool) error {
+	if required && strings.TrimSpace(value) == "" {
+		return fmt.Errorf("audit: invalid %s", name)
+	}
+	if !utf8.ValidString(value) || len([]rune(value)) > maxRunes {
+		return fmt.Errorf("audit: invalid %s", name)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("audit: invalid %s", name)
+		}
+	}
+	return nil
+}
+
+// RecordTx: 在【调用方事务内】append 一条 event——lifecycle mutation 与 audit
+// 必须是同一个 SQLite transaction（§9）；audit INSERT 失败 → 整个 mutation
+// rollback。EventID 由服务端生成（UUIDv4），CreatedAt 取 server time。
+func (s *Service) RecordTx(tx *gorm.DB, e models.AuditEvent) error {
+	if !IsKnownAction(e.Action) {
+		return fmt.Errorf("audit: unknown action")
+	}
+	if e.TargetType == "" {
+		e.TargetType = "client"
+	}
+	e.Reason = strings.TrimSpace(e.Reason)
+	for _, field := range []struct {
+		name     string
+		value    string
+		maxRunes int
+		required bool
+	}{
+		{name: "action", value: e.Action, maxRunes: 64, required: true},
+		{name: "actor_type", value: e.ActorType, maxRunes: 32, required: true},
+		{name: "actor_id", value: e.ActorID, maxRunes: 255, required: true},
+		{name: "target_type", value: e.TargetType, maxRunes: 32, required: true},
+		{name: "target_id", value: e.TargetID, maxRunes: 36, required: true},
+		{name: "reason", value: e.Reason, maxRunes: 256},
+	} {
+		if err := validateBoundedField(field.name, field.value, field.maxRunes, field.required); err != nil {
+			return err
+		}
+	}
+	e.EventID = uuid.New().String()
+	e.CreatedAt = time.Now().UTC()
+	return tx.Create(&e).Error
+}
+
+// List: 只读查询（按 target；时间正序）。
+func (s *Service) List(targetType, targetID string) ([]models.AuditEvent, error) {
+	var events []models.AuditEvent
+	err := s.db.Where("target_type = ? AND target_id = ?", targetType, targetID).
+		Order("id ASC").Find(&events).Error
+	return events, err
+}

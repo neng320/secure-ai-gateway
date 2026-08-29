@@ -152,7 +152,7 @@ func newPrivacyEnv(t *testing.T, captureOn bool) *privacyEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := ensureRequestLogPrivacyRunnable(db); err != nil {
@@ -311,21 +311,21 @@ func TestPromptPrivacyGate_DefaultMode_NoPlaintextAnywhere(t *testing.T) {
 	svc := newGateClientSvc(env)
 
 	// client A：无 override → global fallback；client B：openai override
-	cA, gwA, err := svc.CreateClient("pp-global", "", "openai", "sk-", env.cfg)
+	cA, gwA, err := svc.CreateClient("pp-global", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cA.Backend = "openai"
-	if err := svc.UpdateClient(cA); err != nil {
+	if err := svc.UpdateClientSettings(cA.ID, map[string]interface{}{"backend": "openai"}); err != nil {
 		t.Fatal(err)
 	}
-	cB, gwB, err := svc.CreateClient("pp-override", "", "openai", "sk-", env.cfg)
+	cB, gwB, err := svc.CreateClient("pp-override", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cB.Backend = "openai"
-	cB.BackendBaseURL = env.upstream.URL + "/v1"
-	if err := svc.UpdateClient(cB); err != nil {
+	if err := svc.UpdateClientSettings(cB.ID, map[string]interface{}{
+		"backend":          "openai",
+		"backend_base_url": env.upstream.URL + "/v1",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -388,13 +388,14 @@ func TestPromptPrivacyGate_RuntimeUpstreamError_BoundedOnly(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":{"message":"` + gateCanaryUPErr + `"}}`))
 	})
 	svc := newGateClientSvc(env)
-	c, gwKey, err := svc.CreateClient("pp-fb", "", "openai", "sk-", env.cfg)
+	c, gwKey, err := svc.CreateClient("pp-fb", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Backend = "openai"
-	c.FallbackModels = "fallback-x"
-	if err := svc.UpdateClient(c); err != nil {
+	if err := svc.UpdateClientSettings(c.ID, map[string]interface{}{
+		"backend":         "openai",
+		"fallback_models": "fallback-x",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -420,11 +421,11 @@ func TestPromptPrivacyGate_RuntimeUpstreamError_BoundedOnly(t *testing.T) {
 func TestPromptPrivacyGate_DiagnosticMode_MemoryOnly(t *testing.T) {
 	env := newPrivacyEnv(t, true) // capture 显式启用 10 分钟
 	svc := newGateClientSvc(env)
-	c, gwKey, err := svc.CreateClient("pp-cap", "", "gemini", "sk-", env.cfg)
+	c, gwKey, err := svc.CreateClient("pp-cap", "", "gemini", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.UpdateClient(c); err != nil {
+	if err := svc.UpdateClientSettings(c.ID, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -462,11 +463,11 @@ func TestPromptPrivacyGate_DiagnosticMode_MemoryOnly(t *testing.T) {
 func TestPromptPrivacyGate_Bounds_TruncationThroughEndpoint(t *testing.T) {
 	env := newPrivacyEnv(t, true)
 	svc := newGateClientSvc(env)
-	c, gwKey, err := svc.CreateClient("pp-big", "", "gemini", "sk-", env.cfg)
+	c, gwKey, err := svc.CreateClient("pp-big", "", "gemini", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.UpdateClient(c); err != nil {
+	if err := svc.UpdateClientSettings(c.ID, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
 

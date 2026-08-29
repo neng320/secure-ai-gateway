@@ -47,6 +47,32 @@ type Client struct {
 	LastSeen  time.Time `json:"last_seen"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// P1-05C · Permanent Revocation（additive nullable；无独立 Status 字段——
+	// REVOKED 由 RevokedAt != nil 推导，避免第二份状态真相）。
+	// json:"-" 防止通过通用 Client JSON 泄露管理侧 lifecycle metadata。
+	RevokedAt        *time.Time `gorm:"index" json:"-"`
+	RevokedBy        string     `gorm:"type:varchar(255)" json:"-"`
+	RevocationReason string     `gorm:"type:varchar(256)" json:"-"`
+}
+
+// ClientLifecycleState: 派生状态（P1-05C）——不持久化，只从 RevokedAt + IsActive 推导。
+type ClientLifecycleState string
+
+const (
+	ClientStateActive    ClientLifecycleState = "ACTIVE"
+	ClientStateSuspended ClientLifecycleState = "SUSPENDED"
+	ClientStateRevoked   ClientLifecycleState = "REVOKED"
+)
+
+func (c *Client) LifecycleState() ClientLifecycleState {
+	if c.RevokedAt != nil {
+		return ClientStateRevoked
+	}
+	if !c.IsActive {
+		return ClientStateSuspended
+	}
+	return ClientStateActive
 }
 
 // HasBackendKey: 是否配置了 per-client Provider Key（legacy 明文或 encrypted 信封）。

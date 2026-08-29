@@ -79,29 +79,43 @@ func TestP105B_StaticGate_RowsAffectedAndSentinel(t *testing.T) {
 	if !strings.Contains(src, "ErrClientNotFound = errors.New") {
 		t.Fatal("[static] client.go 缺少 ErrClientNotFound sentinel")
 	}
+	if !strings.Contains(src, "ErrClientRevoked") || !strings.Contains(src, "ErrInvalidLifecycleTransition") || !strings.Contains(src, "ErrInvalidLifecycleReason") {
+		t.Fatal("[static] client.go 缺少 P1-05C 生命周期 sentinel（Revoked/Transition/Reason）")
+	}
 	if !strings.Contains(src, "db.Transaction") {
 		t.Fatal("[static] DeleteClient 必须使用事务（db.Transaction）")
 	}
-	if n := strings.Count(src, "RowsAffected"); n < 3 {
-		t.Fatalf("[static] client.go 应 3 处 RowsAffected 检查（Regenerate/Delete/SetActive），实际 %d", n)
+	// P1-05C：RowsAffected 检查覆盖 rotate/suspend/resume/revoke/delete（≥5）
+	if n := strings.Count(src, "RowsAffected"); n < 5 {
+		t.Fatalf("[static] client.go 应 ≥5 处 RowsAffected 检查（Rotate/Suspend/Resume/Revoke/Delete），实际 %d", n)
 	}
-	if !strings.Contains(src, "SetClientActive") {
-		t.Fatal("[static] client.go 缺少 SetClientActive")
+	if !strings.Contains(src, "SuspendClient") || !strings.Contains(src, "ResumeClient") || !strings.Contains(src, "RevokeClient") {
+		t.Fatal("[static] client.go 缺少 SuspendClient/ResumeClient/RevokeClient")
 	}
-	t.Log("[static] services：ErrClientNotFound + Regenerate/Delete/SetActive 均检查 RowsAffected")
+	// 旧 SetClientActive 已替换（P1-05C API 面演化）
+	if strings.Contains(src, "SetClientActive") {
+		t.Fatal("[static] client.go 不应再有 SetClientActive（已替换为 Suspend/ResumeClient）")
+	}
+	t.Log("[static] services：sentinel + Rotate/Suspend/Resume/Revoke/Delete 全部 RowsAffected 检查")
 }
 
-func TestP105B_StaticGate_ResetClientOnlyOnDelete(t *testing.T) {
+func TestP105B_StaticGate_ResetClientOnlyAfterCommit(t *testing.T) {
 	root := p105bModuleRoot(t)
 	adminSrc := p105bRead(t, root, "internal/handlers/admin.go")
 
-	if n := strings.Count(adminSrc, ".ResetClient("); n != 1 {
-		t.Fatalf("[static] admin.go 中 ResetClient 调用应只出现 1 次（DeleteClient 成功路径），实际 %d", n)
+	// P1-05C：ResetClient 恰 2 处调用——DeleteClient 与 RevokeClient 的【事务成功之后】
+	if n := strings.Count(adminSrc, ".ResetClient("); n != 2 {
+		t.Fatalf("[static] admin.go 中 ResetClient 调用应恰 2 次（Delete/Revoke 成功路径），实际 %d", n)
 	}
-	if !strings.Contains(adminSrc, "SetClientActive") {
-		t.Fatal("[static] admin.go 应调用 SetClientActive（toggle 不再直接改字段）")
+	for _, s := range []string{"SuspendClient", "ResumeClient", "RevokeClient"} {
+		if !strings.Contains(adminSrc, s) {
+			t.Fatalf("[static] admin.go 应调用 %s", s)
+		}
 	}
-	t.Log("[static] admin.go：ResetClient 仅存在于 DeleteClient；toggle 走 SetClientActive")
+	if strings.Contains(adminSrc, "SetClientActive") {
+		t.Fatal("[static] admin.go 不应再出现 SetClientActive")
+	}
+	t.Log("[static] admin.go：ResetClient 仅 Delete/Revoke 成功路径；toggle 走 Suspend/ResumeClient")
 }
 
 func TestP105B_StaticGate_MetricsConstantTime(t *testing.T) {

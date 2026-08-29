@@ -132,7 +132,7 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -318,7 +318,7 @@ func freshGatewayKeyOf(t *testing.T, svc *services.ClientService, name string) s
 	if id == "" {
 		t.Fatalf("client %q 不存在", name)
 	}
-	key, err := svc.RegenerateAPIKey(id, "openai", "sk-")
+	key, err := svc.RegenerateAPIKey(id, "openai", "sk-", "test-admin", "P105C rotate reason")
 	if err != nil {
 		t.Fatal(err)
 	}

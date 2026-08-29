@@ -76,7 +76,7 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	// Windows 下 TempDir 清理需要先释放 SQLite 文件句柄

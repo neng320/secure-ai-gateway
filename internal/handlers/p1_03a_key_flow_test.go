@@ -100,7 +100,7 @@ func newKeyFlowEnvWithManager(t *testing.T, globalAPIKey string, manager *secret
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -174,20 +174,22 @@ func (e *keyFlowEnv) doChat(t *testing.T, clientAPIKey, model string) {
 // P1-03C3 起 key 只存密文（与 Admin CreateClient 同语义）：明文参数即刻转为信封。
 func (e *keyFlowEnv) createClientWithKey(t *testing.T, backendAPIKey string) *models.Client {
 	t.Helper()
-	client, _, err := e.clientService.CreateClient("kf", "", "openai", "sk-", e.cfg)
+	client, _, err := e.clientService.CreateClient("kf", "", "openai", "sk-", e.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.Backend = "openai"                     // service 层 CreateClient 不设 Backend（DB 默认 gemini），显式指定
-	client.BackendBaseURL = e.upstreamURL + "/v1" // openai_compat 约定：base 已含 /v1
+	updates := map[string]interface{}{
+		"backend":          "openai",              // service 层 CreateClient 不设 Backend（DB 默认 gemini），显式指定
+		"backend_base_url": e.upstreamURL + "/v1", // openai_compat 约定：base 已含 /v1
+	}
 	if backendAPIKey != "" {
 		env, encErr := e.manager.EncryptClientBackendKey(client.ID, []byte(backendAPIKey))
 		if encErr != nil {
 			t.Fatal(encErr)
 		}
-		client.BackendAPIKeyEncrypted = env
+		updates["backend_api_key_encrypted"] = env
 	}
-	if err := e.clientService.UpdateClient(client); err != nil {
+	if err := e.clientService.UpdateClientSettings(client.ID, updates); err != nil {
 		t.Fatal(err)
 	}
 	return client
@@ -285,9 +287,7 @@ func TestP103A_KeyPrecedence_ClientKeyWins_ThenGlobalFallback(t *testing.T) {
 	}
 
 	// b) client key 清空（encrypted 字段清空，BaseURL 保留）→ 全局 key 回退
-	client.BackendAPIKeyEncrypted = ""
-	client.BackendAPIKey = ""
-	if err := env.clientService.UpdateClient(client); err != nil {
+	if err := env.clientService.UpdateClientSettings(client.ID, map[string]interface{}{"backend_api_key_encrypted": ""}); err != nil {
 		t.Fatal(err)
 	}
 	env.doChat(t, clientAPIKeyOf(t, env, client), "test-model")
@@ -296,8 +296,7 @@ func TestP103A_KeyPrecedence_ClientKeyWins_ThenGlobalFallback(t *testing.T) {
 	}
 
 	// c) client key 与 BaseURL 都空 → registry 全局 provider（其 BaseURL 亦为 upstream）
-	client.BackendBaseURL = ""
-	if err := env.clientService.UpdateClient(client); err != nil {
+	if err := env.clientService.UpdateClientSettings(client.ID, map[string]interface{}{"backend_base_url": ""}); err != nil {
 		t.Fatal(err)
 	}
 	env.doChat(t, clientAPIKeyOf(t, env, client), "test-model")
@@ -314,7 +313,7 @@ func clientAPIKeyOf(t *testing.T, env *keyFlowEnv, client *models.Client) string
 		t.Fatal("client 不存在")
 	}
 	// Client 的网关 API Key 只有哈希入库；此处重新签发并返回明文
-	newKey, err := env.clientService.RegenerateAPIKey(client.ID, "openai", "sk-")
+	newKey, err := env.clientService.RegenerateAPIKey(client.ID, "openai", "sk-", "test-admin", "P105C rotate reason")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +332,13 @@ func TestP103A_Fixed_UpdateClient_KeySemantics(t *testing.T) {
 	env := newKeyFlowEnv(t, canaryGlobal)
 	client := env.createClientWithKey(t, canaryClient)
 	clientToken := adminSessionToken(t, env)
-	originalEnvelope := client.BackendAPIKeyEncrypted
+	// P1-05C：createClientWithKey 经 UpdateClientSettings（allowlist map）落库，
+	// 返回对象不携带信封——originalEnvelope 必须从库重载
+	orig, err := env.clientService.GetClientByID(client.ID)
+	if err != nil || orig == nil {
+		t.Fatal("client 不存在")
+	}
+	originalEnvelope := orig.BackendAPIKeyEncrypted
 
 	postUpdate := func(extra map[string]string) *http.Response {
 		form := url.Values{

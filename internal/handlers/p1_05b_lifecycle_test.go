@@ -119,7 +119,7 @@ func TestP105B_ForeignKeys_OnAllPooledConnections(t *testing.T) {
 func TestP105B_Regenerate_Nonexistent_ErrAnd404(t *testing.T) {
 	env := newP105Env(t)
 
-	newKey, err := env.clientSvc.RegenerateAPIKey("p105b-no-such-id", "openai", "sk-")
+	newKey, err := env.clientSvc.RegenerateAPIKey("p105b-no-such-id", "openai", "sk-", "test-admin", "P105C rotate reason")
 	if !errors.Is(err, services.ErrClientNotFound) {
 		t.Fatalf("[A] 应返回 ErrClientNotFound，实际 %v", err)
 	}
@@ -129,7 +129,7 @@ func TestP105B_Regenerate_Nonexistent_ErrAnd404(t *testing.T) {
 
 	// Admin 路由 → 404，无截断模板/无 key
 	token := p105AdminSessionOf(t, env)
-	form := url.Values{"key_type": {"openai"}, "key_prefix": {"sk-"}}
+	form := url.Values{"key_type": {"openai"}, "key_prefix": {"sk-"}, "reason": {"P105C rotate reason"}}
 	req := httptest.NewRequest("POST", "/admin/clients/p105b-no-such-id/regenerate", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
@@ -153,12 +153,12 @@ func TestP105B_Regenerate_Nonexistent_ErrAnd404(t *testing.T) {
 func TestP105B_Delete_Nonexistent_ErrAnd404(t *testing.T) {
 	env := newP105Env(t)
 
-	if err := env.clientSvc.DeleteClient("p105b-no-such-id"); !errors.Is(err, services.ErrClientNotFound) {
+	if err := env.clientSvc.DeleteClient("p105b-no-such-id", "test-admin", "P105C delete reason"); !errors.Is(err, services.ErrClientNotFound) {
 		t.Fatalf("[B] 应返回 ErrClientNotFound，实际 %v", err)
 	}
 
 	token := p105AdminSessionOf(t, env)
-	req := httptest.NewRequest("POST", "/admin/clients/p105b-no-such-id/delete", strings.NewReader(""))
+	req := httptest.NewRequest("POST", "/admin/clients/p105b-no-such-id/delete", strings.NewReader(url.Values{"reason": {"P105C delete reason"}}.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	req.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, token))
@@ -175,7 +175,7 @@ func TestP105B_Delete_Nonexistent_ErrAnd404(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105B_Delete_Existing_AllTablesZero(t *testing.T) {
 	env := newP105Env(t)
-	client, key, err := env.clientSvc.CreateClient("p105b-del", "", "openai", "sk-", env.cfg)
+	client, key, err := env.clientSvc.CreateClient("p105b-del", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestP105B_Delete_Existing_AllTablesZero(t *testing.T) {
 	}
 
 	token := p105AdminSessionOf(t, env)
-	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/delete", strings.NewReader(""))
+	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/delete", strings.NewReader(url.Values{"reason": {"P105C delete reason"}}.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	req.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, token))
@@ -212,7 +212,7 @@ func TestP105B_Delete_Existing_AllTablesZero(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105B_Delete_TransactionFailure_Rollback(t *testing.T) {
 	env := newP105Env(t)
-	client, _, err := env.clientSvc.CreateClient("p105b-tx", "", "openai", "sk-", env.cfg)
+	client, _, err := env.clientSvc.CreateClient("p105b-tx", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestP105B_Delete_TransactionFailure_Rollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = env.clientSvc.DeleteClient(client.ID)
+	err = env.clientSvc.DeleteClient(client.ID, "test-admin", "P105C delete reason")
 	if err == nil {
 		t.Fatal("[D] 注入清理失败后 DeleteClient 应返回 error")
 	}
@@ -253,7 +253,7 @@ func TestP105B_Delete_TransactionFailure_Rollback(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105B_Delete_InFlightLateWrite_Barrier(t *testing.T) {
 	env := newP105Env(t)
-	client, key, err := env.clientSvc.CreateClient("p105b-late", "", "openai", "sk-", env.cfg)
+	client, key, err := env.clientSvc.CreateClient("p105b-late", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestP105B_Delete_InFlightLateWrite_Barrier(t *testing.T) {
 
 	// Gate step 4: Admin Delete 成功（含事务提交 + bucket reset）
 	token := p105AdminSessionOf(t, env)
-	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/delete", strings.NewReader(""))
+	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/delete", strings.NewReader(url.Values{"reason": {"P105C delete reason"}}.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	req.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, token))
@@ -308,20 +308,20 @@ func TestP105B_Delete_InFlightLateWrite_Barrier(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F. Suspend/Resume：SetClientActive(false)→401；恢复原 key→200
+// F. Suspend/Resume：SuspendClient(false)→401；恢复原 key→200
 // ---------------------------------------------------------------------------
 func TestP105B_SuspendResume_Contract(t *testing.T) {
 	env := newP105Env(t)
 	c := env.insertClientWithKey(t, "p105b-sr", p105OriginalKey, true)
 
-	if err := env.clientSvc.SetClientActive(c.ID, false); err != nil {
+	if err := env.clientSvc.SuspendClient(c.ID, "test-admin", "P105C suspend reason"); err != nil {
 		t.Fatal(err)
 	}
 	if resp := env.doAuth(t, p105OriginalKey); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("[F] suspend 后应 401（SUSPENDED 统一 invalid-key 语义），实际 %d", resp.StatusCode)
 	}
 
-	if err := env.clientSvc.SetClientActive(c.ID, true); err != nil {
+	if err := env.clientSvc.ResumeClient(c.ID, "test-admin", ""); err != nil {
 		t.Fatal(err)
 	}
 	if resp := env.doAuth(t, p105OriginalKey); resp.StatusCode != http.StatusOK {
@@ -329,8 +329,8 @@ func TestP105B_SuspendResume_Contract(t *testing.T) {
 	}
 
 	// 不存在 id → ErrClientNotFound
-	if err := env.clientSvc.SetClientActive("p105b-no-such", true); !errors.Is(err, services.ErrClientNotFound) {
-		t.Fatalf("[F] SetClientActive 不存在 client 应 ErrClientNotFound，实际 %v", err)
+	if err := env.clientSvc.SuspendClient("p105b-no-such", "test-admin", "P105C suspend reason"); !errors.Is(err, services.ErrClientNotFound) {
+		t.Fatalf("[F] SuspendClient 不存在 client 应 ErrClientNotFound，实际 %v", err)
 	}
 	t.Log("[F PASS] Suspend→401 / Resume 原 key→200 / 不存在→ErrClientNotFound")
 }
@@ -340,7 +340,7 @@ func TestP105B_SuspendResume_Contract(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105B_Rotate_InheritsRateLimitState(t *testing.T) {
 	env := newP105Env(t)
-	client, key, err := env.clientSvc.CreateClient("p105b-rot", "", "openai", "sk-", env.cfg)
+	client, key, err := env.clientSvc.CreateClient("p105b-rot", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestP105B_Rotate_InheritsRateLimitState(t *testing.T) {
 		t.Fatalf("[G] 消耗 1 后 remaining 应为 1，实际 %q", got)
 	}
 
-	newKey, err := env.clientSvc.RegenerateAPIKey(client.ID, "openai", "sk-")
+	newKey, err := env.clientSvc.RegenerateAPIKey(client.ID, "openai", "sk-", "test-admin", "P105C rotate reason")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestP105B_Rotate_InheritsRateLimitState(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105B_Delete_ResetsRateLimitBucket(t *testing.T) {
 	env := newP105Env(t)
-	client, key, err := env.clientSvc.CreateClient("p105b-rst", "", "openai", "sk-", env.cfg)
+	client, key, err := env.clientSvc.CreateClient("p105b-rst", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestP105B_Delete_ResetsRateLimitBucket(t *testing.T) {
 
 	// Admin Delete（handler 内完成 tx 成功 → ResetClient）
 	token := p105AdminSessionOf(t, env)
-	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/delete", strings.NewReader(""))
+	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/delete", strings.NewReader(url.Values{"reason": {"P105C delete reason"}}.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	req.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, token))
@@ -443,7 +443,7 @@ func TestP105B_Delete_ResetsRateLimitBucket(t *testing.T) {
 func TestP105B_Toggle_DbErrorNotSwallowed(t *testing.T) {
 	env := newP105Env(t)
 	// P1-05C §0 correction：必须保存真实 generated key——禁止用固定无效 key 证明 401
-	client, generatedKey, err := env.clientSvc.CreateClient("p105b-tog", "", "openai", "sk-", env.cfg)
+	client, generatedKey, err := env.clientSvc.CreateClient("p105b-tog", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +453,7 @@ func TestP105B_Toggle_DbErrorNotSwallowed(t *testing.T) {
 	if resp := env.doAuth(t, generatedKey); resp.StatusCode != http.StatusOK {
 		t.Fatalf("[I] toggle 前 generated key 应 200，实际 %d", resp.StatusCode)
 	}
-	form := url.Values{"active": {"false"}}
+	form := url.Values{"active": {"false"}, "reason": {"P105C suspend reason"}}
 	req := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/toggle", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
@@ -481,8 +481,8 @@ func TestP105B_Toggle_DbErrorNotSwallowed(t *testing.T) {
 		t.Fatalf("[I] resume 后同一 generated key 应 200，实际 %d", resp.StatusCode)
 	}
 
-	// 不存在 id → 404（显式状态路径经 SetClientActive ErrClientNotFound）
-	req404 := httptest.NewRequest("POST", "/admin/clients/p105b-no-such/toggle", strings.NewReader(url.Values{"active": {"true"}}.Encode()))
+	// 不存在 id → 404（显式状态路径经 SuspendClient/ResumeClient ErrClientNotFound）
+	req404 := httptest.NewRequest("POST", "/admin/clients/p105b-no-such/toggle", strings.NewReader(url.Values{"active": {"true"}, "reason": {"P105C resume reason"}}.Encode()))
 	req404.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req404.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	req404.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, token))
@@ -497,7 +497,7 @@ func TestP105B_Toggle_DbErrorNotSwallowed(t *testing.T) {
 	if err := env.db.Exec("DROP TABLE clients").Error; err != nil {
 		t.Fatal(err)
 	}
-	reqErr := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/toggle", strings.NewReader(url.Values{"active": {"true"}}.Encode()))
+	reqErr := httptest.NewRequest("POST", "/admin/clients/"+client.ID+"/toggle", strings.NewReader(url.Values{"active": {"true"}, "reason": {"P105C resume reason"}}.Encode()))
 	reqErr.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	reqErr.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	reqErr.Header.Set("X-CSRF-Token", auth.CSRFToken(env.cfg.Admin.SessionSecret, token))
@@ -555,7 +555,7 @@ func TestP105B_MetricsBasicAuth_ConstantTimeContract(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestP105B_LogRequest_FKViolation_GracefulSkip(t *testing.T) {
 	env := newP105Env(t)
-	client, _, err := env.clientSvc.CreateClient("p105b-fk", "", "openai", "sk-", env.cfg)
+	client, _, err := env.clientSvc.CreateClient("p105b-fk", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}

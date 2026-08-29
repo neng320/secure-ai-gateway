@@ -27,7 +27,7 @@ func TestGate_P1_02_CSRF_AllStateChangingRoutesProtected(t *testing.T) {
 	// 先经 clientService 建一个真实 client，拿真实 id 供 {id} 类路由使用
 	// （避免假 id 触发 RegenerateKey 对 nil client 渲染模板错误的噪音）
 	clientService := services.NewClientService(env.db)
-	client, _, err := clientService.CreateClient("gate-client", "", "openai", "sk-", env.cfg)
+	client, _, err := clientService.CreateClient("gate-client", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
