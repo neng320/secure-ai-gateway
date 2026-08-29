@@ -343,10 +343,12 @@ func TestP103A_Gemini_URLContainsKey_InErrorPath(t *testing.T) {
 	if err == nil {
 		t.Fatal("closed port 应产生错误")
 	}
-	if !strings.Contains(err.Error(), "?key=") || !strings.Contains(err.Error(), canaryGemini) {
-		t.Fatalf("[CURRENT BEHAVIOR CHANGED] 错误串不再包含 ?key= 明文——若已修复泄露，请改写为安全断言。err=%v", err)
+	// [P1-03C3 修复后回归]（反转自 KNOWN-VULN "?key= 进错误串"）：
+	// 错误串不含 ?key=、不含明文 key；key 只经 header 传输（由 providers 实现保证）
+	if strings.Contains(err.Error(), "?key=") || strings.Contains(err.Error(), canaryGemini) {
+		t.Fatalf("[安全回归失败] 错误串泄露 key 材料: %v", err)
 	}
-	t.Log("[KNOWN-VULN: SEC-002] 确认：Gemini Chat 错误路径把含 key 的完整 URL 暴露进 error 字符串")
+	t.Log("确认：Gemini 错误路径不再泄露 key（header 传输）")
 }
 
 // ---------------------------------------------------------------------------
