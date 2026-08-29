@@ -1,0 +1,199 @@
+package main
+
+// P1-03D1A · Secure Global Provider Key Provisioning
+//
+// 为全新部署提供"第一天就不产生明文 api_key"的安全入口：
+//
+//	ai-gateway -config /etc/ai-gateway/config.yaml -set-provider-key openai
+//
+// 硬性纪律：
+//   - Provider Key 绝不允许作为 CLI 参数（防 shell history / argv 泄露）
+//   - 默认 TTY no-echo 输入（x/term.ReadPassword）+ 二次确认；非 TTY 默认拒绝，
+//     仅显式 -provider-key-stdin 允许非交互（stdin 内容同样绝不回显）
+//   - 不写任何临时明文文件；config 走 candidate + 临时文件 + rename 原子替换
+//   - stdout/log/error 永不包含 secret 或 envelope
+//   - 既有 LEGACY_ONLY/MIXED → 拒绝并指向 migration CLI；INVALID → 拒绝
+//   - 既有 ENCRYPTED_ONLY → 默认拒绝，须显式 -replace-provider-key 才覆盖
+//   - provider 不存在 → 拒绝（防 typo 制造陌生 provider）
+//   - Master Key 仍为 ENV/FILE 恰好其一，fail-closed
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"ai-gateway/internal/config"
+	"ai-gateway/internal/secrets"
+
+	"golang.org/x/term"
+)
+
+// provisionResult: 仅供输出摘要使用（不含任何 secret 材料）。
+type provisionResult struct {
+	Provider   string
+	KeyID      string
+	ConfigPath string
+	Replaced   bool
+}
+
+// runSetProviderKey: -set-provider-key 主流程。readSecret 由调用方注入
+// （生产：TTY no-echo / stdin 模式；测试：注入固定值）。任何失败路径都不得
+// 修改磁盘上的 config。
+func runSetProviderKey(configPath, providerName string, allowReplace bool, readSecret func() ([]byte, error), stdout io.Writer) (*provisionResult, error) {
+	providerName = strings.TrimSpace(providerName)
+	if providerName == "" {
+		return nil, errors.New("provider name is required (-set-provider-key <name>)")
+	}
+	if configPath == "" {
+		return nil, errors.New("config path is required")
+	}
+
+	// config 必须已存在（绝不代替 setup wizard 创建默认配置）
+	if st, err := os.Stat(configPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("config %s not found — start the gateway once (setup wizard) to create it first", configPath)
+		}
+		return nil, fmt.Errorf("config %s: %w", configPath, err)
+	} else if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("config %s is not a regular file", configPath)
+	}
+
+	// 纯读取加载（无 ensureDefaults 写回、无默认值生成）
+	cfg, err := config.LoadExistingForMigration(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+
+	// provider 必须已声明（typo 防护：不静默创建陌生 provider）
+	p, ok := cfg.Providers[providerName]
+	if !ok {
+		return nil, fmt.Errorf("provider %q not found in config — declare the provider section (type/base_url) first; refusing to create an unknown provider", providerName)
+	}
+
+	// 状态机判定（与 preflight/迁移引擎同一分类器）
+	switch state := secrets.ClassifySecret(p.APIKey, p.APIKeyEncrypted); state {
+	case secrets.SecretLegacyOnly, secrets.SecretMixed:
+		return nil, fmt.Errorf("provider %q holds a legacy plaintext key — run -migrate-provider-secrets instead (plaintext provisioning is not allowed)", providerName)
+	case secrets.SecretInvalidEncrypted:
+		return nil, fmt.Errorf("provider %q holds an invalid/corrupt encrypted key — manual intervention required", providerName)
+	case secrets.SecretEncryptedOnly:
+		if !allowReplace {
+			return nil, fmt.Errorf("provider %q already has an encrypted key — pass -replace-provider-key to overwrite it deliberately", providerName)
+		}
+	}
+
+	secret, err := readSecret()
+	if err != nil {
+		return nil, err
+	}
+	if len(secret) == 0 {
+		return nil, errors.New("empty provider key — nothing to provision")
+	}
+
+	key, err := secrets.LoadMasterKey(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	cipher, err := secrets.NewAESGCMCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	mgr := secrets.NewManager(cipher)
+
+	envelope, err := mgr.EncryptGlobalProviderKey(providerName, secret)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt provider key: %w", err)
+	}
+
+	// candidate 模式：只在副本上改，原子替换成功前磁盘内容不变
+	candidate := *cfg
+	pc := candidate.Providers[providerName]
+	pc.APIKey = "" // 持久化视图绝不持有明文
+	pc.APIKeyEncrypted = envelope
+	candidate.Providers[providerName] = pc
+
+	if err := atomicWriteConfigFile(configPath, &candidate); err != nil {
+		return nil, err
+	}
+
+	res := &provisionResult{
+		Provider:   providerName,
+		KeyID:      mgr.KeyID(),
+		ConfigPath: configPath,
+		Replaced:   p.APIKeyEncrypted != "",
+	}
+	fmt.Fprintf(stdout, "provider %q key provisioned (encrypted at rest, key_id=%s, config=%s)\n",
+		res.Provider, res.KeyID, res.ConfigPath)
+	return res, nil
+}
+
+// atomicWriteConfigFile: 同目录临时文件 + rename 原子替换（与迁移引擎同语义）。
+func atomicWriteConfigFile(path string, cfg *config.Config) error {
+	data, err := config.MarshalYAML(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmp := path + ".provisioning"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
+// newProviderKeyReader: 构造默认的 secret 读取器。
+//   - stdin 模式（显式 -provider-key-stdin）：从 r 读取一行；不回显（管道场景天然不回显）
+//   - 默认：r 必须是 TTY（char device）；no-echo 读取 + 二次确认
+//
+// 两个分支都绝不把输入写进任何 log/stdout。
+func newProviderKeyReader(r io.Reader, stdinMode bool) func() ([]byte, error) {
+	if stdinMode {
+		return func() ([]byte, error) {
+			data, err := io.ReadAll(r)
+			if err != nil {
+				return nil, fmt.Errorf("read provider key from stdin: %w", err)
+			}
+			s := strings.TrimSpace(string(data))
+			if s == "" {
+				return nil, errors.New("empty provider key from stdin")
+			}
+			return []byte(s), nil
+		}
+	}
+
+	f, isFile := r.(*os.File)
+	if !isFile {
+		return func() ([]byte, error) {
+			return nil, errors.New("provider key input must be a TTY (interactive) or use -provider-key-stdin")
+		}
+	}
+	return func() ([]byte, error) {
+		if !term.IsTerminal(int(f.Fd())) {
+			return nil, errors.New("stdin is not a TTY — use -provider-key-stdin for explicit non-interactive provisioning (input is never echoed)")
+		}
+		fmt.Fprintln(os.Stderr, "Enter provider key (input hidden):")
+		first, err := term.ReadPassword(int(f.Fd()))
+		if err != nil {
+			return nil, fmt.Errorf("read provider key: %w", err)
+		}
+		fmt.Fprintln(os.Stderr)
+		if len(strings.TrimSpace(string(first))) == 0 {
+			return nil, errors.New("empty provider key")
+		}
+		fmt.Fprintln(os.Stderr, "Re-enter provider key to confirm:")
+		second, err := term.ReadPassword(int(f.Fd()))
+		if err != nil {
+			return nil, fmt.Errorf("read provider key confirmation: %w", err)
+		}
+		fmt.Fprintln(os.Stderr)
+		if string(first) != string(second) {
+			return nil, errors.New("provider key confirmation does not match — nothing was written")
+		}
+		return []byte(strings.TrimSpace(string(first))), nil
+	}
+}
