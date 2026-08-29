@@ -467,25 +467,47 @@ func (h *AdminHandler) encryptClientKey(clientID, plaintext string) (string, *ke
 	return env, nil
 }
 
-// decryptClientKey: client Provider Key 的 point-of-use 解密。
-// 密文无 Master Key / legacy 明文不变量破坏 → 受限错误，绝不回退明文。
-func (h *AdminHandler) decryptClientKey(client *models.Client) (string, *keyOpError) {
+// buildClientRuntimeProviderConfig: 组装 Admin 侧连接测试/模型拉取用的运行时
+// provider 配置（P1-03C3.1）。key 优先级与 OpenAI resolveProvider 完全一致，单一实现防漂移：
+//
+//	runtime 全局 provider（h.geminiService.GetConfig()，明文已解密）
+//	  → client BaseURL / DefaultModel override
+//	  → client 密文 override（point-of-use 解密，覆盖全局 key）
+//
+// 硬性约束：必须使用运行时视图；禁止解密全局 key 写回 h.cfg（持久化视图恒 envelope-only）。
+// client 无 key 时保留 runtime 全局 key（修复此前 Test/Fetch 丢 global fallback 的功能回归）。
+func (h *AdminHandler) buildClientRuntimeProviderConfig(client *models.Client, timeoutSeconds int) (config.ProviderConfig, *keyOpError) {
+	backend := client.Backend
+	if backend == "" {
+		backend = "gemini"
+	}
+	var cfg config.ProviderConfig
+	if gp := h.geminiService.GetConfig().GetProvider(backend); gp != nil {
+		cfg = *gp // 运行时视图副本：只读，修改不回流
+	}
+	cfg.Type = backend
+	if client.BackendBaseURL != "" {
+		cfg.BaseURL = client.BackendBaseURL
+	}
+	if client.BackendDefaultModel != "" {
+		cfg.DefaultModel = client.BackendDefaultModel
+	}
 	switch {
 	case client.BackendAPIKeyEncrypted != "":
 		if h.secretMgr == nil {
-			return "", &keyOpError{message: "client provider key is encrypted but no master key is configured", status: http.StatusServiceUnavailable}
+			return config.ProviderConfig{}, &keyOpError{message: "client provider key is encrypted but no master key is configured", status: http.StatusServiceUnavailable}
 		}
 		pt, err := h.secretMgr.DecryptClientBackendKey(client.ID, client.BackendAPIKeyEncrypted)
 		if err != nil {
 			log.Printf("[ADMIN] decrypt client %s provider key failed: %v", client.ID, err)
-			return "", &keyOpError{message: "client provider key could not be decrypted", status: http.StatusInternalServerError}
+			return config.ProviderConfig{}, &keyOpError{message: "client provider key could not be decrypted", status: http.StatusInternalServerError}
 		}
-		return string(pt), nil
+		cfg.APIKey = string(pt)
 	case client.BackendAPIKey != "":
-		return "", &keyOpError{message: "client has a legacy plaintext provider key; run -migrate-provider-secrets", status: http.StatusConflict}
-	default:
-		return "", nil // 无 per-client key：调用方走全局回退
+		return config.ProviderConfig{}, &keyOpError{message: "client has a legacy plaintext provider key; run -migrate-provider-secrets", status: http.StatusConflict}
 	}
+	cfg.TimeoutSeconds = timeoutSeconds
+	return cfg, nil
 }
 
 func (h *AdminHandler) CreateClient(w http.ResponseWriter, r *http.Request) {
@@ -791,69 +813,6 @@ func (h *AdminHandler) ShowStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *AdminHandler) ShowSettings(w http.ResponseWriter, r *http.Request) {
-	h.render(r, w, "settings.html", PageData{
-		Title: "Settings",
-		User:  h.cfg.Admin.Username,
-		Data: map[string]interface{}{
-			"Config":    h.cfg,
-			"Providers": KnownProviderTypes(),
-		},
-	})
-}
-
-// UpdateSettings: DEAD CODE——自 fork baseline 起未注册任何路由（RegisterRoutes 不挂载
-// /admin/settings，settings.html 不可达）。按 P1-03C3 任务卡决定：文档化而非为其扩展 UI。
-// ⚠ 不得在接入 P1-03C3 key 语义（blank 保留 / 非空加密替换 / 显式清除）之前复活：
-// 现有实现直接把表单明文写进 cfg.Providers[*].APIKey 并 config.Save(h.cfg)，
-// 属 SEC-002 明文持久化模式。若未来启用，必须重写为 SetupHandler 式 candidate 原子保存。
-func (h *AdminHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-
-	// Update each provider's API key and default model from the form
-	for name, pcfg := range h.cfg.Providers {
-		apiKey := r.Form.Get("provider_" + name + "_api_key")
-		if apiKey != "" || pcfg.APIKey != "" {
-			pcfg.APIKey = apiKey
-		}
-		defaultModel := r.Form.Get("provider_" + name + "_default_model")
-		if defaultModel != "" {
-			pcfg.DefaultModel = defaultModel
-		}
-		baseURL := r.Form.Get("provider_" + name + "_base_url")
-		if baseURL != "" {
-			pcfg.BaseURL = baseURL
-		}
-		h.cfg.Providers[name] = pcfg
-	}
-
-	// Handle adding a new provider
-	newName := r.Form.Get("new_provider_name")
-	newType := r.Form.Get("new_provider_type")
-	if newName != "" && newType != "" {
-		h.cfg.Providers[newName] = config.ProviderConfig{
-			Type:           newType,
-			APIKey:         r.Form.Get("new_provider_api_key"),
-			BaseURL:        r.Form.Get("new_provider_base_url"),
-			DefaultModel:   r.Form.Get("new_provider_default_model"),
-			TimeoutSeconds: 120,
-		}
-	}
-
-	// Update Gemini allowed models if the gemini provider still exists
-	allowedModels := r.Form["allowed_models"]
-	if len(allowedModels) > 0 {
-		if p, ok := h.cfg.Providers["gemini"]; ok {
-			p.AllowedModels = allowedModels
-			h.cfg.Providers["gemini"] = p
-		}
-	}
-
-	config.Save(h.cfg)
-
-	http.Redirect(w, r, "/admin/clients", http.StatusFound)
-}
-
 func (h *AdminHandler) GetAPISTats(w http.ResponseWriter, r *http.Request) {
 	stats, err := h.statsService.GetGlobalStats()
 	if err != nil {
@@ -910,23 +869,14 @@ func (h *AdminHandler) TestClientConnection(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// SEC-002（P1-03C3）：per-client key 走 point-of-use 解密（明文仅在本次请求内）
-	key, kerr := h.decryptClientKey(client)
+	pcfg, kerr := h.buildClientRuntimeProviderConfig(client, 30)
 	if kerr != nil {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"success":false,"message":"%s"}`, kerr.message)
 		return
 	}
 
-	pcfg := config.ProviderConfig{
-		Type:           client.Backend,
-		APIKey:         key,
-		BaseURL:        client.BackendBaseURL,
-		DefaultModel:   client.BackendDefaultModel,
-		TimeoutSeconds: 30,
-	}
-
-	provider, err := providers.BuildSingleProvider(client.Backend, pcfg)
+	provider, err := providers.BuildSingleProvider(pcfg.Type, pcfg)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"success":false,"message":"Failed to build provider: %s"}`, err.Error())
@@ -954,23 +904,14 @@ func (h *AdminHandler) FetchClientModels(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// SEC-002（P1-03C3）：per-client key 走 point-of-use 解密（明文仅在本次请求内）
-	key, kerr := h.decryptClientKey(client)
+	pcfg, kerr := h.buildClientRuntimeProviderConfig(client, 30)
 	if kerr != nil {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"success":false,"error":"%s"}`, kerr.message)
 		return
 	}
 
-	pcfg := config.ProviderConfig{
-		Type:           client.Backend,
-		APIKey:         key,
-		BaseURL:        client.BackendBaseURL,
-		DefaultModel:   client.BackendDefaultModel,
-		TimeoutSeconds: 30,
-	}
-
-	provider, err := providers.BuildSingleProvider(client.Backend, pcfg)
+	provider, err := providers.BuildSingleProvider(pcfg.Type, pcfg)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"success":false,"error":"Failed to build provider: %s"}`, err.Error())
@@ -2305,90 +2246,6 @@ var adminTemplates = []byte(`
 </html>
 {{end}}
 
-{{define "settings.html"}}
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Settings - AI Gateway</title>
-    <link rel="stylesheet" href="/static/style.css">
-    <style>body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; }</style>
-</head>
-<body class="bg-gray-900 min-h-screen">
-    <nav class="bg-gray-800/80 backdrop-blur-md border-b border-gray-700 sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex items-center justify-between h-16">
-                <div class="flex items-center space-x-3">
-                    <div class="w-8 h-8 bg-gradient-to-br from-blue-500 to-blue-700 rounded-lg flex items-center justify-center">
-                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
-                        </svg>
-                    </div>
-                    <span class="text-xl font-bold text-white">AI Gateway</span>
-                </div>
-                <div class="flex items-center space-x-1">
-                    <a href="/admin/dashboard" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Dashboard</a>
-                    <a href="/admin/clients" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Clients</a>
-                    <a href="/admin/stats" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Stats</a>
-                    <form method="POST" action="/admin/logout" class="ml-2">
-                        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-                        <button type="submit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
-                            </svg>
-                        </button>
-                    </form>
-                </div>
-            </div>
-        </div>
-    </nav>
-
-    <div class="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div class="bg-amber-500/10 border border-amber-500/50 rounded-xl p-4 mb-6">
-            <div class="flex items-start space-x-3">
-                <svg class="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                </svg>
-                <div class="text-amber-400">
-                    <p class="font-medium text-sm">Provider Configuration Moved</p>
-                    <p class="text-amber-300/70 text-xs mt-1">API keys and provider settings are now configured per-client. Go to Clients to manage individual client credentials.</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- Server Info -->
-        <div class="bg-gray-800 rounded-2xl border border-gray-700 p-6 mb-6">
-            <h3 class="text-lg font-semibold text-white mb-6 flex items-center">
-                <svg class="w-5 h-5 text-purple-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"/>
-                </svg>
-                Server Information
-            </h3>
-            
-            <div class="grid grid-cols-2 gap-4">
-                <div class="bg-gray-900/50 rounded-xl p-4">
-                    <p class="text-gray-500 text-xs uppercase tracking-wide">Port</p>
-                    <p class="text-white font-medium">{{(index .Data "Config").Server.Port}}</p>
-                </div>
-                <div class="bg-gray-900/50 rounded-xl p-4">
-                    <p class="text-gray-500 text-xs uppercase tracking-wide">Host</p>
-                    <p class="text-white font-medium">{{(index .Data "Config").Server.Host}}</p>
-                </div>
-                <div class="bg-gray-900/50 rounded-xl p-4">
-                    <p class="text-gray-500 text-xs uppercase tracking-wide">Default Rate (min)</p>
-                    <p class="text-white font-medium">{{(index .Data "Config").Defaults.RateLimit.RequestsPerMinute}}</p>
-                </div>
-                <div class="bg-gray-900/50 rounded-xl p-4">
-                    <p class="text-gray-500 text-xs uppercase tracking-wide">Default Daily Quota</p>
-                    <p class="text-white font-medium">{{(index .Data "Config").Defaults.Quota.MaxRequestsPerDay}} requests</p>
-                </div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-{{end}}
 
 {{define "stats.html"}}
 <!DOCTYPE html>

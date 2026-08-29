@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 const jsonCanary = "P103C21_CANARY_JSON_PROVIDER_SECRET"
@@ -57,6 +59,36 @@ func assertNoSecret(t *testing.T, out string) {
 	}
 	if strings.Contains(out, "api_key") {
 		t.Fatal("[安全回归失败] 'api_key' 键名出现在 JSON 序列化中")
+	}
+}
+
+// [安全回归]（P1-03C3.1）：legacy 顶层 gemini 兼容结构的明文 key 同样封死 JSON 通道。
+// 即便有人直接 Marshal 未经 Load 转换的 legacy Config，也不得输出 key 材料。
+func TestLegacyGeminiConfig_JSON_OmitsSecret(t *testing.T) {
+	const legacyCanary = "P103C31_CANARY_LEGACY_GEMINI_SECRET"
+
+	cfg := Config{Gemini: &LegacyGeminiConfig{APIKey: legacyCanary}}
+	out := marshalJSON(t, cfg)
+	if strings.Contains(out, legacyCanary) {
+		t.Fatal("[安全回归失败] Config.Gemini 的明文 key 出现在 JSON 序列化中")
+	}
+	if strings.Contains(out, "api_key") || strings.Contains(out, "APIKey") {
+		t.Fatalf("[安全回归失败] legacy key 字段名出现在 JSON 序列化中: %s", out)
+	}
+
+	// 直接 Marshal 兼容结构本身（纵深防御）
+	out = marshalJSON(t, &LegacyGeminiConfig{APIKey: legacyCanary})
+	if strings.Contains(out, legacyCanary) || strings.Contains(out, "api_key") {
+		t.Fatalf("[安全回归失败] LegacyGeminiConfig 直序列化泄露 key: %s", out)
+	}
+
+	// YAML backward compat 保持：yaml 序列化仍含 api_key 键
+	yb, err := yaml.Marshal(cfg.Gemini)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(yb), "api_key: "+legacyCanary) {
+		t.Fatalf("[兼容回归失败] legacy gemini 的 YAML 序列化不应改变: %s", string(yb))
 	}
 }
 

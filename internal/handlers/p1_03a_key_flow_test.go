@@ -68,6 +68,7 @@ type keyFlowEnv struct {
 	manager       *secrets.Manager
 	openai        http.Handler // /v1/* 路由（含 client key 认证中间件）
 	admin         http.Handler // /admin/* 路由（含 RequireAuth/CSRF）
+	adminMux      *chi.Mux     // 同 admin，保留具体类型供 chi.Walk 路由枚举（静态防线用）
 	upstreamURL   string
 	upstreamAuths *[]string
 }
@@ -143,7 +144,7 @@ func newKeyFlowEnvWithManager(t *testing.T, globalAPIKey string, manager *secret
 
 	return &keyFlowEnv{
 		cfg: cfg, db: db, clientService: clientService, limiter: limiter, store: store,
-		manager: manager, openai: apiMux, admin: adminMux, upstreamURL: upstream.URL, upstreamAuths: &auths,
+		manager: manager, openai: apiMux, admin: adminMux, adminMux: adminMux, upstreamURL: upstream.URL, upstreamAuths: &auths,
 	}
 }
 

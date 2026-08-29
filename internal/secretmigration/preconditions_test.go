@@ -11,6 +11,7 @@ package secretmigration
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -317,7 +318,124 @@ func columnExistsInFile(t *testing.T, dbPath, table, column string) bool {
 	return n > 0
 }
 
-// 修正 3：备份必须是 mutation 前快照——
+// ---------------------------------------------------------------------------
+// P1-03C3.1 · Final Staging Corrections
+// ---------------------------------------------------------------------------
+
+// Gate 1：clients.id 缺失 → 显式 schema STOP；
+// 绝不 ADD COLUMN、绝不 PREPARE、DB schema 完全不变、无模糊 "no such column" 半途错误
+func TestC31_MissingClientsID_SchemaStopNoMutation(t *testing.T) {
+	withEmptyCwd(t)
+	f := newFixture(t)
+	// 重建异常旧库：clients 表存在、backend_api_key 存在、id 缺失
+	if sqlDB, err := f.db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+	_ = os.Remove(f.dbPath)
+	db, err := gorm.Open(sqlite.Open(f.dbPath), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("CREATE TABLE clients (name varchar(255), backend varchar(50), backend_api_key varchar(500))").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("INSERT INTO clients (name, backend, backend_api_key) VALUES ('x', 'openai', '" + canaryClientA + "')").Error; err != nil {
+		t.Fatal(err)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+	f.db = nil
+
+	err = runMigrationOrFail(t, f)
+	if err == nil || !strings.Contains(err.Error(), "clients.id") {
+		t.Fatalf("[安全回归失败] clients.id 缺失应显式 STOP，实际 err=%v", err)
+	}
+
+	// DB schema 完全不变：没有 ADD COLUMN，也没有 id
+	if columnExistsInFile(t, f.dbPath, "clients", "backend_api_key_encrypted") {
+		t.Fatal("[安全回归失败] 前置失败仍执行了 ADD COLUMN（mutation 先于校验）")
+	}
+	if columnExistsInFile(t, f.dbPath, "clients", "id") {
+		t.Fatal("不可能状态：id 列出现")
+	}
+	assertNoBackupRoot(t, filepath.Join(f.dir, "backups"))
+}
+
+// Gate 2：DB path 指向目录 → STOP（regular-file Gate 的稳定反向场景；
+// FIFO/socket 无法跨平台稳定构造，regular-file 正向由其余全部 fixture 覆盖）
+func TestC31_NonRegularDBFile_Stop(t *testing.T) {
+	withEmptyCwd(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	dbDir := filepath.Join(dir, "gateway.db")
+	if err := os.MkdirAll(dbDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeCfgFile(t, cfgPath, "server:\n  host: 127.0.0.1\ndatabase:\n  path: "+dbDir+"\nproviders: {}\n")
+
+	if _, err := Run(Options{
+		ConfigPath: cfgPath,
+		BackupDir:  filepath.Join(dir, "bk"),
+		MasterKey:  testKey(t),
+		Now:        func() time.Time { return time.Now().UTC() },
+	}); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("[安全回归失败] 非 regular file 应 STOP，实际 err=%v", err)
+	}
+	assertNoBackupRoot(t, filepath.Join(dir, "bk"))
+}
+
+// Gate 3：manifest 必须含迁移格式版本 / encrypted 列前置状态 / sqlite user_version，
+// 且不含任何 secret 材料（canary / enc:v1 信封）
+func TestC31_ManifestVersionMetadata(t *testing.T) {
+	withEmptyCwd(t)
+	f := newFixture(t) // AutoMigrate schema：encrypted 列已存在
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+
+	res, err := runMigration(t, f, testMasterKeyB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertManifestMetadata(t, res.BackupDir, "true")
+
+	// 旧 schema fixture：快照时 encrypted 列尚未存在 → before=false
+	f2 := newOldSchemaFixture(t)
+	insertOldSchemaClient(t, f2, "client-old", canaryClientA)
+	res2, err := runMigration(t, f2, testMasterKeyB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertManifestMetadata(t, res2.BackupDir, "false")
+}
+
+func assertManifestMetadata(t *testing.T, backupDir, wantEncryptedBefore string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(backupDir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]string
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["migration_format_version"] != MigrationFormatVersion {
+		t.Fatalf("[安全回归失败] migration_format_version 应为 %q，实际 %q", MigrationFormatVersion, m["migration_format_version"])
+	}
+	if m["schema_clients_backend_api_key_encrypted_before"] != wantEncryptedBefore {
+		t.Fatalf("[安全回归失败] encrypted_before 应为 %q，实际 %q", wantEncryptedBefore, m["schema_clients_backend_api_key_encrypted_before"])
+	}
+	if _, ok := m["sqlite_user_version"]; !ok {
+		t.Fatal("[安全回归失败] manifest 缺 sqlite_user_version")
+	}
+	for k, v := range m {
+		if strings.Contains(v, "enc:v1") || strings.Contains(v, canaryGlobal) || strings.Contains(v, canaryClientA) || strings.Contains(v, testMasterKeyB64) {
+			t.Fatalf("[安全回归失败] manifest 字段 %q 含 secret 材料", k)
+		}
+	}
+}
+
+// 修正 3（P1-03C2.1）：备份必须是 mutation 前快照——
 // config（含会触发旧 ensureDefaults 写回的缺失字段）原始字节 == 备份字节；
 // DB 行内容 == 迁移前内容；loader 默认值补齐不得污染备份。
 func TestC21_BackupIsPreMutationSnapshot(t *testing.T) {

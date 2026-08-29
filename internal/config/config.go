@@ -22,7 +22,9 @@ type Config struct {
 
 	// Deprecated: kept for backward compat with existing config files.
 	// On load, this is migrated into Providers["gemini"].
-	Gemini *LegacyGeminiConfig `yaml:"gemini,omitempty"`
+	// json:"-"（P1-03C3.1）：兼容 secret 结构同样绝不进入任何 JSON 序列化路径；
+	// yaml 兼容性不受影响。
+	Gemini *LegacyGeminiConfig `yaml:"gemini,omitempty" json:"-"`
 }
 
 // ProviderConfig is the unified configuration for any upstream AI backend.
@@ -41,8 +43,10 @@ type ProviderConfig struct {
 }
 
 // LegacyGeminiConfig supports the old config.yaml format with a top-level gemini: key.
+// APIKey json:"-"（P1-03C3.1）：即便有人直接 Marshal 未经 Load 转换的 legacy Config，
+// 兼容结构的明文 key 也不得出现在 JSON 输出中。
 type LegacyGeminiConfig struct {
-	APIKey         string   `yaml:"api_key"`
+	APIKey         string   `yaml:"api_key" json:"-"`
 	DefaultModel   string   `yaml:"default_model"`
 	AllowedModels  []string `yaml:"allowed_models"`
 	TimeoutSeconds int      `yaml:"timeout_seconds"`
