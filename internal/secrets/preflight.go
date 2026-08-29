@@ -123,6 +123,7 @@ func ScanPreflight(items []SecretItem) PreflightResult {
 			res.Offenders = append(res.Offenders, it.Kind+":"+it.Ref+"=LEGACY_ONLY")
 		case SecretMixed:
 			res.MigrationRequired = true
+			res.NeedMasterKey = true // verify 阶段需要解密比对
 			res.Offenders = append(res.Offenders, it.Kind+":"+it.Ref+"=MIXED")
 			res.EncryptedItems = append(res.EncryptedItems, it)
 		case SecretEncryptedOnly:
