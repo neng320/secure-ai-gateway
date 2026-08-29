@@ -168,6 +168,23 @@ func ensureProviderSecretsRunnable(cfg *config.Config, db *gorm.DB) (*secrets.Ma
 	return mgr, nil
 }
 
+// ensureRequestLogPrivacyRunnable: SEC-003/P1-04D 启动 preflight。
+// request_logs 中存在任何 legacy request_body/error_message 非空行 → 拒绝正常启动，
+// 错误含稳定哨兵 REQUEST_LOG_PRIVACY_MIGRATION_REQUIRED（仅报告行数，绝不输出内容）。
+// 清理路径：显式 -scrub-request-log-content（不可逆）。
+func ensureRequestLogPrivacyRunnable(db *gorm.DB) error {
+	var dirty int64
+	if err := db.Raw("SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''").Scan(&dirty).Error; err != nil {
+		// 表/列缺失由 AutoMigrate 保证；到达此处仍失败属异常 → fail-closed
+		return fmt.Errorf("request log privacy preflight: %w", err)
+	}
+	if dirty > 0 {
+		return fmt.Errorf("REQUEST_LOG_PRIVACY_MIGRATION_REQUIRED: %d request_logs rows still contain legacy prompt/error content; "+
+			"run -scrub-request-log-content -confirm-destructive-scrub offline (irreversible)", dirty)
+	}
+	return nil
+}
+
 // buildAPIRouter: 公网入口。仅 API 端点与必需 health；
 // 禁止挂载 /admin /setup /metrics /static /swagger 及任何管理面路由。
 func buildAPIRouter(d gatewayDeps) *chi.Mux {
