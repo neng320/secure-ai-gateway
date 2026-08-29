@@ -3,6 +3,8 @@ package auth
 // P1-02D · LoginRateLimiter 单元测试（TTL 用注入时钟验证，不依赖真实等待）
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,5 +114,44 @@ func TestLimiter_WindowExpiryResetsCount(t *testing.T) {
 	l.RecordFailure("admin")                         // 只算 1 次
 	if !l.Allow("admin") {
 		t.Fatal("窗口过期后计数应重置，1 次失败不应锁定")
+	}
+}
+
+// [P1-02.1 安全回归] 容量打满后，真实管理员的失败必须仍被追踪（禁止 fail-open）。
+func TestLimiter_CapacityFull_ProtectedAccountStillTracked(t *testing.T) {
+	l, _ := newTestLimiter()
+	l.Configure(DefaultLoginMaxFailures, DefaultLoginLockout, "admin")
+
+	// 刷满容量
+	for i := 0; i < maxTrackedUsernames; i++ {
+		l.RecordFailure(fmt.Sprintf("user%06d", i))
+	}
+
+	// 攻击真实 admin：达到阈值必须锁定
+	for i := 0; i < DefaultLoginMaxFailures; i++ {
+		l.RecordFailure("admin")
+	}
+	if l.Allow("admin") {
+		t.Fatal("[安全回归失败] 容量打满后 admin 防爆破失效（fail-open）")
+	}
+	if ra := l.RetryAfter("admin"); ra <= 0 {
+		t.Fatalf("[安全回归失败] admin 锁定后 Retry-After 应 > 0，实际 %d", ra)
+	}
+}
+
+// [P1-02.1 回归] 超长 username 截断为固定 key（防巨型 map key），行为一致。
+func TestLimiter_LongUsername_Truncated(t *testing.T) {
+	l, _ := newTestLimiter()
+	l.Configure(DefaultLoginMaxFailures, DefaultLoginLockout, "admin")
+	long := strings.Repeat("x", 10000)
+	for i := 0; i < DefaultLoginMaxFailures; i++ {
+		l.RecordFailure(long)
+	}
+	if l.Allow(long) {
+		t.Fatal("超长用户名达到阈值后应锁定")
+	}
+	if !l.Allow(long[:maxTrackedUsernameLen-1]) {
+		// 截断碰撞：前 255 字符相同的用户名共享计数（保守方向），首个前缀不同 → 允许
+		t.Log("不同长用户名共享截断 key 属预期保守行为")
 	}
 }

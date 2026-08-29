@@ -56,7 +56,7 @@ func newGatewayDeps(cfg *config.Config, db *gorm.DB, setupMode bool) gatewayDeps
 	dashboardHub := services.NewDashboardHub(statsService)
 	geminiService.SetOnRequestLogged(dashboardHub.NotifyUpdate)
 	loginLimiter := auth.NewLoginRateLimiter()
-	loginLimiter.Configure(cfg.Admin.LoginMaxFailures, time.Duration(cfg.Admin.LoginLockoutMinutes)*time.Minute)
+	loginLimiter.Configure(cfg.Admin.LoginMaxFailures, time.Duration(cfg.Admin.LoginLockoutMinutes)*time.Minute, cfg.Admin.Username)
 	return gatewayDeps{
 		cfg:           cfg,
 		db:            db,
@@ -103,6 +103,8 @@ func buildAdminRouter(d gatewayDeps) (*chi.Mux, error) {
 	r := chi.NewRouter()
 	r.Use(mw.Recovery)
 	r.Use(mw.SecurityHeaders)
+	// P1-02.1：Admin 面恢复请求体上限（与原单端口行为一致；更细粒度校验属 P1-07）
+	r.Use(mw.MaxRequestSize(10 << 20))
 
 	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter)
 	if err != nil {
