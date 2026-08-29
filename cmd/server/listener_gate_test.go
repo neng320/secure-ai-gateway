@@ -43,20 +43,19 @@ type gatewayEnv struct {
 
 func newTestGateway(t *testing.T, prometheusEnabled, setupRequired bool) *gatewayEnv {
 	t.Helper()
-	cfg := &config.Config{
-		Server: config.ServerConfig{
-			Host:    "127.0.0.1",
-			Port:    8090,
-			Admin:   config.ListenerConfig{Host: "127.0.0.1", Port: 8091},
-			Metrics: config.ListenerConfig{Host: "127.0.0.1", Port: 9090},
-		},
-		Admin: config.AdminConfig{
-			Username:      "admin",
-			PasswordHash:  "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi5B0X0ME0wUoAg8ZlLlZ7m0D0lCL9a", // 任意合法 bcrypt 形态；登录测试不走这里
-			SessionSecret: "listener-gate-test-secret",
-		},
-		Providers:  map[string]config.ProviderConfig{},
-		Prometheus: config.PrometheusConfig{Enabled: prometheusEnabled, Username: "prom", Password: "prompass"},
+	// P1-02.3：buildAdminRouter 需要 config.SourcePath()——先落一个临时配置文件再 Load
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load temp config: %v", err)
+	}
+	cfg.Admin.Username = "admin"
+	cfg.Admin.PasswordHash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi5B0X0ME0wUoAg8ZlLlZ7m0D0lCL9a" // 合法 bcrypt 形态；登录测试不走这里
+	cfg.Admin.SessionSecret = "listener-gate-test-secret"
+	cfg.Admin.CookieSecure = false
+	cfg.Prometheus = config.PrometheusConfig{Enabled: prometheusEnabled, Username: "prom", Password: "prompass"}
+	if cfg.Providers == nil {
+		cfg.Providers = map[string]config.ProviderConfig{}
 	}
 	if setupRequired {
 		cfg.Admin.PasswordHash = "__SETUP_REQUIRED__"
