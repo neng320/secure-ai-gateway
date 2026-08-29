@@ -14,8 +14,6 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -166,39 +164,8 @@ func TestP1041_VLLM_NoResponseBodyInLog(t *testing.T) {
 	t.Log("[SEC-003 FIXED] vllm：响应体不再进 log")
 }
 
-// 静态 tripwire：生产源码（排除 _test.go）不得存在 body/respBody 的日志 sink
-func TestP1041_StaticTripwire_NoBodyLogSinks(t *testing.T) {
-	dirs := []string{"providers", "services", "handlers"}
-	for _, d := range dirs {
-		matches, err := filepath.Glob("../internal/" + d + "/*.go")
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, f := range matches {
-			if strings.HasSuffix(f, "_test.go") {
-				continue
-			}
-			raw, err := os.ReadFile(f)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for i, line := range strings.Split(string(raw), "\n") {
-				isLog := strings.Contains(line, "log.Printf") || strings.Contains(line, "log.Println") || strings.Contains(line, "fmt.Printf")
-				if !isLog {
-					continue
-				}
-				if strings.Contains(line, "string(body)") || strings.Contains(line, "string(respBody)") ||
-					strings.Contains(line, "string(u.Body)") ||
-					// P1-04.2：credential/header/URL/proxy 层
-					strings.Contains(line, ".Header)") || strings.Contains(line, "APIKey") ||
-					strings.Contains(line, "proxyURL") || strings.Contains(line, "Proxy env var") {
-					t.Fatalf("[安全回归失败] 生产日志 sink 回归 %s:%d: %s", f, i+1, strings.TrimSpace(line))
-				}
-			}
-		}
-	}
-	t.Log("[SEC-003] 静态 tripwire：provider/service/handler 生产源码无 body 日志 sink")
-}
+// 静态 tripwire 已由 p1_042_static_gate_test.go 的 AST 版取代
+// （旧 line-based 实现存在 0 文件扫描的 false-green，已按 P1-04.2.1 移除）。
 
 // ---------------------------------------------------------------------------
 // P1-04.2 · Runtime Secret Log Gate（credential/header/URL/proxy 层）
