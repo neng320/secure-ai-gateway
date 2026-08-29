@@ -383,3 +383,55 @@ func TestScrub_ExclusiveOwnership_RetainedAcrossCommit(t *testing.T) {
 	_, _ = intruder.ExecContext(ctx, "ROLLBACK")
 	t.Log("[SEC-003 FIXED] 持有式独占：COMMIT 后锁保留，释放后恢复")
 }
+
+// P1-04.2.1 · WAL ownership 实际分支覆盖：
+// journal_mode=WAL 的 legacy DB → Run 取得持有式独占 → WAL→DELETE 拍平 → VACUUM
+// → 成功；logica l/raw 双清零，且 WAL sidecar 不再存在、journal_mode 已切到 delete。
+// （持有期内并发者被拒的机制证明见 TestScrub_ExclusiveOwnership_RetainedAcrossCommit；
+//
+//	并发占用下 Run 提前 STOP 见 TestScrub_WALBusy_StopBeforeMutation。）
+func TestScrub_WALOwnership_BranchEradication(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, true) // WAL 模式 + legacy canary
+
+	// 注：WAL 模式下【任何】其他打开的连接（即使空闲）都会合法阻止
+	// BEGIN EXCLUSIVE 获取——这正是离线 Gate 的正确语义（必须关闭一切连接）。
+	// 该前置阻断由 TestScrub_WALBusy_StopBeforeMutation 覆盖；
+	// 持有期内干扰被拒由 TestScrub_ExclusiveOwnership_RetainedAcrossCommit 覆盖；
+	// 本测试覆盖生产 Run 的 WAL→exclusive ownership→WAL→DELETE→VACUUM 实际分支。
+	res, err := Run(Options{ConfigPath: f.cfgPath})
+	if err != nil {
+		t.Fatalf("WAL ownership 分支 scrub 应成功: %v", err)
+	}
+	if res.RemainNonEmpty != 0 {
+		t.Fatalf("[安全回归失败] 残留: %+v", res)
+	}
+
+	// WAL→DELETE 分支确实执行：journal_mode 已切换
+	db, err := gorm.Open(sqlite.Open(f.dbPath), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mode string
+	if err := db.Raw("PRAGMA journal_mode").Scan(&mode).Error; err != nil {
+		t.Fatal(err)
+	}
+	if sqlDB, e := db.DB(); e == nil {
+		_ = sqlDB.Close()
+	}
+	if !strings.EqualFold(mode, "delete") {
+		t.Fatalf("[安全回归失败] WAL→DELETE 分支未生效，journal_mode=%q", mode)
+	}
+
+	// 逻辑 + raw bytes 双清零（raw scan 覆盖 -wal/-shm 残留文件）
+	hits, scanned := f.rawScanCanaryHits(t)
+	if hits != 0 {
+		t.Fatalf("[安全回归失败] raw bytes 含 canary（%d 处，扫描 %v）", hits, scanned)
+	}
+	for _, name := range scanned {
+		if strings.HasSuffix(name, "-wal") {
+			t.Fatalf("[安全回归失败] WAL sidecar 在 journal 切换后仍存在: %s", name)
+		}
+	}
+	t.Log("[SEC-003 FIXED] WAL ownership 分支：独占持有 → 拍平 → VACUUM → 双清零")
+}
