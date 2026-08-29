@@ -79,12 +79,20 @@ func (h *ProxyHandler) GenerateContent(w http.ResponseWriter, r *http.Request) {
 
 	inputTokens, outputTokens, _ := services.ParseGeminiResponse(respBody)
 
-	errMsg := ""
-	if err != nil {
-		errMsg = err.Error()
-	}
-
-	h.geminiService.LogRequest(client.ID, model, statusCode, inputTokens, outputTokens, latencyMs, errMsg, string(body), false, false, "")
+	// SEC-003（P1-04B）：metadata-only 持久化——raw 错误文本/正文不再可传给持久层
+	h.geminiService.LogRequest(services.RequestRecord{
+		RequestID:    middleware.GetRequestID(r),
+		ClientID:     client.ID,
+		Provider:     "gemini",
+		Model:        model,
+		StatusCode:   statusCode,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		LatencyMs:    latencyMs,
+		ErrorCode:    services.ClassifyUpstreamError(statusCode, err),
+		IsStreaming:  false,
+		HasTools:     false,
+	})
 	RecordRequest(client.ID, model, fmt.Sprintf("%d", statusCode), inputTokens, outputTokens, latencyMs)
 
 	if h.statsService != nil {
@@ -182,6 +190,10 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// SEC-003（P1-04B）：补齐 gemini 流式路径的 metadata-only RequestLog
+	// （此前该路径完全无 RequestLog；正文照旧不入持久层）
+	streamStart := time.Now()
+
 	body = h.capOutputTokens(client, body)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -230,6 +242,17 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 			break
 		}
 	}
+
+	h.geminiService.LogRequest(services.RequestRecord{
+		RequestID:   middleware.GetRequestID(r),
+		ClientID:    client.ID,
+		Provider:    "gemini",
+		Model:       model,
+		StatusCode:  resp.StatusCode,
+		LatencyMs:   int(time.Since(streamStart).Milliseconds()),
+		ErrorCode:   services.ClassifyUpstreamError(resp.StatusCode, nil),
+		IsStreaming: true,
+	})
 
 	if h.statsService != nil {
 		h.statsService.DecrementRequestsInProgress()

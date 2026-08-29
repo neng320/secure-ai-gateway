@@ -182,27 +182,85 @@ func (s *GeminiService) ForwardStreamRequest(model string, body []byte) (*http.R
 	return resp, model, nil
 }
 
-func (s *GeminiService) LogRequest(clientID, model string, statusCode int, inputTokens, outputTokens int, latencyMs int, errMsg string, requestBody string, isStreaming bool, hasTools bool, toolNames string) error {
-	log := &models.RequestLog{
-		ClientID:     clientID,
-		Model:        model,
-		StatusCode:   statusCode,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		LatencyMs:    latencyMs,
-		ErrorMessage: errMsg,
-		RequestBody:  requestBody,
-		IsStreaming:  isStreaming,
-		HasTools:     hasTools,
-		ToolNames:    toolNames,
+// RequestRecord: metadata-only 请求日志条目（SEC-003 / P1-04B）。
+//
+// 结构化 API 的设计目的：业务调用点【根本不存在】requestBody / raw error text
+// 可以传给持久层——持久层不可能收到正文。字段只含元数据；ErrorCode 为 bounded
+// 稳定错误码（ClassifyUpstreamError），无用户正文/URL/secret。
+type RequestRecord struct {
+	RequestID    string
+	ClientID     string
+	Provider     string
+	Model        string
+	StatusCode   int
+	InputTokens  int
+	OutputTokens int
+	LatencyMs    int
+	ErrorCode    string
+	IsStreaming  bool
+	HasTools     bool
+	ToolNames    string
+}
+
+// bounded 稳定错误码集合（SEC-003）。固定取值、固定语义，禁止拼接任何动态文本。
+const (
+	ErrCodeUpstreamNetwork = "UPSTREAM_NETWORK_ERROR"
+	ErrCodeUpstreamAuth    = "UPSTREAM_AUTH_ERROR"
+	ErrCodeUpstreamRate    = "UPSTREAM_RATE_LIMIT"
+	ErrCodeUpstream4xx     = "UPSTREAM_4XX"
+	ErrCodeUpstream5xx     = "UPSTREAM_5XX"
+	ErrCodeInvalidRequest  = "INVALID_REQUEST"
+	ErrCodeInternal        = "INTERNAL_ERROR"
+)
+
+// ClassifyUpstreamError: 把 upstream 状态/传输错误归类为 bounded 错误码。
+// 绝不返回包含 upstream 响应体或错误文本的值。
+func ClassifyUpstreamError(statusCode int, err error) string {
+	switch {
+	case statusCode >= 400 && statusCode <= 499:
+		if statusCode == 401 || statusCode == 403 {
+			return ErrCodeUpstreamAuth
+		}
+		if statusCode == 429 {
+			return ErrCodeUpstreamRate
+		}
+		return ErrCodeUpstream4xx
+	case statusCode >= 500:
+		return ErrCodeUpstream5xx
+	case err != nil:
+		return ErrCodeUpstreamNetwork
+	default:
+		return ""
+	}
+}
+
+// LogRequest: 持久化一条 metadata-only 请求日志（SEC-003 / P1-04B）。
+// RequestBody / ErrorMessage 为 legacy scrub 字段，新写入恒为空——
+// 由本函数强制置空，调用方无法（也无需）传入正文。
+func (s *GeminiService) LogRequest(rec RequestRecord) error {
+	entry := &models.RequestLog{
+		RequestID:    rec.RequestID,
+		ClientID:     rec.ClientID,
+		Provider:     rec.Provider,
+		Model:        rec.Model,
+		StatusCode:   rec.StatusCode,
+		InputTokens:  rec.InputTokens,
+		OutputTokens: rec.OutputTokens,
+		LatencyMs:    rec.LatencyMs,
+		ErrorCode:    rec.ErrorCode,
+		RequestBody:  "", // legacy privacy field：恒空（P1-04B）
+		ErrorMessage: "", // legacy privacy field：恒空（P1-04B）
+		IsStreaming:  rec.IsStreaming,
+		HasTools:     rec.HasTools,
+		ToolNames:    rec.ToolNames,
 		CreatedAt:    time.Now(),
 	}
 
-	if err := s.db.Create(log).Error; err != nil {
+	if err := s.db.Create(entry).Error; err != nil {
 		return fmt.Errorf("failed to log request: %w", err)
 	}
 
-	err := s.updateDailyUsage(clientID, inputTokens, outputTokens, statusCode)
+	err := s.updateDailyUsage(rec.ClientID, rec.InputTokens, rec.OutputTokens, rec.StatusCode)
 
 	// Notify dashboard hub about the new request
 	if s.onRequestLogged != nil {
@@ -275,7 +333,13 @@ func (s *GeminiService) GetAPIKey() string {
 	return s.geminiProvider().APIKey
 }
 
+// GetBaseURL: proxy 流式路径使用的 base URL。
+// P1-04B 起尊重 provider 配置的 BaseURL（与 ForwardRequest/ForwardStreamRequest 语义一致，
+// 同时使 proxy 流式路径可本地测试）；未配置时回退官方端点。
 func (s *GeminiService) GetBaseURL() string {
+	if p := s.cfg.GetProvider("gemini"); p != nil && p.BaseURL != "" {
+		return p.BaseURL
+	}
 	return "https://generativelanguage.googleapis.com/v1beta"
 }
 

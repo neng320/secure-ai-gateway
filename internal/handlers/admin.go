@@ -1329,7 +1329,7 @@ var adminTemplates = []byte(`
                                 <div class="flex flex-wrap gap-1">
                                     {{if .IsStreaming}}<span class="text-xs px-2 py-0.5 bg-purple-500/20 text-purple-400 rounded-full">stream</span>{{end}}
                                     {{if .HasTools}}{{range splitToolNames .ToolNames}}<span class="text-xs px-2 py-0.5 bg-orange-500/20 text-orange-400 rounded-full">{{.}}</span>{{end}}{{end}}
-                                    {{if .RequestBody}}<button onclick="showRequestBody('{{js .RequestBody}}')" class="text-xs px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded-full hover:bg-blue-500/30">body</button>{{end}}
+                                    {{if .ErrorCode}}<span class="text-xs px-2 py-0.5 bg-red-500/20 text-red-400 rounded-full" title="bounded error code">{{.ErrorCode}}</span>{{end}}
                                 </div>
                         </tr>
                         {{else}}
@@ -1339,21 +1339,6 @@ var adminTemplates = []byte(`
                         {{end}}
                     </tbody>
                 </table>
-            </div>
-        </div>
-
-        <!-- Request Details Modal -->
-        <div id="requestModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center">
-            <div class="bg-gray-800 rounded-2xl border border-gray-700 w-full max-w-3xl max-h-[80vh] flex flex-col">
-                <div class="flex items-center justify-between px-6 py-4 border-b border-gray-700">
-                    <h3 class="text-lg font-semibold text-white">Request Details</h3>
-                    <button onclick="closeRequestModal()" class="text-gray-400 hover:text-white">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-                    </button>
-                </div>
-                <div class="flex-1 overflow-auto p-6">
-                    <pre id="requestBodyContent" class="text-sm text-gray-300 font-mono whitespace-pre-wrap break-all"></pre>
-                </div>
             </div>
         </div>
 
@@ -1430,7 +1415,7 @@ var adminTemplates = []byte(`
                         html += '<span class="text-xs px-2 py-0.5 bg-orange-500/20 text-orange-400 rounded-full">' + t + '</span> ';
                     });
                 }
-                if (l.request_body) html += '<span class="text-xs px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded-full">body</span> ';
+                if (l.error_code) html += '<span class="text-xs px-2 py-0.5 bg-red-500/20 text-red-400 rounded-full">' + l.error_code + '</span> ';
                 html += '</td>';
                 html += '</tr>';
             });
@@ -2043,6 +2028,8 @@ var adminTemplates = []byte(`
                     <thead class="bg-gray-900/50">
                         <tr>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Time</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Request</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Provider</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Model</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Runtime</th>
@@ -2067,14 +2054,16 @@ var adminTemplates = []byte(`
                                 <div class="flex items-center gap-1">
                                     {{if .IsStreaming}}<span class="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded">stream</span>{{end}}
                                     {{if .HasTools}}<span class="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 bg-orange-500/20 text-orange-400 rounded">tools</span>{{end}}
-                                    {{if .RequestBody}}<span class="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 bg-blue-500/20 text-blue-400 rounded">body</span>{{end}}
+                                    {{if .ErrorCode}}<span class="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded" title="bounded error code">{{.ErrorCode}}</span>{{end}}
                                 </div>
                             </td>
-                            <td class="px-6 py-4 text-sm text-red-400 max-w-xs truncate">{{.ErrorMessage}}</td>
+                            <td class="px-6 py-4 text-sm text-gray-500 font-mono max-w-xs truncate">{{.RequestID}}</td>
+                            <td class="px-6 py-4 text-sm text-gray-300">{{.Provider}}</td>
+                            <td class="px-6 py-4 text-sm text-red-400 max-w-xs truncate">{{.ErrorCode}}</td>
                         </tr>
                         {{else}}
                         <tr>
-                            <td colspan="7" class="px-6 py-8 text-center text-gray-500">No requests yet</td>
+                            <td colspan="9" class="px-6 py-8 text-center text-gray-500">No requests yet</td>
                         </tr>
                         {{end}}
                     </tbody>
