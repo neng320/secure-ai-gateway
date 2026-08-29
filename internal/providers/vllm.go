@@ -229,16 +229,10 @@ func (p *VLLMProvider) ParseStreamChunk(data []byte) (string, int, int) {
 
 func (p *VLLMProvider) ListModels() ([]string, error) {
 	url := p.cfg.BaseURL + "/models"
-	log.Printf("[vllm ListModels] GET %s", url)
-
-	// Check for proxy environment variables
-	proxyURL := os.Getenv("HTTP_PROXY")
-	if proxyURL == "" {
-		proxyURL = os.Getenv("HTTPS_PROXY")
-	}
-	if proxyURL != "" {
-		log.Printf("[vllm ListModels] WARNING: Proxy env var detected: %s", proxyURL)
-	}
+	// P1-04.2：完整 URL 与 proxy 环境变量值（常见 user:password@host 形态）
+	// 是 secret log sink——只允许布尔型 metadata，绝不输出值。
+	proxyEnvPresent := os.Getenv("HTTP_PROXY") != "" || os.Getenv("HTTPS_PROXY") != ""
+	log.Printf("[vllm ListModels] proxy_ignored=%v", proxyEnvPresent)
 
 	// Create a fresh HTTP client with HTTP/1.1 (no HTTP/2) to match curl behavior
 	transport := &http.Transport{
@@ -261,10 +255,11 @@ func (p *VLLMProvider) ListModels() ([]string, error) {
 	}
 	p.setHeaders(httpReq)
 
-	log.Printf("[vllm ListModels] Sending request (HTTP/1.1, no proxy)...")
+	log.Printf("[vllm ListModels] Sending request (HTTP/1.1, proxy_ignored=%v)...", proxyEnvPresent)
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		log.Printf("[vllm ListModels] HTTP request failed: %v", err)
+		// P1-04.2：url.Error 会内嵌完整请求 URL——日志只允许 bounded 错误码
+		log.Printf("[vllm ListModels] request failed: operation=list_models error_code=UPSTREAM_NETWORK_ERROR")
 		return nil, err
 	}
 	defer resp.Body.Close()

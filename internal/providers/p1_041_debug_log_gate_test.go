@@ -188,11 +188,89 @@ func TestP1041_StaticTripwire_NoBodyLogSinks(t *testing.T) {
 					continue
 				}
 				if strings.Contains(line, "string(body)") || strings.Contains(line, "string(respBody)") ||
-					strings.Contains(line, "string(u.Body)") {
+					strings.Contains(line, "string(u.Body)") ||
+					// P1-04.2：credential/header/URL/proxy 层
+					strings.Contains(line, ".Header)") || strings.Contains(line, "APIKey") ||
+					strings.Contains(line, "proxyURL") || strings.Contains(line, "Proxy env var") {
 					t.Fatalf("[安全回归失败] 生产日志 sink 回归 %s:%d: %s", f, i+1, strings.TrimSpace(line))
 				}
 			}
 		}
 	}
 	t.Log("[SEC-003] 静态 tripwire：provider/service/handler 生产源码无 body 日志 sink")
+}
+
+// ---------------------------------------------------------------------------
+// P1-04.2 · Runtime Secret Log Gate（credential/header/URL/proxy 层）
+// ---------------------------------------------------------------------------
+
+const (
+	p1042ProviderKeyCanary   = "P1042_PROVIDER_KEY_CANARY"
+	p1042ProxyPasswordCanary = "P1042_PROXY_PASSWORD_CANARY"
+)
+
+// A+B. OpenAI FetchModels：DEBUG=1 下 Provider Key（Authorization）与 upstream URL 不得进 log
+func TestP1042_FetchModels_DEBUG_NoKeyNoURL(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-a"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	t.Setenv("DEBUG", "1")
+	buf := captureLog(t)
+
+	p, err := BuildSingleProvider("openai", config.ProviderConfig{
+		Type: "openai", BaseURL: upstream.URL + "/v1", APIKey: p1042ProviderKeyCanary, TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := p.FetchModels()
+	if err != nil || len(models) == 0 {
+		t.Fatalf("[功能回归失败] FetchModels 应成功，实际 %v err=%v", models, err)
+	}
+
+	logs := buf.String()
+	for _, banned := range []string{p1042ProviderKeyCanary, upstream.URL, "Authorization", "Bearer", "Headers", "headers:"} {
+		if strings.Contains(logs, banned) {
+			t.Fatalf("[安全回归失败] FetchModels DEBUG log 含 %q: %q", banned, logs)
+		}
+	}
+	t.Log("[SEC-003 FIXED] FetchModels DEBUG：无 Provider Key/URL/Header")
+}
+
+// C. vLLM：proxy 凭据 canary 不进 log（当前 transport 显式 Proxy:nil，请求仍直达 upstream）
+func TestP1042_VLLM_ProxyCredentialNotLogged(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-a"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	t.Setenv("HTTP_PROXY", "http://user:"+p1042ProxyPasswordCanary+"@127.0.0.1:9999")
+	t.Setenv("HTTPS_PROXY", "http://user:"+p1042ProxyPasswordCanary+"@127.0.0.1:9999")
+	buf := captureLog(t)
+
+	p, err := BuildSingleProvider("vllm", config.ProviderConfig{
+		Type: "vllm", BaseURL: upstream.URL, TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := p.FetchModels()
+	if err != nil || len(models) == 0 {
+		t.Fatalf("[功能回归失败] FetchModels 应成功（transport 显式 Proxy:nil），实际 %v err=%v", models, err)
+	}
+
+	logs := buf.String()
+	for _, banned := range []string{p1042ProxyPasswordCanary, "http://user:", "@127.0.0.1:9999", upstream.URL, "GET "} {
+		if strings.Contains(logs, banned) {
+			t.Fatalf("[安全回归失败] vllm log 含 %q: %q", banned, logs)
+		}
+	}
+	if !strings.Contains(logs, "proxy_ignored=true") {
+		t.Fatalf("[安全回归失败] vllm log 应仅含布尔型 proxy metadata，实际 %q", logs)
+	}
+	t.Log("[SEC-003 FIXED] vLLM：proxy 凭据/URL 不进 log，仅 proxy_ignored 布尔值")
 }

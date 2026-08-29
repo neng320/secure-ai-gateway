@@ -97,62 +97,108 @@ func Run(opts Options) (*Result, error) {
 
 	res := &Result{DBPath: dbPath, Phases: []string{}}
 
-	// 独占/offline Gate（P1-04.1）：任何 sensitive mutation 之前必须证明没有其他连接
-	// 在使用该 DB。两道防线：
-	//   a) WAL 模式：wal_checkpoint(TRUNCATE) 首列 Busy!=0 即被其他连接阻塞 → STOP
-	//      （SQLite 契约：Busy=1 表示 checkpoint 未完成）
-	//   b) 通用：busy_timeout=0 的 BEGIN EXCLUSIVE 探测——journal 模式下任何
-	//      读/写锁占用都会立即 SQLITE_BUSY → STOP
-	// 失败绝不进入 UPDATE/VACUUM（杜绝"先改后败"的半完成状态）。
+	// 独占/offline 预检（P1-04.1）：WAL 模式先做 TRUNCATE checkpoint——
+	// 首列 Busy!=0 即有其他连接（含活跃 reader）→ 任何 mutation 之前 STOP。
 	var journalMode string
 	if err := db.Raw("PRAGMA journal_mode").Scan(&journalMode).Error; err != nil {
 		return nil, fmt.Errorf("scrub: read journal_mode: %w", err)
 	}
-	if strings.EqualFold(journalMode, "wal") {
+	isWAL := strings.EqualFold(journalMode, "wal")
+	if isWAL {
 		if err := walCheckpointTruncate(db); err != nil {
 			return nil, err // 含 OFFLINE_REQUIRED 语义
 		}
 		res.Phases = append(res.Phases, "WAL-CHECKPOINT")
 	}
-	if err := acquireExclusiveProbe(sqlDB); err != nil {
-		return nil, err
+
+	// P1-04.2：持有式独占（消除 probe→mutation 的 TOCTOU）。
+	// 单一 dedicated connection：
+	//   busy_timeout=0 → locking_mode=EXCLUSIVE → BEGIN EXCLUSIVE
+	// locking_mode=EXCLUSIVE 使独占锁在 COMMIT 之后仍由本连接持有，
+	// 之后的 checkpoint/VACUUM/verify 期间任何并发连接都被 SQLITE_BUSY 拒绝，
+	// 直到全部完成、conn.Close() 释放。杜绝“UPDATE 已提交但 VACUUM 被新并发者打断”。
+	ctx := context.Background()
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("scrub: acquire dedicated connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	// 关闭 gorm 连接池（本进程内的其他连接同样不得干扰独占期）
+	if err := sqlDB.Close(); err != nil {
+		return nil, fmt.Errorf("scrub: close pool: %w", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
+		return nil, fmt.Errorf("scrub: busy_timeout: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA locking_mode = EXCLUSIVE"); err != nil {
+		return nil, fmt.Errorf("scrub: locking_mode: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		return nil, fmt.Errorf("scrub: database is in use (exclusive lock unavailable) — "+
+			"stop the gateway / close other connections and retry: %w (REQUEST_LOG_SCRUB_OFFLINE_REQUIRED)", err)
 	}
 	res.Phases = append(res.Phases, "EXCLUSIVE")
 
+	exec := func(q string) error {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("scrub: %s: %w", strings.Fields(q)[0], err)
+		}
+		return nil
+	}
+	queryCount := func(q string) (int64, error) {
+		var n int64
+		if err := conn.QueryRowContext(ctx, q).Scan(&n); err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+
 	// secure_delete=ON（best-effort：driver 不支持时跳过，VACUUM 仍会重写整库）
-	var sd string
-	if err := db.Raw("PRAGMA secure_delete = ON").Scan(&sd).Error; err == nil {
+	if _, err := conn.ExecContext(ctx, "PRAGMA secure_delete = ON"); err == nil {
 		res.Phases = append(res.Phases, "SECURE-DELETE-ON")
 	}
 
 	// 清点（只输出数量）
-	var dirty int64
-	if err := db.Raw("SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''").Scan(&dirty).Error; err != nil {
+	dirty, err := queryCount("SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''")
+	if err != nil {
 		return nil, fmt.Errorf("scrub: count legacy rows: %w", err)
 	}
 
-	// UPDATE 置空（保留 metadata 行）
-	tx := db.Exec("UPDATE request_logs SET request_body = '', error_message = '' WHERE request_body != '' OR error_message != ''")
-	if tx.Error != nil {
-		return nil, fmt.Errorf("scrub: update: %w", tx.Error)
+	// UPDATE 置空（在持有式独占事务内；保留 metadata 行）
+	if err := exec("UPDATE request_logs SET request_body = '', error_message = '' WHERE request_body != '' OR error_message != ''"); err != nil {
+		return nil, err
 	}
 	res.ScrubbedRows = int(dirty)
 	res.Phases = append(res.Phases, "UPDATE")
 
-	// 再次 checkpoint（如 WAL）→ VACUUM 重写整库
-	if strings.EqualFold(journalMode, "wal") {
-		if err := walCheckpointTruncate(db); err != nil {
-			return nil, fmt.Errorf("scrub: final wal checkpoint: %w", err)
-		}
+	// COMMIT——locking_mode=EXCLUSIVE 使锁继续由本连接持有
+	if err := exec("COMMIT"); err != nil {
+		return nil, err
 	}
-	if err := db.Exec("VACUUM").Error; err != nil {
-		return nil, fmt.Errorf("scrub: vacuum: %w", err)
+
+	// WAL → DELETE 切换（持有独占时执行：把 WAL 拍平回主库并消除 -wal 旧帧；
+	// 切换后 VACUUM 在 rollback-journal 模式下重写整库）。已在 DELETE 模式则跳过。
+	if isWAL {
+		var newMode string
+		if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode = DELETE").Scan(&newMode); err != nil {
+			return nil, fmt.Errorf("scrub: journal switch: %w", err)
+		}
+		if !strings.EqualFold(newMode, "delete") {
+			return nil, fmt.Errorf("scrub: journal switch failed (mode=%s) — stop", newMode)
+		}
+		res.Phases = append(res.Phases, "JOURNAL-SWITCH")
+	}
+
+	// VACUUM 重写整库（仍持有独占锁：并发者无法使其失败）
+	if err := exec("VACUUM"); err != nil {
+		return nil, err
 	}
 	res.Phases = append(res.Phases, "VACUUM")
 
 	// 逻辑复核
-	var remain int64
-	if err := db.Raw("SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''").Scan(&remain).Error; err != nil {
+	remain, err := queryCount("SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''")
+	if err != nil {
 		return nil, fmt.Errorf("scrub: verify: %w", err)
 	}
 	res.RemainNonEmpty = int(remain)
@@ -160,7 +206,8 @@ func Run(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("scrub: verification failed: %d rows still non-empty — stop", remain)
 	}
 
-	_ = sqlDB.Close()
+	// 释放独占（conn.Close）
+	_ = conn.Close()
 	res.Phases = append(res.Phases, "CLOSE")
 
 	// sidecar 清点（仅文件名；内容 raw-scan 由 fixture gate 以 canary 验证）

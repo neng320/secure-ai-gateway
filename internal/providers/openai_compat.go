@@ -435,18 +435,15 @@ func (p *OpenAICompatProvider) FetchModels() ([]string, error) {
 		url = p.cfg.BaseURL + "/models"
 	}
 
-	if isDebug() {
-		log.Printf("[%s] FetchModels URL: %s", p.name, url)
-	}
-
+	// P1-04.2：FetchModels 的 URL 与 headers（含 Authorization: Bearer <Provider Key>）
+	// 是直接的 secret runtime log sink——绝不输出 URL/Header map；DEBUG 仅 metadata。
 	httpReq, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 	p.setHeaders(httpReq)
-
 	if isDebug() {
-		log.Printf("[%s] FetchModels headers: %v", p.name, httpReq.Header)
+		log.Printf("[%s] fetch_models started", p.name)
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}

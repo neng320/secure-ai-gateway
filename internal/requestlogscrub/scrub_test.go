@@ -314,3 +314,72 @@ func TestScrub_JournalBusy_StopBeforeMutation(t *testing.T) {
 	assertLegacyIntact(t, f)
 	release()
 }
+
+// ---------------------------------------------------------------------------
+// P1-04.2 · 持有式独占的所有权保留属性（Gate B 的机制证明）
+//
+// locking_mode=EXCLUSIVE + BEGIN EXCLUSIVE + COMMIT 之后，独占锁由该连接
+// 持续保留——另一个【已打开】连接的 BEGIN IMMEDIATE（busy_timeout=0）必须被
+// SQLITE_BUSY 拒绝，直到持有连接关闭；关闭后并发者恢复可写。
+// 这正是 scrub 在 UPDATE→VACUUM 期间赖以防干扰的机制。
+// 两条连接都在上锁前打开（与真实 scrub 场景一致：连接预先存在）。
+// ---------------------------------------------------------------------------
+func TestScrub_ExclusiveOwnership_RetainedAcrossCommit(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+
+	ctx := context.Background()
+	// open: 返回 (专用连接, 彻底销毁函数)——销毁 = conn.Close + raw.Close（释放底层句柄）
+	open := func() (*sql.Conn, func()) {
+		raw, err := sql.Open("sqlite3", f.dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := raw.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
+			t.Fatal(err)
+		}
+		return conn, func() {
+			_ = conn.Close()
+			_ = raw.Close()
+		}
+	}
+
+	owner, destroyOwner := open()
+	intruder, destroyIntruder := open()
+	defer destroyIntruder()
+
+	// owner 取得独占并提交（locking_mode=EXCLUSIVE → 锁跨 COMMIT 保持）
+	if _, err := owner.ExecContext(ctx, "PRAGMA locking_mode = EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.ExecContext(ctx, "COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 持有期内：intruder 写事务必须被拒
+	if _, err := intruder.ExecContext(ctx, "BEGIN IMMEDIATE"); err == nil {
+		_, _ = intruder.ExecContext(ctx, "ROLLBACK")
+		t.Fatal("[安全回归失败] 持有式独占未生效——并发者可以干扰 scrub")
+	}
+
+	// owner 释放：conn.Close 只归还连接池——必须销毁底层 pool
+	// 才真正关闭持有 locking_mode=EXCLUSIVE 锁的 sqlite 句柄
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	destroyOwner()
+
+	// 释放后：intruder 恢复可写（因果性证明）
+	if _, err := intruder.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("[安全回归失败] owner 释放后并发者仍被拒: %v", err)
+	}
+	_, _ = intruder.ExecContext(ctx, "ROLLBACK")
+	t.Log("[SEC-003 FIXED] 持有式独占：COMMIT 后锁保留，释放后恢复")
+}
