@@ -16,6 +16,8 @@
 package requestlogscrub
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -95,17 +97,27 @@ func Run(opts Options) (*Result, error) {
 
 	res := &Result{DBPath: dbPath, Phases: []string{}}
 
-	// WAL checkpoint（如处于 WAL 模式）
+	// 独占/offline Gate（P1-04.1）：任何 sensitive mutation 之前必须证明没有其他连接
+	// 在使用该 DB。两道防线：
+	//   a) WAL 模式：wal_checkpoint(TRUNCATE) 首列 Busy!=0 即被其他连接阻塞 → STOP
+	//      （SQLite 契约：Busy=1 表示 checkpoint 未完成）
+	//   b) 通用：busy_timeout=0 的 BEGIN EXCLUSIVE 探测——journal 模式下任何
+	//      读/写锁占用都会立即 SQLITE_BUSY → STOP
+	// 失败绝不进入 UPDATE/VACUUM（杜绝"先改后败"的半完成状态）。
 	var journalMode string
 	if err := db.Raw("PRAGMA journal_mode").Scan(&journalMode).Error; err != nil {
 		return nil, fmt.Errorf("scrub: read journal_mode: %w", err)
 	}
 	if strings.EqualFold(journalMode, "wal") {
 		if err := walCheckpointTruncate(db); err != nil {
-			return nil, fmt.Errorf("scrub: wal checkpoint: %w", err)
+			return nil, err // 含 OFFLINE_REQUIRED 语义
 		}
 		res.Phases = append(res.Phases, "WAL-CHECKPOINT")
 	}
+	if err := acquireExclusiveProbe(sqlDB); err != nil {
+		return nil, err
+	}
+	res.Phases = append(res.Phases, "EXCLUSIVE")
 
 	// secure_delete=ON（best-effort：driver 不支持时跳过，VACUUM 仍会重写整库）
 	var sd string
@@ -160,15 +172,49 @@ func Run(opts Options) (*Result, error) {
 	return res, nil
 }
 
+// walCheckpointTruncate: TRUNCATE checkpoint 并遵守 SQLite 契约——
+// 首列 Busy!=0 表示 checkpoint 被其他连接阻塞、未完成 → 显式 STOP（fail-closed）。
 func walCheckpointTruncate(db *gorm.DB) error {
-	var row struct {
-		Busy  int64
-		Log   int64
-		Chkpt int64
+	rows, err := db.Raw("PRAGMA wal_checkpoint(TRUNCATE)").Rows()
+	if err != nil {
+		return fmt.Errorf("scrub: wal checkpoint: %w", err)
 	}
-	// PRAGMA wal_checkpoint(TRUNCATE) 返回 (busy, log, checkpointed)
-	if err := db.Raw("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&row).Error; err != nil {
-		return err
+	defer rows.Close()
+	var busy, logPages, checkpointed int64
+	if rows.Next() {
+		if err := rows.Scan(&busy, &logPages, &checkpointed); err != nil {
+			return fmt.Errorf("scrub: wal checkpoint scan: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("scrub: wal checkpoint rows: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("scrub: WAL checkpoint blocked (busy=%d) — another connection is using the database; "+
+			"stop the gateway / close other connections and retry (REQUEST_LOG_SCRUB_OFFLINE_REQUIRED)", busy)
+	}
+	return nil
+}
+
+// acquireExclusiveProbe: 以 busy_timeout=0 的独立连接尝试 BEGIN EXCLUSIVE。
+// 任何并发占用（journal 模式下的读/写锁）都会立即 SQLITE_BUSY → STOP。
+// 成功后立即 ROLLBACK（探测不持有锁、不做任何修改）。
+func acquireExclusiveProbe(sqlDB *sql.DB) error {
+	ctx := context.Background()
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("scrub: acquire connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
+		return fmt.Errorf("scrub: busy_timeout: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		return fmt.Errorf("scrub: database is in use (exclusive lock unavailable) — "+
+			"stop the gateway / close other connections and retry: %w (REQUEST_LOG_SCRUB_OFFLINE_REQUIRED)", err)
+	}
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		return fmt.Errorf("scrub: exclusive probe rollback: %w", err)
 	}
 	return nil
 }

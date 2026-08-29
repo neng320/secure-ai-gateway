@@ -54,8 +54,17 @@ LOG/ERROR SINK
 | gemini proxy 上游 4xx/5xx 响应 | 原样转发给客户端；不解析、不落 DB |
 | Admin Test/Fetch client | provider error 文本即时 JSON 返回（on-demand，非持久化）——出 P1-04 范围 |
 
-**运行时日志的"不可信 upstream body 回显"只有一处**：openai fallback `log.Printf`（`openai.go` handleNonStreamingRequestWithFallback）。
-**不可信文本持久化只有一处**：gemini proxy 传输错误的 `err.Error()` → DB ErrorMessage。
+~~**运行时日志的"不可信 upstream body 回显"只有一处**~~（**P1-04.1 复勘修正：此结论错误**）：
+P1-04 终验 review 发现 provider 层还存在正文 runtime log 通道——`openai_compat.go`/`ollama.go` 在
+`DEBUG=1` 时输出完整 request body 与 response body（含完整 URL），`openai_compat.go` FetchModels 与
+`vllm.go` ListModels 甚至无条件输出 response body。该通道无限期、非 bounded、非 expiry，
+完全绕过 request_body_capture 的 memory-only 语义，是 Final Gate 0-canary 的覆盖缺口
+（Gate 未在 DEBUG=1 下运行）。**已在 P1-04.1 全部根除**（provider 层日志仅剩 provider/model/
+status/bytes metadata），并以 `internal/providers/p1_041_debug_log_gate_test.go`
+（DEBUG=1 canary 双端 + 静态 tripwire）防回归。
+
+**不可信文本持久化只有一处**：gemini proxy 传输错误的 `err.Error()` → DB ErrorMessage
+（P1-04B 起改为 bounded ErrorCode）。
 
 ## 5. Target P1-04 行为（对照）
 

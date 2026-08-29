@@ -106,12 +106,15 @@ func TestCaptureConfig_MaxEntriesBounds(t *testing.T) {
 	}
 }
 
-// 过期时刻（expires_at 已在过去）→ reject
-func TestCaptureConfig_ExpiredAtResolve_Rejected(t *testing.T) {
-	_, err := resolveFor(t, LoggingConfig{RequestBodyCapture: RequestBodyCaptureConfig{
+// 过期时刻（expires_at 已在过去）→ fail-safe disable（非 fatal；P1-04.1 恢复原契约）
+func TestCaptureConfig_ExpiredAtResolve_DisabledNotFatal(t *testing.T) {
+	settings, err := resolveFor(t, LoggingConfig{RequestBodyCapture: RequestBodyCaptureConfig{
 		Enabled: true, ExpiresAt: "2026-08-29T11:59:59Z",
 	}})
-	if err == nil || !strings.Contains(err.Error(), "future") {
-		t.Fatalf("[安全回归失败] 已过期 expiry 应拒绝，实际 err=%v", err)
+	if err != nil {
+		t.Fatalf("[安全回归失败] 过期配置应 fail-safe disable 而非启动失败，实际 err=%v", err)
+	}
+	if settings.Enabled {
+		t.Fatal("[安全回归失败] 过期配置必须解析为 disabled")
 	}
 }

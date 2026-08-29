@@ -40,7 +40,7 @@ func (p *OllamaProvider) ChatCompletion(req *ChatRequest) ([]byte, int, error) {
 	url := p.cfg.BaseURL + "/api/chat"
 
 	if isDebug() {
-		log.Printf("[%s] Request to %s: %s", p.name, url, string(body))
+		log.Printf("[%s] request model=%s bytes=%d", p.name, req.Model, len(body))
 	}
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
@@ -63,7 +63,7 @@ func (p *OllamaProvider) ChatCompletion(req *ChatRequest) ([]byte, int, error) {
 	}
 
 	if isDebug() {
-		log.Printf("[%s] Response: %d - %s", p.name, resp.StatusCode, string(respBody))
+		log.Printf("[%s] response status=%d bytes=%d", p.name, resp.StatusCode, len(respBody))
 	}
 
 	return respBody, resp.StatusCode, nil
@@ -73,7 +73,7 @@ func (p *OllamaProvider) ChatCompletionStream(req *ChatRequest) (*http.Response,
 	body := p.buildRequestBody(req, true)
 	url := p.cfg.BaseURL + "/api/chat"
 
-	log.Printf("[%s] Stream request to %s", p.name, url)
+	log.Printf("[%s] Stream request model=%s bytes=%d", p.name, req.Model, len(body))
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {

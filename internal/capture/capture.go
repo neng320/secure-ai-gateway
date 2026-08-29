@@ -69,16 +69,20 @@ func (s *Store) Capture(requestID string, body []byte) {
 		return
 	}
 
-	b := make([]byte, len(body))
-	copy(b, body)
+	// P1-04.1：真实内存上界——只分配 min(len(body), maxBytes)，
+	// 绝不先全量拷贝再切片（否则 10MiB 请求会瞬时分配 10MiB）。
+	n := len(body)
 	truncated := false
-	if len(b) > s.maxBytes {
-		b = b[:s.maxBytes]
+	if n > s.maxBytes {
+		n = s.maxBytes
 		truncated = true
 	}
+	b := make([]byte, n)
+	copy(b, body[:n])
 
-	// 同 requestID 重复捕获：移除旧位置（FIFO 序），覆盖为新条目
-	if _, ok := s.entries[requestID]; ok {
+	// 同 requestID 重复捕获：旧 Body best-effort 置零后再覆盖
+	if old, ok := s.entries[requestID]; ok {
+		zeroBytes(old.Body)
 		s.removeOrder(requestID)
 	} else if len(s.entries) >= s.maxEntries {
 		// 容量满：淘汰最旧（best-effort 置零）

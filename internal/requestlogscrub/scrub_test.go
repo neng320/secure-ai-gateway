@@ -11,6 +11,8 @@ package requestlogscrub
 // Canary：P104_LEGACY_PROMPT_ERADICATION_CANARY / P104_LEGACY_ERRORTEXT_ERADICATION_CANARY
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +21,7 @@ import (
 
 	"ai-gateway/internal/models"
 
+	_ "github.com/mattn/go-sqlite3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -207,4 +210,107 @@ func TestScrub_DirectoryDB_Stop(t *testing.T) {
 	if _, err := Run(Options{ConfigPath: cfgPath}); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Fatalf("[安全回归失败] 目录式 DB 应 STOP，实际 err=%v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// P1-04.1 · Exclusive / Busy Gate（并发连接 → 任何 mutation 之前 STOP）
+// ---------------------------------------------------------------------------
+
+// holdLock: 在独立连接上以 BEGIN IMMEDIATE 占用写锁（足以阻塞 TRUNCATE checkpoint
+// 与 BEGIN EXCLUSIVE 探测），并保持打开直到调用返回的 release。
+func holdLock(t *testing.T, dbPath string) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	raw, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := raw.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("fixture: 占用写锁失败: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "SELECT count(*) FROM request_logs"); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		_ = conn.Close()
+		_ = raw.Close()
+	}
+}
+
+// assertLegacyIntact: legacy 行原值仍在（未发生任何 mutation）
+func assertLegacyIntact(t *testing.T, f *scrubFixture) {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(f.dbPath), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	if err := db.Raw("SELECT count(*) FROM request_logs WHERE request_body = ?", legacyPromptCanary).Scan(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("[安全回归失败] legacy 正文应在 STOP 后保持原值（3 行），实际 %d", n)
+	}
+	if sqlDB, e := db.DB(); e == nil {
+		_ = sqlDB.Close()
+	}
+}
+
+// G. WAL 模式 + 并发写锁占用 → STOP 于任何 mutation 之前
+func TestScrub_WALBusy_StopBeforeMutation(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, true) // WAL 模式
+
+	release := holdLock(t, f.dbPath)
+
+	_, err := Run(Options{ConfigPath: f.cfgPath})
+	if err == nil {
+		release()
+		t.Fatal("[安全回归失败] 并发占用下 scrub 应 STOP")
+	}
+	if !strings.Contains(err.Error(), "REQUEST_LOG_SCRUB_OFFLINE_REQUIRED") {
+		t.Fatalf("[安全回归失败] 应报 OFFLINE_REQUIRED，实际 %v", err)
+	}
+	assertLegacyIntact(t, f)
+	release()
+
+	// 释放后重跑 → 成功：逻辑 0 + raw bytes 0
+	res, err := Run(Options{ConfigPath: f.cfgPath})
+	if err != nil {
+		t.Fatalf("释放独占后 scrub 应成功: %v", err)
+	}
+	if res.RemainNonEmpty != 0 {
+		t.Fatalf("[安全回归失败] scrub 后仍有残留: %+v", res)
+	}
+	hits, scanned := f.rawScanCanaryHits(t)
+	if hits != 0 || len(scanned) == 0 {
+		t.Fatalf("[安全回归失败] raw bytes 未清零: hits=%d scanned=%v", hits, scanned)
+	}
+}
+
+// 反向：delete-journal 模式 + 并发写锁占用 → exclusive 探测 STOP
+func TestScrub_JournalBusy_StopBeforeMutation(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+
+	release := holdLock(t, f.dbPath)
+
+	_, err := Run(Options{ConfigPath: f.cfgPath})
+	if err == nil {
+		release()
+		t.Fatal("[安全回归失败] journal 模式并发占用下 scrub 应 STOP")
+	}
+	if !strings.Contains(err.Error(), "REQUEST_LOG_SCRUB_OFFLINE_REQUIRED") {
+		t.Fatalf("[安全回归失败] 应报 OFFLINE_REQUIRED，实际 %v", err)
+	}
+	assertLegacyIntact(t, f)
+	release()
 }
