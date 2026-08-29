@@ -56,7 +56,7 @@ func TestGate_ValidSession_AccessesAllAdminSurfaces(t *testing.T) {
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/admin/ws"
 	d := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
-	hdr := http.Header{"Cookie": {sessionCookieName + "=" + token}}
+	hdr := http.Header{"Cookie": {sessionCookieName + "=" + token}, "Origin": {srv.URL}}
 	conn, _, err := d.Dial(wsURL, hdr)
 	if err != nil {
 		t.Fatalf("[安全回归失败] 合法会话的 WS 升级被拒绝: %v", err)

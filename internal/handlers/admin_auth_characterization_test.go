@@ -99,7 +99,7 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	toolSvc := services.NewToolService(nil)
 
 	store := auth.NewSQLiteStore(db)
-	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store)
+	adminH, err := NewAdminHandler(cfg, clientSvc, statsSvc, geminiSvc, hub, toolSvc, store, auth.NewLoginRateLimiter())
 	if err != nil {
 		t.Fatalf("NewAdminHandler: %v", err)
 	}
