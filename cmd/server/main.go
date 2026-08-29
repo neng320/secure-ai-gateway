@@ -25,12 +25,15 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/logger"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/secretmigration"
+	"ai-gateway/internal/secrets"
 
 	_ "ai-gateway/docs"
 	"gorm.io/driver/sqlite"
@@ -39,11 +42,13 @@ import (
 )
 
 var (
-	version   = "dev"
-	commit    = "unknown"
-	buildTime = "unknown"
-	setupMode = flag.Bool("setup", false, "Run setup wizard")
-	resetPw   = flag.String("reset-password", "", "Reset admin password to the specified value")
+	version     = "dev"
+	commit      = "unknown"
+	buildTime   = "unknown"
+	setupMode   = flag.Bool("setup", false, "Run setup wizard")
+	resetPw     = flag.String("reset-password", "", "Reset admin password to the specified value")
+	migrateSec  = flag.Bool("migrate-provider-secrets", false, "Offline migration: encrypt provider secrets (PREPARE/VERIFY/FINALIZE), then exit")
+	backupDirFl = flag.String("migration-backup-dir", "", "Backup root dir for provider secret migration (required with -migrate-provider-secrets)")
 )
 
 func main() {
@@ -66,6 +71,12 @@ func main() {
 			log.Fatalf("Failed to save config: %v", err)
 		}
 		fmt.Printf("Admin password has been reset\n")
+		return
+	}
+
+	// P1-03C2：显式离线迁移模式——不启动任何 HTTP listener
+	if *migrateSec {
+		runProviderSecretMigration(*configPath, *backupDirFl)
 		return
 	}
 
@@ -139,6 +150,37 @@ func main() {
 		log.Printf("Shutdown completed with error: %v", err)
 	}
 	log.Println("Server exited")
+}
+
+// runProviderSecretMigration: 离线迁移入口（P1-03C2）。
+// Master Key 从环境加载（fail-closed）；输出只含数量/位置，不含 secret 材料。
+func runProviderSecretMigration(configPath, backupDir string) {
+	if backupDir == "" {
+		fmt.Println("error: -migration-backup-dir is required with -migrate-provider-secrets")
+		os.Exit(2)
+	}
+	key, err := secrets.LoadMasterKey(os.Getenv)
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+		os.Exit(2)
+	}
+	res, err := secretmigration.Run(secretmigration.Options{
+		ConfigPath: configPath,
+		BackupDir:  backupDir,
+		MasterKey:  key,
+	})
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("migration complete\n")
+	fmt.Printf("  backup dir       : %s\n", res.BackupDir)
+	fmt.Printf("  global prepared  : %d (legacy-only)\n", res.GlobalLegacyOnly)
+	fmt.Printf("  client prepared  : %d (legacy-only)\n", res.ClientLegacyOnly)
+	fmt.Printf("  already encrypted: global=%d clients=%d\n", res.GlobalEncrypted, res.ClientEncrypted)
+	fmt.Printf("  finalized        : global=%d clients=%d\n", res.FinalizedGlobal, res.FinalizedClients)
+	fmt.Printf("  phases           : %s\n", strings.Join(res.Phases, " -> "))
+	fmt.Println("next: restart gateway (preflight now requires AIGATEWAY_MASTER_KEY)")
 }
 
 func initDatabase(cfg *config.Config) (*gorm.DB, error) {

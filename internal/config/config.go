@@ -421,6 +421,11 @@ func SourcePath() string {
 	return configPath
 }
 
+// MarshalYAML: 将配置序列化为 YAML（迁移引擎等需要"序列化与保存分离"的场景使用）。
+func MarshalYAML(cfg *Config) ([]byte, error) {
+	return yaml.Marshal(cfg)
+}
+
 func Save(cfg *Config) {
 	if configPath == "" {
 		return
