@@ -139,7 +139,9 @@ func TestLimiter_CapacityFull_ProtectedAccountStillTracked(t *testing.T) {
 	}
 }
 
-// [P1-02.1 回归] 超长 username 截断为固定 key（防巨型 map key），行为一致。
+// [P1-02.1 回归] 超长 username 截断为固定 key（防巨型 map key），行为精确断言：
+//   - 255 字节规范化 key 与 long 共享失败状态 → 同样锁定
+//   - 254 字节不同 key → 无失败记录 → 允许
 func TestLimiter_LongUsername_Truncated(t *testing.T) {
 	l, _ := newTestLimiter()
 	l.Configure(DefaultLoginMaxFailures, DefaultLoginLockout, "admin")
@@ -150,8 +152,42 @@ func TestLimiter_LongUsername_Truncated(t *testing.T) {
 	if l.Allow(long) {
 		t.Fatal("超长用户名达到阈值后应锁定")
 	}
+	if l.Allow(long[:maxTrackedUsernameLen]) {
+		t.Fatal("[安全回归失败] 255 字节规范化 key 应与 long 共享失败状态并锁定")
+	}
 	if !l.Allow(long[:maxTrackedUsernameLen-1]) {
-		// 截断碰撞：前 255 字符相同的用户名共享计数（保守方向），首个前缀不同 → 允许
-		t.Log("不同长用户名共享截断 key 属预期保守行为")
+		t.Fatal("[安全回归失败] 254 字节不同 key 应独立计算并允许")
+	}
+}
+
+// [P1-02.2 回归] 容量满后 SetProtectedUser 切换的新账号必须被继续追踪。
+func TestLimiter_SetProtectedUser_TrackedUnderFullCapacity(t *testing.T) {
+	l, _ := newTestLimiter()
+	l.Configure(DefaultLoginMaxFailures, DefaultLoginLockout, "oldadmin")
+	for i := 0; i < maxTrackedUsernames; i++ {
+		l.RecordFailure(fmt.Sprintf("user%06d", i))
+	}
+	l.SetProtectedUser("newadmin")
+	for i := 0; i < DefaultLoginMaxFailures; i++ {
+		l.RecordFailure("newadmin")
+	}
+	if l.Allow("newadmin") {
+		t.Fatal("[安全回归失败] 容量满 + SetProtectedUser 后新管理员仍 fail-open")
+	}
+}
+
+// [P1-02.2 回归] SetProtectedUser 清除新账号已有失败状态（干净起点）。
+func TestLimiter_SetProtectedUser_ClearsNewUserFailures(t *testing.T) {
+	l, _ := newTestLimiter()
+	l.Configure(DefaultLoginMaxFailures, DefaultLoginLockout, "oldadmin")
+	for i := 0; i < 3; i++ {
+		l.RecordFailure("newadmin")
+	}
+	l.SetProtectedUser("newadmin")
+	// 清零后：再累计 2 次（合计不足阈值）不应锁定
+	l.RecordFailure("newadmin")
+	l.RecordFailure("newadmin")
+	if !l.Allow("newadmin") {
+		t.Fatal("[安全回归失败] SetProtectedUser 未清除新账号失败状态（应从干净起点累计）")
 	}
 }

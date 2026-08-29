@@ -147,6 +147,18 @@ func (l *LoginRateLimiter) RecordSuccess(username string) {
 	delete(l.failures, l.normalize(username))
 }
 
+// SetProtectedUser: 运行时切换受保护账号（Setup 完成修改用户名后同步，P1-02.2）。
+// - 立即生效：新受保护账号不受容量上限约束（容量满仍被追踪）
+// - 清除新账号已有失败状态：成功的 Setup 从干净登录状态开始
+// - 旧账号的失败条目保留，交给惰性过期/容量淘汰（有界，不无限增长）
+func (l *LoginRateLimiter) SetProtectedUser(username string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	normalized := l.normalize(username)
+	l.protectedUser = normalized
+	delete(l.failures, normalized)
+}
+
 // trimExpiredLocked: 清理锁定与窗口均已过期的条目（调用方持锁）。
 func (l *LoginRateLimiter) trimExpiredLocked(now time.Time) {
 	for k, f := range l.failures {

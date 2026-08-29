@@ -16,12 +16,15 @@ import (
 )
 
 type SetupHandler struct {
-	cfg       *config.Config
-	setupMode bool
+	cfg          *config.Config
+	setupMode    bool
+	loginLimiter *auth.LoginRateLimiter
 }
 
-func NewSetupHandler(cfg *config.Config, setupMode bool) *SetupHandler {
-	return &SetupHandler{cfg: cfg, setupMode: setupMode}
+// NewSetupHandler: loginLimiter 必须与 AdminHandler 共享同一实例（P1-02.2），
+// 以便 Setup 修改管理员用户名后同步 limiter 的受保护身份。
+func NewSetupHandler(cfg *config.Config, setupMode bool, loginLimiter *auth.LoginRateLimiter) *SetupHandler {
+	return &SetupHandler{cfg: cfg, setupMode: setupMode, loginLimiter: loginLimiter}
 }
 
 func (h *SetupHandler) IsSetupRequired() bool {
@@ -130,6 +133,12 @@ func (h *SetupHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 	if err := config.SaveConfig(h.cfg, "config.yaml"); err != nil {
 		h.showError(w, "Failed to save config: "+err.Error())
 		return
+	}
+
+	// P1-02.2：配置成功保存后才同步 limiter 的受保护身份（避免保存失败但内存已变）。
+	// 同时清除新用户名的失败记录，让成功的 Setup 从干净登录状态开始。
+	if h.loginLimiter != nil {
+		h.loginLimiter.SetProtectedUser(username)
 	}
 
 	http.Redirect(w, r, "/admin/login", http.StatusFound)
