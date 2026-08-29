@@ -59,7 +59,7 @@ tailwind.config.js
 # 环境变量与密钥文件
 .env
 .env.*
-secrets/
+/secrets/
 # 运行时数据（整目录，含 SQLite 及其 journal/WAL/SHM）
 data/
 backups/

@@ -66,3 +66,19 @@ jobs:
 
       - name: Large file check
         run: bash scripts/check-large-files.sh
+
+      # P1-03B.1 防回归：敏感基础设施包必须真实入库并被构建（防 gitignore 吞包的 CI coverage illusion）
+      - name: Critical package delivery guard
+        run: |
+          files=$(git ls-files 'internal/secrets/*.go')
+          if [ -z "$files" ]; then
+            echo "::error::internal/secrets source files are NOT tracked in git"
+            exit 1
+          fi
+          echo "tracked internal/secrets files:"
+          echo "$files"
+          if ! go list ./... | grep -q '^ai-gateway/internal/secrets$'; then
+            echo "::error::ai-gateway/internal/secrets missing from package list"
+            exit 1
+          fi
+          echo "package delivery guard OK"
