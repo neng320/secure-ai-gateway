@@ -76,6 +76,10 @@ type AdminConfig struct {
 	// server.https 完全解耦。生产经 HTTPS 访问 Admin 面时必须显式设为 true；
 	// 默认 false 以支持 loopback / SSH 隧道的纯 HTTP 开发访问。
 	CookieSecure bool `yaml:"cookie_secure"`
+	// 登录防爆破（P1-02D）：username 维度、本地内存状态、重启清零。
+	// 默认 5 次失败锁定 15 分钟。
+	LoginMaxFailures    int `yaml:"login_max_failures"`
+	LoginLockoutMinutes int `yaml:"login_lockout_minutes"`
 }
 
 type DefaultsConfig struct {
@@ -168,6 +172,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Server.Metrics.Port == 0 {
 		cfg.Server.Metrics.Port = 9090
+	}
+	if cfg.Admin.LoginMaxFailures <= 0 {
+		cfg.Admin.LoginMaxFailures = 5
+	}
+	if cfg.Admin.LoginLockoutMinutes <= 0 {
+		cfg.Admin.LoginLockoutMinutes = 15
 	}
 
 	if cfg.Providers == nil {

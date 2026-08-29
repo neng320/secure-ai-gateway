@@ -43,6 +43,7 @@ type gatewayDeps struct {
 	dashboardHub  *services.DashboardHub
 	toolService   *services.ToolService
 	sessionStore  auth.Store
+	loginLimiter  *auth.LoginRateLimiter
 	registry      *providers.Registry
 	health        *handlers.HealthHandler
 }
@@ -54,6 +55,8 @@ func newGatewayDeps(cfg *config.Config, db *gorm.DB, setupMode bool) gatewayDeps
 	toolService := services.NewToolService(cfg.ServerTools.Tools)
 	dashboardHub := services.NewDashboardHub(statsService)
 	geminiService.SetOnRequestLogged(dashboardHub.NotifyUpdate)
+	loginLimiter := auth.NewLoginRateLimiter()
+	loginLimiter.Configure(cfg.Admin.LoginMaxFailures, time.Duration(cfg.Admin.LoginLockoutMinutes)*time.Minute)
 	return gatewayDeps{
 		cfg:           cfg,
 		db:            db,
@@ -64,6 +67,7 @@ func newGatewayDeps(cfg *config.Config, db *gorm.DB, setupMode bool) gatewayDeps
 		dashboardHub:  dashboardHub,
 		toolService:   toolService,
 		sessionStore:  auth.NewSQLiteStore(db),
+		loginLimiter:  loginLimiter,
 		registry:      providers.BuildRegistry(cfg),
 		health:        handlers.NewHealthHandler(db),
 	}
@@ -100,7 +104,7 @@ func buildAdminRouter(d gatewayDeps) (*chi.Mux, error) {
 	r.Use(mw.Recovery)
 	r.Use(mw.SecurityHeaders)
 
-	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore)
+	adminHandler, err := handlers.NewAdminHandler(d.cfg, d.clientService, d.statsService, d.geminiService, d.dashboardHub, d.toolService, d.sessionStore, d.loginLimiter)
 	if err != nil {
 		return nil, fmt.Errorf("admin handler: %w", err)
 	}

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,6 +105,7 @@ type AdminHandler struct {
 	toolService   *services.ToolService
 	templates     *template.Template
 	sessionStore  auth.Store
+	loginLimiter  *auth.LoginRateLimiter
 }
 
 type PageData struct {
@@ -113,7 +115,7 @@ type PageData struct {
 	CSRFToken string
 }
 
-func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store) (*AdminHandler, error) {
+func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, statsService *services.StatsService, geminiService *services.GeminiService, dashboardHub *services.DashboardHub, toolService *services.ToolService, sessionStore auth.Store, loginLimiter *auth.LoginRateLimiter) (*AdminHandler, error) {
 	tmpl := template.New("admin").Funcs(template.FuncMap{
 		"formatDate":     formatDate,
 		"formatInt":      formatInt,
@@ -140,6 +142,7 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 		toolService:   toolService,
 		templates:     tmpl,
 		sessionStore:  sessionStore,
+		loginLimiter:  loginLimiter,
 	}, nil
 }
 
@@ -308,16 +311,27 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	username := r.Form.Get("username")
 	password := r.Form.Get("password")
 
+	// SEC（P1-02D）：防爆破短路。username 维度，不信任 X-Forwarded-*。
+	if !h.loginLimiter.Allow(username) {
+		w.Header().Set("Retry-After", strconv.Itoa(h.loginLimiter.RetryAfter(username)))
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+
 	if username != h.cfg.Admin.Username {
+		h.loginLimiter.RecordFailure(username)
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
 	err := bcrypt.CompareHashAndPassword([]byte(h.cfg.Admin.PasswordHash), []byte(password))
 	if err != nil {
+		h.loginLimiter.RecordFailure(username)
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
+
+	h.loginLimiter.RecordSuccess(username)
 
 	// SEC-001 修复（P1-01C）：凭据验证通过后签发真实服务端会话。
 	// 原始 256-bit 随机 token 仅此一次可见并放入 Cookie；库中只存 SHA-256。
