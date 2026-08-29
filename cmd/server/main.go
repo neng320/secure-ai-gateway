@@ -33,6 +33,7 @@ import (
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/logger"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/requestlogscrub"
 	"ai-gateway/internal/secretmigration"
 	"ai-gateway/internal/secrets"
 
@@ -43,13 +44,16 @@ import (
 )
 
 var (
-	version     = "dev"
-	commit      = "unknown"
-	buildTime   = "unknown"
-	setupMode   = flag.Bool("setup", false, "Run setup wizard")
-	resetPw     = flag.String("reset-password", "", "Reset admin password to the specified value")
-	migrateSec  = flag.Bool("migrate-provider-secrets", false, "Offline migration: encrypt provider secrets (PREPARE/VERIFY/FINALIZE), then exit")
-	backupDirFl = flag.String("migration-backup-dir", "", "Backup root dir for provider secret migration (required with -migrate-provider-secrets)")
+	version    = "dev"
+	commit     = "unknown"
+	buildTime  = "unknown"
+	setupMode  = flag.Bool("setup", false, "Run setup wizard")
+	resetPw    = flag.String("reset-password", "", "Reset admin password to the specified value")
+	migrateSec = flag.Bool("migrate-provider-secrets", false, "Offline migration: encrypt provider secrets (PREPARE/VERIFY/FINALIZE), then exit")
+	// P1-04D：显式离线 scrub——清除 request_logs legacy 正文/错误文本（不可逆，需二次确认）
+	scrubReqLog  = flag.Bool("scrub-request-log-content", false, "Offline scrub: clear legacy request_body/error_message in request_logs, then exit (IRREVERSIBLE)")
+	confirmScrub = flag.Bool("confirm-destructive-scrub", false, "Required second confirmation flag for -scrub-request-log-content")
+	backupDirFl  = flag.String("migration-backup-dir", "", "Backup root dir for provider secret migration (required with -migrate-provider-secrets)")
 	// P1-03D1A：安全 Global Provider Key provisioning。
 	// Key 绝不允许作为 CLI 参数（防 shell history / argv 泄露）——只能 TTY 隐藏输入或显式 stdin。
 	setProvKeyFl = flag.String("set-provider-key", "", "Provider name whose API key to provision securely (hidden TTY input + confirm; or -provider-key-stdin). Never pass the key as an argument.")
@@ -83,6 +87,12 @@ func main() {
 	// P1-03C2：显式离线迁移模式——不启动任何 HTTP listener
 	if *migrateSec {
 		runProviderSecretMigration(*configPath, *backupDirFl)
+		return
+	}
+
+	// P1-04D：显式离线 scrub 模式——不启动任何 HTTP listener；不可逆，需二次确认
+	if *scrubReqLog {
+		runRequestLogScrub(*configPath, *confirmScrub)
 		return
 	}
 
@@ -120,6 +130,11 @@ func main() {
 	}
 	if err := autoMigrate(db); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
+	}
+
+	// P1-04D 启动 preflight：legacy prompt/error 正文残留 → 拒绝启动（须离线 scrub）
+	if err := ensureRequestLogPrivacyRunnable(db); err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	// P1-03C1 启动 preflight：明文/混合/损坏 Provider Secret → 拒绝启动
@@ -178,6 +193,27 @@ func main() {
 		log.Printf("Shutdown completed with error: %v", err)
 	}
 	log.Println("Server exited")
+}
+
+// runRequestLogScrub: 显式离线 scrub 入口（P1-04D）。
+// 无确认 flag → 拒绝执行；输出只含数量与文件名，绝不包含正文材料。
+func runRequestLogScrub(configPath string, confirmed bool) {
+	if !confirmed {
+		fmt.Println("error: -scrub-request-log-content is IRREVERSIBLE and requires -confirm-destructive-scrub")
+		fmt.Println("note: no plaintext backup is created by this tool; make a controlled encrypted copy first if legally required")
+		os.Exit(2)
+	}
+	res, err := requestlogscrub.Run(requestlogscrub.Options{ConfigPath: configPath})
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("scrub complete\n")
+	fmt.Printf("  db path        : %s\n", res.DBPath)
+	fmt.Printf("  rows scrubbed  : %d\n", res.ScrubbedRows)
+	fmt.Printf("  remain non-empty: %d\n", res.RemainNonEmpty)
+	fmt.Printf("  sidecars        : %s\n", strings.Join(res.Sidecars, ", "))
+	fmt.Printf("  phases          : %s\n", strings.Join(res.Phases, " -> "))
 }
 
 // runProviderSecretMigration: 离线迁移入口（P1-03C2）。
