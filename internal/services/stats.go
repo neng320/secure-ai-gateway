@@ -31,7 +31,7 @@ func (s *StatsService) GetRequestsInProgress() int64 {
 }
 
 func (s *StatsService) GetGlobalStats() (*models.Stats, error) {
-	today := time.Now().Truncate(24 * time.Hour)
+	today := UsageDate(time.Now())
 
 	var stats models.Stats
 
@@ -74,7 +74,7 @@ func (s *StatsService) GetGlobalStats() (*models.Stats, error) {
 }
 
 func (s *StatsService) GetClientStats(clientID string) (*models.ClientStats, error) {
-	today := time.Now().Truncate(24 * time.Hour)
+	today := UsageDate(time.Now())
 
 	var client models.Client
 	if err := s.db.Where("id = ?", clientID).First(&client).Error; err != nil {
@@ -122,7 +122,7 @@ func (s *StatsService) GetAllClientStats() ([]models.ClientStats, error) {
 		return nil, err
 	}
 
-	today := time.Now().Truncate(24 * time.Hour)
+	today := UsageDate(time.Now())
 
 	var result []models.ClientStats
 	for _, client := range clients {
@@ -175,7 +175,7 @@ func (s *StatsService) GetRecentRequests(clientID string, limit int) ([]models.R
 }
 
 func (s *StatsService) GetModelUsage() (map[string]int, error) {
-	today := time.Now().Truncate(24 * time.Hour)
+	today := UsageDate(time.Now())
 
 	type Result struct {
 		Model string
@@ -210,7 +210,7 @@ type DailyStats struct {
 }
 
 func (s *StatsService) GetHistoricalStats(days int) ([]DailyStats, error) {
-	startDate := time.Now().AddDate(0, 0, -days).Truncate(24 * time.Hour)
+	startDate := UsageDate(time.Now().AddDate(0, 0, -days))
 
 	var results []DailyStats
 	err := s.db.Model(&models.DailyUsage{}).

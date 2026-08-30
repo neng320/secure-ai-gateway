@@ -122,6 +122,10 @@ type DailyUsage struct {
 	TotalRequests     int       `gorm:"default:0" json:"total_requests"`
 	TotalInputTokens  int       `gorm:"default:0" json:"total_input_tokens"`
 	TotalOutputTokens int       `gorm:"default:0" json:"total_output_tokens"`
+	// P1-06B：短生命周期 quota reservation counters；不计入 usage totals。
+	ReservedRequests     int `gorm:"default:0" json:"-"`
+	ReservedInputTokens  int `gorm:"default:0" json:"-"`
+	ReservedOutputTokens int `gorm:"default:0" json:"-"`
 }
 
 // AdminSession 已迁移至 internal/models/admin_session.go（P1-01B 重定义：token_hash/expires_at/revoked_at）

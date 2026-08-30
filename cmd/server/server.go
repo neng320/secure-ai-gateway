@@ -212,6 +212,7 @@ func buildAPIRouter(d gatewayDeps) *chi.Mux {
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware.Handler)
 		r.Use(rateLimiter.Middleware)
+		r.Use(mw.NewQuotaMiddleware(d.db))
 		proxyHandler.RegisterRoutes(r)
 		openaiHandler.RegisterRoutes(r)
 	})

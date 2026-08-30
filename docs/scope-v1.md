@@ -46,6 +46,20 @@ P1-05 Client Key Lifecycle：✅ COMPLETE
 
 SEC-001~005：本块不改变 Register 状态——**全部保持 CLOSED**。
 
+### P1-06 Rate Limit / Quota 执行状态（2026-08-30）
+
+```text
+P1-06A Rate / Quota Characterization ✅（PR #17；merge a3f9008b）
+  仅 tests/docs；固化三级 rate window、quota 未执行、DailyUsage lost update 等真实缺口。
+P1-06B Rate / Quota Enforcement ✅（本分支）
+  完成：60s/1h/24h 独立窗口、cold-cache 原子初始化、动态限额保留已消费量、
+        stable rate/quota error contract、并发 reservation、原子 usage charge、
+        OpenAI/Gemini MaxInput/MaxOutput gate、stream/non-stream 统一 reservation。
+P1-06 Rate Limit / Quota：✅ COMPLETE（待本分支 PR/CI/merge 门禁完成）
+  说明：token 计数使用 conservative byte upper bound，不冒充精确 tokenizer；
+        P1-07 继续负责更完整的 request-structure validation。
+```
+
 ### Hardening Backlog（非阻塞，SEC-002 保持 CLOSED）
 
 | ID | 描述 | 来源 | 状态 |

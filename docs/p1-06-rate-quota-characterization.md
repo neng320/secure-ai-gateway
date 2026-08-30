@@ -1,8 +1,9 @@
-# P1-06A · Rate / Quota Characterization
+# P1-06 · Rate / Quota Characterization and Enforcement
 
-> 基线：`origin/develop` `8b6559ef016cad3aaed586ec718036ae15a54136`（P1-05C complete）。
-> 分支：`task/p1-06a-rate-quota-characterization`。
-> 本阶段只做审计、characterization tests 与文档；生产行为修改数 = 0。
+> P1-06A 基线：`origin/develop` `8b6559ef016cad3aaed586ec718036ae15a54136`（P1-05C complete）。
+> 当前 P1-06B 分支：`task/p1-06b-rate-quota-enforcement`，起点为 P1-06A merge `a3f9008b2294c304c4dc8b31f8966a3eed677826`。
+> P1-06A 阶段只做审计、characterization tests 与文档，生产行为修改数 = 0；
+> P1-06B enforcement 结果记录在 §8。
 > 测试：`internal/middleware/p1_06a_rate_characterization_test.go`、
 > `internal/services/p1_06a_quota_characterization_test.go`、
 > `internal/handlers/p1_06a_request_limits_characterization_test.go`。
@@ -62,7 +63,7 @@
 - OpenAI-compatible ChatCompletions 当前没有调用同一 request-limit gate，用户 `max_tokens` 会按请求值传给 provider，即使超过 `Client.MaxOutputTokens`。
 - 这些字段已经存在并在 UI/Stats 中可见，但“字段存在”不等于所有协议路径都 enforce。
 
-## 5. KNOWN-GAP：P1-06A 只固化，不修复
+## 5. KNOWN-GAP：P1-06A 基线发现
 
 1. hour/day bucket 的时间语义错误：两者一分钟后整桶 refill。
 2. cold-cache `getOrCreateLimits` 初始化竞态可造成 burst 超额。
@@ -89,16 +90,40 @@ P1-06B 应先锁定明确的 fixed/rolling/token-bucket 语义，再实现最小
 - 所有 429 使用统一 JSON error schema、稳定 code、Retry-After 与准确 window metadata；invalid request 不调用 upstream。
 - 继续保持 P1-05 lifecycle cleanup、P1-04 privacy 与 P1-05C audit 回归全绿。
 
-## 7. Characterization evidence
+## 7. P1-06A Characterization Evidence
 
 | Test | 结论 |
 |---|---|
-| A/B/C | minute 可限流；hour/day 有独立 capacity 但实际均一分钟 refill。 |
-| D | warm bucket 并发消费不超过 capacity；cold-cache burst 观察到初始化超额。 |
-| E/F | 动态编辑不刷新现有 cache；新 limiter/重启清空内存消费。 |
-| G/H/I | daily request/input/output quota 不参与当前 accounting/preflight；Gemini MaxInput 启发式拒绝、Gemini MaxOutput rewrite、OpenAI max_tokens passthrough。 |
-| J | DailyUsage 并发 read-modify-save lost update。 |
-| K | streaming metadata 与 usage 各记录/charge 一次。 |
-| L | 当前 429 为 plain-text JSON-shaped body，缺 Retry-After/stable code/Limit metadata。 |
+| A/B/C | A 阶段事实：minute 可限流；hour/day 有独立 capacity 但实际均一分钟 refill。 |
+| D | A 阶段事实：warm bucket 并发消费不超过 capacity；cold-cache burst 观察到初始化超额。 |
+| E/F | A 阶段事实：动态编辑不刷新现有 cache；新 limiter/重启清空内存消费。 |
+| G/H/I | A 阶段事实：daily request/input/output quota 不参与当前 accounting/preflight；Gemini MaxInput 启发式拒绝、Gemini MaxOutput rewrite、OpenAI max_tokens passthrough。 |
+| J | A 阶段事实：DailyUsage 并发 read-modify-save lost update。 |
+| K | A 阶段事实：streaming metadata 与 usage 各记录/charge 一次。 |
+| L | A 阶段事实：429 为 plain-text JSON-shaped body，缺 Retry-After/stable code/Limit metadata。 |
 
-P1-06A 结论：以上是当前系统的可复现事实与明确缺口；本卡不把任何 gap 误写成已 enforce，也不提前实现 P1-06B。
+P1-06A 结论：以上是 enforcement 前的可复现事实与明确缺口；P1-06B 的关闭结果如下。
+
+## 8. P1-06B Enforcement Results
+
+### Rate
+
+- minute/hour/day 使用独立 fixed windows：60s、1h、24h；`NewRateLimiterWithClock` 允许无长 sleep 的边界测试。
+- 同一 client 的三窗口在一次 mutex 临界区内同步配置、refill、consume；任一窗口失败不会吞掉前面窗口的 token。
+- `sync.Map.LoadOrStore` 消除 cold-cache 重复 bucket；动态限额按“新 capacity - 已消费量”调整，降额不会送额度，升额不会清空历史消费。
+- 成功响应提供三个 Limit 与 Remaining header；429 使用 JSON `RATE_LIMIT_EXCEEDED`、失败窗口、准确 reset、Retry-After。0/负数 rate limit fail closed。
+
+### Quota / usage
+
+- `NewQuotaMiddleware` 只对 generative POST（chat completions、Gemini generateContent）生效，排除 count_tokens 与 GET models；reservation 发生在 downstream/upstream handler 前。
+- Request quota 每个请求预留 1；input reservation 使用 request body 的 conservative byte upper bound（截到 Client MaxInputTokens），不宣称精确 tokenizer；output reservation 使用请求声明值或 Client MaxOutputTokens 上界。
+- `DailyUsage` 新增 reservation counters。SQLite upsert 条件原子检查 total+reserved 不超过日 quota；并发 reservation 不超额。完成后 transaction 内将实际 usage 加入 totals 并释放 reservation，早期/传输失败由 middleware release。
+- 无效负数 quota/max-token 配置返回稳定 `QUOTA_CONFIGURATION_INVALID`；达到 request/input/output 日 quota 返回 HTTP 429 与对应 stable code；历史 usage 不因动态 quota 编辑重置。
+- `LogRequest` 将 request log insert 与 unreserved usage upsert 放入同一 transaction；reserved request 的 log 与实际 token charge 也同一 transaction。所有 stats 查询使用同一 UTC `UsageDate`。
+- Gemini 与 OpenAI request paths 都执行 conservative MaxInput gate；OpenAI `max_tokens` 超过 Client MaxOutputTokens 返回 `MAX_OUTPUT_TOKENS_EXCEEDED`；Gemini output 请求继续受 client cap 限制。
+
+### V1 charging boundary
+
+完整 upstream response 并成功写入 metadata log 才 charge request/actual tokens；这包括 non-retryable upstream HTTP error（按请求计数、无实际 token 时按 0 charge）。invalid request、provider setup failure 和 transport failure 在没有可 charge response 时释放 reservation。后续若要求“所有 upstream attempt 均计费”，需在后续迭代中为各 fallback/retry/error path 增加统一 charge contract。
+
+P1-06B 关闭 P1-06A 的 rate-window、cold-cache、dynamic-edit、atomic DailyUsage、stable-429 与 request/token quota enforcement gaps；P1-05 lifecycle、P1-04 privacy 与 audit 回归继续作为 required regression。
