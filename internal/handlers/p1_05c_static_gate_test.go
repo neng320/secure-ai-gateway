@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -41,6 +42,11 @@ func TestP105C_StaticGate_AuditAppendOnly(t *testing.T) {
 			file, parseErr := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 			if parseErr != nil {
 				return parseErr
+			}
+			if source, readErr := os.ReadFile(path); readErr != nil {
+				return readErr
+			} else if violations := p108bAuditSQLMutationViolations(path, source); len(violations) != 0 {
+				forbidden = append(forbidden, violations...)
 			}
 			ast.Inspect(file, func(node ast.Node) bool {
 				call, ok := node.(*ast.CallExpr)
@@ -92,6 +98,59 @@ func TestP105C_StaticGate_AuditAppendOnly(t *testing.T) {
 		}
 	}
 	t.Log("[static] AuditEvent production path is append/read-only with fixed actions")
+}
+
+func p108bAuditSQLMutationViolations(path string, source []byte) []string {
+	file, err := parser.ParseFile(token.NewFileSet(), path, source, 0)
+	if err != nil {
+		return []string{path + ":parse error"}
+	}
+	const migrationPath = "internal/audit/migration.go"
+	allowedMigrationSQL := map[string]bool{
+		"alter table audit_events add column chain_version varchar(16)":                         true,
+		"alter table audit_events add column prev_hash varchar(64)":                             true,
+		"alter table audit_events add column event_hash varchar(64)":                            true,
+		"update audit_events set chain_version = ?, prev_hash = ?, event_hash = ? where id = ?": true,
+	}
+	normalizedPath := filepath.ToSlash(filepath.Clean(path))
+	violations := []string{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		value, err := strconv.Unquote(literal.Value)
+		if err != nil {
+			return true
+		}
+		normalized := strings.Join(strings.Fields(strings.ToLower(value)), " ")
+		isMutation := strings.Contains(normalized, "update audit_events") ||
+			strings.Contains(normalized, "delete from audit_events") ||
+			strings.Contains(normalized, "drop table audit_events") ||
+			strings.Contains(normalized, "drop trigger audit_events_no_") ||
+			strings.Contains(normalized, "alter table audit_events")
+		if !isMutation {
+			return true
+		}
+		if (normalizedPath == migrationPath || strings.HasSuffix(normalizedPath, "/"+migrationPath)) && allowedMigrationSQL[normalized] {
+			return true
+		}
+		violations = append(violations, path+":"+normalized)
+		return true
+	})
+	return violations
+}
+
+func TestP108B_S11_StaticGateRejectsRawAuditMutationFixture(t *testing.T) {
+	fixture := []byte(`package fixture
+
+func mutate(db interface{ Exec(string, ...interface{}) }) {
+	db.Exec("DELETE FROM audit_events WHERE id = 1")
+}`)
+	violations := p108bAuditSQLMutationViolations("internal/handlers/fixture.go", fixture)
+	if len(violations) == 0 {
+		t.Fatal("static gate must reject raw audit_events mutation outside migration.go")
+	}
 }
 
 func TestP108B_S1_StaticGate_DedicatedAuditMigrationOwnership(t *testing.T) {

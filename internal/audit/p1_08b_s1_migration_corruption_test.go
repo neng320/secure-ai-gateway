@@ -36,6 +36,62 @@ func seedTwoAuditEvents(t *testing.T, db *gorm.DB) {
 	}
 }
 
+const legacyP105CAuditSchemaSQL = `CREATE TABLE audit_events (
+	id integer PRIMARY KEY AUTOINCREMENT,
+	event_id varchar(64),
+	action varchar(64),
+	actor_type varchar(32),
+	actor_id varchar(255),
+	target_type varchar(32),
+	target_id varchar(36),
+	reason varchar(256),
+	created_at datetime
+)`
+
+func createLegacyP105CSchema(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := db.Exec(legacyP105CAuditSchemaSQL).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range auditEventIndexSQL[:6] {
+		if err := db.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func insertLegacyAuditEvent(t *testing.T, db *gorm.DB, event models.AuditEvent) {
+	t.Helper()
+	if err := db.Exec(`INSERT INTO audit_events
+		(id, event_id, action, actor_type, actor_id, target_type, target_id, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.EventID, event.Action, event.ActorType, event.ActorID,
+		event.TargetType, event.TargetID, event.Reason, event.CreatedAt).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func auditSchemaFingerprint(t *testing.T, db *gorm.DB) string {
+	t.Helper()
+	var objects []struct {
+		Type string `gorm:"column:type"`
+		Name string `gorm:"column:name"`
+		SQL  string `gorm:"column:sql"`
+	}
+	if err := db.Raw("SELECT type, name, sql FROM sqlite_master WHERE name IN ('audit_events', 'audit_chain_states', 'idx_audit_events_event_id', 'idx_audit_events_action', 'idx_audit_events_actor_id', 'idx_audit_events_target_type', 'idx_audit_events_target_id', 'idx_audit_events_created_at', 'idx_audit_events_chain_version', 'idx_audit_events_prev_hash', 'idx_audit_events_event_hash', 'idx_audit_chain_states_updated_at', 'audit_events_no_update', 'audit_events_no_delete') ORDER BY type, name").Scan(&objects).Error; err != nil {
+		t.Fatal(err)
+	}
+	var eventColumns []sqliteTableColumn
+	if err := db.Raw("PRAGMA table_info(audit_events)").Scan(&eventColumns).Error; err != nil {
+		t.Fatal(err)
+	}
+	var stateColumns []sqliteTableColumn
+	if err := db.Raw("PRAGMA table_info(audit_chain_states)").Scan(&stateColumns).Error; err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("objects=%v event_columns=%v state_columns=%v", objects, eventColumns, stateColumns)
+}
+
 func assertAuditVerificationFails(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	if err := NewService(db).VerifyAuditChain(); !errors.Is(err, ErrAuditIntegrity) {
@@ -142,7 +198,7 @@ func TestP108B_S1_VerifierCorruptionMatrix(t *testing.T) {
 	}
 }
 
-func TestP108B_S1_LegacyBackfillByIDAndFieldsPreserved(t *testing.T) {
+func TestP108B_S11_RealLegacySchemaUpgrade(t *testing.T) {
 	path := t.TempDir() + "/legacy.db"
 	db, err := database.Open(path)
 	if err != nil {
@@ -153,22 +209,18 @@ func TestP108B_S1_LegacyBackfillByIDAndFieldsPreserved(t *testing.T) {
 			_ = sqlDB.Close()
 		}
 	})
-	if err := db.AutoMigrate(&models.AuditEvent{}); err != nil {
-		t.Fatal(err)
-	}
+	createLegacyP105CSchema(t, db)
 	created := time.Unix(1788064496, 123456789).UTC()
 	legacy := []models.AuditEvent{
-		{EventID: "legacy-1", Action: ActionClientCreated, ActorType: "admin", ActorID: "legacy-admin", TargetType: "client", TargetID: "client-1", Reason: "  preserve spaces  ", CreatedAt: created},
-		{EventID: "legacy-2", Action: ActionClientDeleted, ActorType: "admin", ActorID: "legacy-admin", TargetType: "client", TargetID: "client-1", Reason: "second", CreatedAt: created},
+		{ID: 20, EventID: "legacy-high", Action: ActionClientDeleted, ActorType: "admin", ActorID: "legacy-admin", TargetType: "client", TargetID: "client-1", Reason: "second", CreatedAt: created},
+		{ID: 10, EventID: "legacy-low", Action: ActionClientCreated, ActorType: "admin", ActorID: "legacy-admin", TargetType: "client", TargetID: "client-1", Reason: "  preserve spaces  ", CreatedAt: created},
 	}
-	for i := range legacy {
-		if err := db.Create(&legacy[i]).Error; err != nil {
-			t.Fatal(err)
-		}
+	for _, event := range legacy {
+		insertLegacyAuditEvent(t, db, event)
 	}
-	var before []models.AuditEvent
-	if err := db.Order("id ASC").Find(&before).Error; err != nil {
-		t.Fatal(err)
+	beforeSchema := auditSchemaFingerprint(t, db)
+	if strings.Contains(beforeSchema, "chain_version") || strings.Contains(beforeSchema, "prev_hash") || strings.Contains(beforeSchema, "event_hash") || strings.Contains(beforeSchema, "audit_chain_states") {
+		t.Fatalf("real legacy fixture unexpectedly contains chain schema: %s", beforeSchema)
 	}
 	if err := MigrateIntegrity(db); err != nil {
 		t.Fatal(err)
@@ -177,14 +229,23 @@ func TestP108B_S1_LegacyBackfillByIDAndFieldsPreserved(t *testing.T) {
 	if err := db.Order("id ASC").Find(&after).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(after) != 2 || after[0].PrevHash != "" || after[1].PrevHash != after[0].EventHash {
+	if len(after) != 2 || after[0].ID != 10 || after[1].ID != 20 || after[0].PrevHash != "" || after[1].PrevHash != after[0].EventHash {
 		t.Fatalf("legacy rows must be chained by immutable ID ASC: %+v", after)
 	}
-	for i := range before {
-		before[i].ChainVersion, before[i].PrevHash, before[i].EventHash = "", "", ""
-		if before[i].EventID != after[i].EventID || before[i].Action != after[i].Action || before[i].ActorType != after[i].ActorType || before[i].ActorID != after[i].ActorID || before[i].TargetType != after[i].TargetType || before[i].TargetID != after[i].TargetID || before[i].Reason != after[i].Reason || !before[i].CreatedAt.Equal(after[i].CreatedAt) {
-			t.Fatalf("legacy semantic fields changed at index %d: before=%+v after=%+v", i, before[i], after[i])
+	if after[0].EventID != "legacy-low" || after[1].EventID != "legacy-high" || after[0].Reason != "  preserve spaces  " || after[1].Reason != "second" {
+		t.Fatalf("legacy semantic fields or ID order changed: %+v", after)
+	}
+	for _, event := range after {
+		if !event.CreatedAt.Equal(created) {
+			t.Fatalf("legacy timestamp changed for %s: %v", event.EventID, event.CreatedAt)
 		}
+	}
+	var states []models.AuditChainState
+	if err := db.Order("id ASC").Find(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].ID != 1 || states[0].HeadHash != after[1].EventHash {
+		t.Fatalf("legacy migration must create state at the final ID-ordered event: %+v", states)
 	}
 	if err := NewService(db).VerifyAuditChain(); err != nil {
 		t.Fatal(err)
@@ -256,6 +317,101 @@ func TestP108B_S1_MixedAndPartialChainFailClosed(t *testing.T) {
 	})
 }
 
+func TestP108B_S11_PartialSchemaMatrixFailsBeforeMutation(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*testing.T, *gorm.DB)
+	}{
+		{name: "legacy plus chain_version", setup: func(t *testing.T, db *gorm.DB) {
+			createLegacyP105CSchema(t, db)
+			if err := db.Exec("ALTER TABLE audit_events ADD COLUMN chain_version varchar(16)").Error; err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "legacy plus two chain columns", setup: func(t *testing.T, db *gorm.DB) {
+			createLegacyP105CSchema(t, db)
+			for _, statement := range []string{
+				"ALTER TABLE audit_events ADD COLUMN chain_version varchar(16)",
+				"ALTER TABLE audit_events ADD COLUMN prev_hash varchar(64)",
+			} {
+				if err := db.Exec(statement).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+		}},
+		{name: "chained columns without state", setup: func(t *testing.T, db *gorm.DB) {
+			createLegacyP105CSchema(t, db)
+			for _, statement := range []string{
+				"ALTER TABLE audit_events ADD COLUMN chain_version varchar(16)",
+				"ALTER TABLE audit_events ADD COLUMN prev_hash varchar(64)",
+				"ALTER TABLE audit_events ADD COLUMN event_hash varchar(64)",
+			} {
+				if err := db.Exec(statement).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			insertLegacyAuditEvent(t, db, models.AuditEvent{ID: 1, EventID: "partial-no-state", Action: ActionClientCreated, ActorType: "admin", ActorID: "admin", TargetType: "client", TargetID: "client", CreatedAt: time.Unix(1788064496, 1).UTC()})
+			if err := db.Exec("UPDATE audit_events SET chain_version = ?, event_hash = ? WHERE id = 1", chainVersionV1, strings.Repeat("a", 64)).Error; err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "legacy event plus state", setup: func(t *testing.T, db *gorm.DB) {
+			createLegacyP105CSchema(t, db)
+			if err := db.Exec(createChainStateTableSQL).Error; err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "chained schema missing prev_hash", setup: func(t *testing.T, db *gorm.DB) {
+			// This case is built independently so its connection remains the
+			// subject of the pre-state snapshot and migration attempt.
+			if err := db.Exec(createAuditEventsTableSQL).Error; err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range auditEventIndexSQL {
+				if err := db.Exec(statement).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Exec(createChainStateTableSQL).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Exec("INSERT INTO audit_chain_states (id, chain_version, head_hash, updated_at) VALUES (1, ?, ?, ?)", chainVersionV1, "", time.Now().UTC()).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Exec("DROP INDEX idx_audit_events_prev_hash").Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Exec("ALTER TABLE audit_events DROP COLUMN prev_hash").Error; err != nil {
+				t.Skipf("SQLite build does not support DROP COLUMN: %v", err)
+			}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t.TempDir() + "/partial.db"
+			db, err := database.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if sqlDB, err := db.DB(); err == nil {
+					_ = sqlDB.Close()
+				}
+			})
+			tc.setup(t, db)
+			before := auditSchemaFingerprint(t, db)
+			if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
+				t.Fatalf("partial schema must fail closed, got %v", err)
+			}
+			after := auditSchemaFingerprint(t, db)
+			if after != before {
+				t.Fatalf("partial schema changed before rejection: before=%s after=%s", before, after)
+			}
+		})
+	}
+}
+
 func TestP108B_S1_TriggerDefinitionMismatchFailsClosed(t *testing.T) {
 	db, _ := newP108BS1DB(t)
 	dropAuditMutationTriggers(t, db)
@@ -278,13 +434,9 @@ func TestP108B_S1_MigrationFailureRollsBack(t *testing.T) {
 			_ = sqlDB.Close()
 		}
 	})
-	if err := db.AutoMigrate(&models.AuditEvent{}); err != nil {
-		t.Fatal(err)
-	}
-	legacy := models.AuditEvent{EventID: "legacy-rollback", Action: ActionClientCreated, ActorType: "admin", ActorID: "admin", TargetType: "client", TargetID: "client", Reason: "legacy", CreatedAt: time.Now().UTC()}
-	if err := db.Create(&legacy).Error; err != nil {
-		t.Fatal(err)
-	}
+	createLegacyP105CSchema(t, db)
+	legacy := models.AuditEvent{ID: 1, EventID: "legacy-rollback", Action: ActionClientCreated, ActorType: "admin", ActorID: "admin", TargetType: "client", TargetID: "client", Reason: "legacy", CreatedAt: time.Unix(1788064496, 987654321).UTC()}
+	insertLegacyAuditEvent(t, db, legacy)
 	if err := db.Exec("CREATE TABLE trigger_name_blocker (id INTEGER)").Error; err != nil {
 		t.Fatal(err)
 	}
@@ -295,12 +447,35 @@ func TestP108B_S1_MigrationFailureRollsBack(t *testing.T) {
 	if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
 		t.Fatalf("trigger-name collision should fail migration, got %v", err)
 	}
-	var after models.AuditEvent
-	if err := db.First(&after, "event_id = ?", legacy.EventID).Error; err != nil {
+	var after struct {
+		ID         int64
+		EventID    string
+		Action     string
+		ActorType  string
+		ActorID    string
+		TargetType string
+		TargetID   string
+		Reason     string
+		CreatedAt  time.Time
+	}
+	if err := db.Raw("SELECT id, event_id, action, actor_type, actor_id, target_type, target_id, reason, created_at FROM audit_events WHERE event_id = ?", legacy.EventID).Scan(&after).Error; err != nil {
 		t.Fatal(err)
 	}
-	if after.ChainVersion != "" || after.PrevHash != "" || after.EventHash != "" {
-		t.Fatalf("failed migration must roll back legacy backfill, got %+v", after)
+	if after.ID != legacy.ID || after.EventID != legacy.EventID || after.Action != legacy.Action || after.ActorType != legacy.ActorType || after.ActorID != legacy.ActorID || after.TargetType != legacy.TargetType || after.TargetID != legacy.TargetID || after.Reason != legacy.Reason || !after.CreatedAt.Equal(legacy.CreatedAt) {
+		t.Fatalf("failed migration changed legacy row, got %+v", after)
+	}
+	var columnRows []sqliteTableColumn
+	if err := db.Raw("PRAGMA table_info(audit_events)").Scan(&columnRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	columns := make(map[string]sqliteTableColumn, len(columnRows))
+	for _, column := range columnRows {
+		columns[column.Name] = column
+	}
+	for _, name := range []string{"chain_version", "prev_hash", "event_hash"} {
+		if _, ok := columns[name]; ok {
+			t.Fatalf("failed migration must roll back legacy column %q", name)
+		}
 	}
 	var stateTables int64
 	if err := db.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'audit_chain_states'").Scan(&stateTables).Error; err != nil {

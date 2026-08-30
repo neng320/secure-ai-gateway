@@ -12,6 +12,7 @@ package audit
 // 完整不可变审计子系统由 P1-08 负责（见 docs/adr/ADR-008）。
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -79,6 +80,9 @@ func (s *Service) Record(e models.AuditEvent) error {
 func normalizeAuditDBError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, sql.ErrTxDone) {
+		return ErrAuditTransactionRequired
 	}
 	var sqliteErr sqlite3.Error
 	if errors.As(err, &sqliteErr) && (sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked) {

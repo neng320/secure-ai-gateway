@@ -64,6 +64,60 @@ func TestP108B_S1_RecordTxRequiresTransaction(t *testing.T) {
 	}
 }
 
+func TestP108B_S11_RecordTxAfterCommittedTransaction(t *testing.T) {
+	db, _ := newP108BS1DB(t)
+	svc := NewService(db)
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatal(tx.Error)
+	}
+	if err := tx.Commit().Error; err != nil {
+		t.Fatal(err)
+	}
+
+	err := svc.RecordTx(tx, testAuditEvent("committed-transaction"))
+	if !errors.Is(err, ErrAuditTransactionRequired) {
+		t.Fatalf("RecordTx after commit must return ErrAuditTransactionRequired, got %v", err)
+	}
+	assertEmptyAuditAppend(t, db, "committed transaction")
+}
+
+func TestP108B_S11_RecordTxAfterRolledBackTransaction(t *testing.T) {
+	db, _ := newP108BS1DB(t)
+	svc := NewService(db)
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatal(tx.Error)
+	}
+	if err := tx.Rollback().Error; err != nil {
+		t.Fatal(err)
+	}
+
+	err := svc.RecordTx(tx, testAuditEvent("rolled-back-transaction"))
+	if !errors.Is(err, ErrAuditTransactionRequired) {
+		t.Fatalf("RecordTx after rollback must return ErrAuditTransactionRequired, got %v", err)
+	}
+	assertEmptyAuditAppend(t, db, "rolled-back transaction")
+}
+
+func assertEmptyAuditAppend(t *testing.T, db *gorm.DB, label string) {
+	t.Helper()
+	var eventCount int64
+	if err := db.Model(&models.AuditEvent{}).Count(&eventCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("%s left %d audit event(s)", label, eventCount)
+	}
+	var state models.AuditChainState
+	if err := db.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.HeadHash != "" {
+		t.Fatalf("%s changed chain head to %q", label, state.HeadHash)
+	}
+}
+
 func TestP108B_S1_FreshInstallMigration(t *testing.T) {
 	db, _ := newP108BS1DB(t)
 	var states []models.AuditChainState
