@@ -861,10 +861,11 @@ func TestP105C_Migration_AdditiveFromP105BSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// AutoMigrate P1-05C 全模型（additive：加 revoked 三列 + audit_events 表）
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AuditEvent{}); err != nil {
+	// Generic migration owns business tables; dedicated audit migration owns audit_events.
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}); err != nil {
 		t.Fatalf("[Migration] P1-05C AutoMigrate 失败（禁止 destructive migration）: %v", err)
 	}
+	migrateHandlerAudit(t, db)
 
 	// 旧行仍存在；hash byte-for-byte；RevokedAt == nil
 	var got models.Client

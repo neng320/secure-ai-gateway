@@ -74,11 +74,12 @@ func insertLegacyAuditEvent(t *testing.T, db *gorm.DB, event models.AuditEvent) 
 func auditSchemaFingerprint(t *testing.T, db *gorm.DB) string {
 	t.Helper()
 	var objects []struct {
-		Type string `gorm:"column:type"`
-		Name string `gorm:"column:name"`
-		SQL  string `gorm:"column:sql"`
+		Type  string `gorm:"column:type"`
+		Name  string `gorm:"column:name"`
+		Table string `gorm:"column:tbl_name"`
+		SQL   string `gorm:"column:sql"`
 	}
-	if err := db.Raw("SELECT type, name, sql FROM sqlite_master WHERE name IN ('audit_events', 'audit_chain_states', 'idx_audit_events_event_id', 'idx_audit_events_action', 'idx_audit_events_actor_id', 'idx_audit_events_target_type', 'idx_audit_events_target_id', 'idx_audit_events_created_at', 'idx_audit_events_chain_version', 'idx_audit_events_prev_hash', 'idx_audit_events_event_hash', 'idx_audit_chain_states_updated_at', 'audit_events_no_update', 'audit_events_no_delete') ORDER BY type, name").Scan(&objects).Error; err != nil {
+	if err := db.Raw("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name").Scan(&objects).Error; err != nil {
 		t.Fatal(err)
 	}
 	var eventColumns []sqliteTableColumn
@@ -281,19 +282,8 @@ func TestP108B_S1_MigrationIdempotent(t *testing.T) {
 
 func TestP108B_S1_MixedAndPartialChainFailClosed(t *testing.T) {
 	t.Run("mixed events", func(t *testing.T) {
-		path := t.TempDir() + "/mixed.db"
-		db, err := database.Open(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			if sqlDB, err := db.DB(); err == nil {
-				_ = sqlDB.Close()
-			}
-		})
-		if err := db.AutoMigrate(&models.AuditEvent{}); err != nil {
-			t.Fatal(err)
-		}
+		db, _ := newP108BS1DB(t)
+		dropAuditMutationTriggers(t, db)
 		if err := db.Create(&models.AuditEvent{EventID: "legacy", Action: ActionClientCreated, ActorType: "admin", ActorID: "admin", TargetType: "client", TargetID: "client", CreatedAt: time.Now().UTC(), EventHash: "partial"}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -409,6 +399,167 @@ func TestP108B_S11_PartialSchemaMatrixFailsBeforeMutation(t *testing.T) {
 				t.Fatalf("partial schema changed before rejection: before=%s after=%s", before, after)
 			}
 		})
+	}
+}
+
+func createCurrentAuditEventsWithoutState(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := db.Exec(createAuditEventsTableSQL).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range auditEventIndexSQL {
+		if err := db.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestP108B_S12_CurrentColumnsNoStateEmptyFailsClosed(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/empty-current.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	createCurrentAuditEventsWithoutState(t, db)
+	before := auditSchemaFingerprint(t, db)
+	if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("current columns without state must fail closed, got %v", err)
+	}
+	if after := auditSchemaFingerprint(t, db); after != before {
+		t.Fatalf("empty current partial schema changed: before=%s after=%s", before, after)
+	}
+}
+
+func TestP108B_S12_CurrentColumnsNoStateUnchainedRowsFailsClosed(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/unchained-current.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	createCurrentAuditEventsWithoutState(t, db)
+	insertLegacyAuditEvent(t, db, models.AuditEvent{ID: 1, EventID: "unchained-current", Action: ActionClientCreated, ActorType: "admin", ActorID: "admin", TargetType: "client", TargetID: "client", CreatedAt: time.Unix(1788064496, 2).UTC()})
+	before := auditSchemaFingerprint(t, db)
+	if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("current columns without state and unchained rows must fail closed, got %v", err)
+	}
+	if after := auditSchemaFingerprint(t, db); after != before {
+		t.Fatalf("unchained current partial schema changed: before=%s after=%s", before, after)
+	}
+}
+
+func TestP108B_S12_LegacyExtraColumnFailsClosed(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/legacy-extra.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	createLegacyP105CSchema(t, db)
+	if err := db.Exec("ALTER TABLE audit_events ADD COLUMN payload text").Error; err != nil {
+		t.Fatal(err)
+	}
+	before := auditSchemaFingerprint(t, db)
+	if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("legacy extra column must fail closed, got %v", err)
+	}
+	if after := auditSchemaFingerprint(t, db); after != before {
+		t.Fatalf("legacy extra-column schema changed: before=%s after=%s", before, after)
+	}
+}
+
+func TestP108B_S12_CurrentExtraColumnFailsClosed(t *testing.T) {
+	db, _ := newP108BS1DB(t)
+	if err := db.Exec("ALTER TABLE audit_events ADD COLUMN raw_body text").Error; err != nil {
+		t.Fatal(err)
+	}
+	before := auditSchemaFingerprint(t, db)
+	if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("current extra column must fail closed, got %v", err)
+	}
+	if after := auditSchemaFingerprint(t, db); after != before {
+		t.Fatalf("current extra-column schema changed: before=%s after=%s", before, after)
+	}
+}
+
+func TestP108B_S12_StateExtraColumnFailsClosed(t *testing.T) {
+	db, _ := newP108BS1DB(t)
+	if err := db.Exec("ALTER TABLE audit_chain_states ADD COLUMN secret text").Error; err != nil {
+		t.Fatal(err)
+	}
+	before := auditSchemaFingerprint(t, db)
+	if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("chain state extra column must fail closed, got %v", err)
+	}
+	if after := auditSchemaFingerprint(t, db); after != before {
+		t.Fatalf("chain state extra-column schema changed: before=%s after=%s", before, after)
+	}
+}
+
+func TestP108B_S12_FreshIndexNameCollisionRollsBack(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/index-collision.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	if err := db.Exec("CREATE TABLE dummy (id integer)").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("CREATE INDEX idx_audit_events_event_id ON dummy(id)").Error; err != nil {
+		t.Fatal(err)
+	}
+	before := auditSchemaFingerprint(t, db)
+	if err := MigrateIntegrity(db); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("fresh index-name collision must fail closed, got %v", err)
+	}
+	if after := auditSchemaFingerprint(t, db); after != before {
+		t.Fatalf("fresh index collision changed schema: before=%s after=%s", before, after)
+	}
+	var count int64
+	if err := db.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('audit_events', 'audit_chain_states')").Scan(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("fresh index collision must not create audit tables, got %d", count)
+	}
+}
+
+func TestP108B_S12_PostMigrationIndexesExact(t *testing.T) {
+	db, _ := newP108BS1DB(t)
+	if err := verifyExpectedAuditIndexes(db, auditIndexSpecs); err != nil {
+		t.Fatalf("post-migration audit indexes are not exact: %v", err)
+	}
+}
+
+func TestP108B_S12_EventIDUniqueConstraint(t *testing.T) {
+	db, _ := newP108BS1DB(t)
+	svc := NewService(db)
+	if err := svc.Record(testAuditEvent("unique-event-id")); err != nil {
+		t.Fatal(err)
+	}
+	var event models.AuditEvent
+	if err := db.First(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	duplicate := event
+	duplicate.ID = 0
+	duplicate.TargetID = "duplicate-target"
+	if err := db.Create(&duplicate).Error; err == nil {
+		t.Fatal("duplicate event_id insert must fail at the database constraint")
 	}
 }
 

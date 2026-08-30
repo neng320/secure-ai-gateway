@@ -100,7 +100,7 @@ func newKeyFlowEnvWithManager(t *testing.T, globalAPIKey string, manager *secret
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
 		t.Fatal(err)
 	}
 	migrateHandlerAudit(t, db)

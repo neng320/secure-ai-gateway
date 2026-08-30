@@ -74,7 +74,6 @@ const (
 	auditSchemaFreshNoTable auditSchemaFamily = iota
 	auditSchemaLegacyP105C
 	auditSchemaCurrentChain
-	auditSchemaCurrentEmptyNoState
 )
 
 type sqliteTableColumn struct {
@@ -117,6 +116,26 @@ var chainStateColumns = map[string]string{
 	"updated_at":    "datetime",
 }
 
+type auditIndexSpec struct {
+	Name    string
+	Table   string
+	Columns []string
+	Unique  bool
+}
+
+var auditIndexSpecs = []auditIndexSpec{
+	{Name: "idx_audit_events_event_id", Table: "audit_events", Columns: []string{"event_id"}, Unique: true},
+	{Name: "idx_audit_events_action", Table: "audit_events", Columns: []string{"action"}},
+	{Name: "idx_audit_events_actor_id", Table: "audit_events", Columns: []string{"actor_id"}},
+	{Name: "idx_audit_events_target_type", Table: "audit_events", Columns: []string{"target_type"}},
+	{Name: "idx_audit_events_target_id", Table: "audit_events", Columns: []string{"target_id"}},
+	{Name: "idx_audit_events_created_at", Table: "audit_events", Columns: []string{"created_at"}},
+	{Name: "idx_audit_events_chain_version", Table: "audit_events", Columns: []string{"chain_version"}},
+	{Name: "idx_audit_events_prev_hash", Table: "audit_events", Columns: []string{"prev_hash"}},
+	{Name: "idx_audit_events_event_hash", Table: "audit_events", Columns: []string{"event_hash"}},
+	{Name: "idx_audit_chain_states_updated_at", Table: "audit_chain_states", Columns: []string{"updated_at"}},
+}
+
 // MigrateIntegrity owns all AuditEvent schema changes, legacy backfill,
 // verification, and mutation-trigger installation in one SQLite transaction.
 // The pre-migration schema is classified before any audit DDL is executed.
@@ -152,27 +171,15 @@ func MigrateIntegrity(db *gorm.DB) error {
 			if err := backfillLegacyEvents(tx, events); err != nil {
 				return err
 			}
-		case auditSchemaCurrentEmptyNoState:
-			if err := createChainStateTable(tx); err != nil {
-				return err
-			}
-			events, err := loadAuditEvents(tx)
-			if err != nil {
-				return err
-			}
-			if len(events) == 0 {
-				if err := insertChainState(tx, ""); err != nil {
-					return err
-				}
-			} else if err := backfillLegacyEvents(tx, events); err != nil {
-				return err
-			}
 		case auditSchemaCurrentChain:
 			// The current schema has already been classified and is verified below.
 		default:
 			return ErrAuditIntegrity
 		}
 
+		if err := verifyExpectedAuditIndexes(tx, auditIndexSpecs); err != nil {
+			return err
+		}
 		if err := verifyAuditChainDB(tx); err != nil {
 			return err
 		}
@@ -202,6 +209,9 @@ func inspectAuditSchema(db *gorm.DB) (auditSchemaSnapshot, error) {
 		if schema.stateTableExists || len(schema.triggers) != 0 {
 			return schema, auditIntegrityError("audit schema has orphaned integrity objects")
 		}
+		if err := validateIndexNameOwnership(db, auditIndexSpecs); err != nil {
+			return schema, err
+		}
 		schema.family = auditSchemaFreshNoTable
 		return schema, nil
 	}
@@ -210,7 +220,7 @@ func inspectAuditSchema(db *gorm.DB) (auditSchemaSnapshot, error) {
 	if err != nil {
 		return schema, auditIntegrityError("audit event schema unavailable")
 	}
-	if !hasExpectedColumns(schema.eventColumns, legacyAuditColumns) {
+	if countColumns(schema.eventColumns, legacyAuditColumns) != len(legacyAuditColumns) {
 		return schema, auditIntegrityError("audit event legacy schema is incomplete")
 	}
 	chainColumnCount := countColumns(schema.eventColumns, chainAuditColumns)
@@ -219,13 +229,38 @@ func inspectAuditSchema(db *gorm.DB) (auditSchemaSnapshot, error) {
 		if schema.stateTableExists || len(schema.triggers) != 0 {
 			return schema, auditIntegrityError("legacy audit schema has partial integrity objects")
 		}
+		if !hasExactColumns(schema.eventColumns, legacyAuditColumns) {
+			return schema, auditIntegrityError("legacy audit schema has unexpected columns")
+		}
+		if err := validateIndexNameOwnership(db, auditIndexSpecs); err != nil {
+			return schema, err
+		}
+		if err := verifyExpectedAuditIndexes(db, auditIndexSpecs[:6]); err != nil {
+			return schema, err
+		}
 		schema.family = auditSchemaLegacyP105C
 		return schema, nil
 	case len(chainAuditColumns):
+		currentColumns := make(map[string]string, len(legacyAuditColumns)+len(chainAuditColumns))
+		for name, columnType := range legacyAuditColumns {
+			currentColumns[name] = columnType
+		}
+		for name, columnType := range chainAuditColumns {
+			currentColumns[name] = columnType
+		}
+		if !hasExactColumns(schema.eventColumns, currentColumns) {
+			return schema, auditIntegrityError("current audit schema has unexpected columns")
+		}
 		if schema.stateTableExists {
 			schema.stateColumns, err = loadTableColumns(db, "audit_chain_states")
-			if err != nil || !hasExpectedColumns(schema.stateColumns, chainStateColumns) {
+			if err != nil || !hasExactColumns(schema.stateColumns, chainStateColumns) {
 				return schema, auditIntegrityError("chain state schema is incomplete")
+			}
+			if err := validateIndexNameOwnership(db, auditIndexSpecs); err != nil {
+				return schema, err
+			}
+			if err := verifyExpectedAuditIndexes(db, auditIndexSpecs); err != nil {
+				return schema, err
 			}
 			if err := validateExistingTriggerDefinitions(schema.triggers); err != nil {
 				return schema, err
@@ -233,20 +268,7 @@ func inspectAuditSchema(db *gorm.DB) (auditSchemaSnapshot, error) {
 			schema.family = auditSchemaCurrentChain
 			return schema, nil
 		}
-		if len(schema.triggers) != 0 {
-			return schema, auditIntegrityError("chained audit schema has triggers but no chain state")
-		}
-		events, loadErr := loadAuditEvents(db)
-		if loadErr != nil {
-			return schema, loadErr
-		}
-		for _, event := range events {
-			if event.ChainVersion != "" || event.PrevHash != "" || event.EventHash != "" {
-				return schema, auditIntegrityError("chained audit history has no chain state")
-			}
-		}
-		schema.family = auditSchemaCurrentEmptyNoState
-		return schema, nil
+		return schema, auditIntegrityError("current audit schema is missing chain state")
 	default:
 		return schema, auditIntegrityError("audit event chain schema is partial")
 	}
@@ -289,6 +311,10 @@ func hasExpectedColumns(actual map[string]sqliteTableColumn, expected map[string
 	return true
 }
 
+func hasExactColumns(actual map[string]sqliteTableColumn, expected map[string]string) bool {
+	return len(actual) == len(expected) && hasExpectedColumns(actual, expected)
+}
+
 func countColumns(actual map[string]sqliteTableColumn, expected map[string]string) int {
 	count := 0
 	for name := range expected {
@@ -297,6 +323,88 @@ func countColumns(actual map[string]sqliteTableColumn, expected map[string]strin
 		}
 	}
 	return count
+}
+
+type sqliteIndexListRow struct {
+	Name    string `gorm:"column:name"`
+	Unique  int    `gorm:"column:unique"`
+	Partial int    `gorm:"column:partial"`
+}
+
+type sqliteIndexInfoRow struct {
+	Seqno int    `gorm:"column:seqno"`
+	Name  string `gorm:"column:name"`
+}
+
+type auditIndexDefinition struct {
+	Table   string
+	Columns []string
+	Unique  bool
+	Partial bool
+}
+
+func validateIndexNameOwnership(db *gorm.DB, specs []auditIndexSpec) error {
+	for _, spec := range specs {
+		var row struct {
+			Table string `gorm:"column:tbl_name"`
+		}
+		if err := db.Raw("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?", spec.Name).Scan(&row).Error; err != nil {
+			return auditIntegrityError("audit index metadata unavailable")
+		}
+		if row.Table != "" && row.Table != spec.Table {
+			return auditIntegrityError("audit index name collision")
+		}
+	}
+	return nil
+}
+
+func loadIndexDefinitions(db *gorm.DB, table string) (map[string]auditIndexDefinition, error) {
+	var rows []sqliteIndexListRow
+	if err := db.Raw("PRAGMA index_list(" + table + ")").Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	definitions := make(map[string]auditIndexDefinition, len(rows))
+	for _, row := range rows {
+		var info []sqliteIndexInfoRow
+		quotedName := strings.ReplaceAll(row.Name, "'", "''")
+		if err := db.Raw("PRAGMA index_info('" + quotedName + "')").Scan(&info).Error; err != nil {
+			return nil, err
+		}
+		columns := make([]string, len(info))
+		for _, item := range info {
+			if item.Seqno < 0 || item.Seqno >= len(columns) {
+				return nil, auditIntegrityError("audit index metadata unavailable")
+			}
+			columns[item.Seqno] = strings.ToLower(item.Name)
+		}
+		definitions[row.Name] = auditIndexDefinition{Table: table, Columns: columns, Unique: row.Unique == 1, Partial: row.Partial == 1}
+	}
+	return definitions, nil
+}
+
+func verifyExpectedAuditIndexes(db *gorm.DB, specs []auditIndexSpec) error {
+	byTable := map[string][]auditIndexSpec{}
+	for _, spec := range specs {
+		byTable[spec.Table] = append(byTable[spec.Table], spec)
+	}
+	for table, tableSpecs := range byTable {
+		actual, err := loadIndexDefinitions(db, table)
+		if err != nil {
+			return auditIntegrityError("audit index metadata unavailable")
+		}
+		for _, spec := range tableSpecs {
+			got, ok := actual[spec.Name]
+			if !ok || got.Table != spec.Table || got.Unique != spec.Unique || got.Partial || len(got.Columns) != len(spec.Columns) {
+				return auditIntegrityError("audit index definition mismatch")
+			}
+			for i, column := range spec.Columns {
+				if got.Columns[i] != strings.ToLower(column) {
+					return auditIntegrityError("audit index definition mismatch")
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func createFreshAuditSchema(tx *gorm.DB) error {

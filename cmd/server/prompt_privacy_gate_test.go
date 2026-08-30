@@ -168,7 +168,7 @@ func newPrivacyEnv(t *testing.T, captureOn bool) *privacyEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
 		t.Fatal(err)
 	}
 	migrateTestAudit(t, db)

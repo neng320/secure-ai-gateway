@@ -114,42 +114,83 @@ func p108bAuditSQLMutationViolations(path string, source []byte) []string {
 	}
 	normalizedPath := filepath.ToSlash(filepath.Clean(path))
 	violations := []string{}
-	ast.Inspect(file, func(node ast.Node) bool {
-		literal, ok := node.(*ast.BasicLit)
-		if !ok || literal.Kind != token.STRING {
-			return true
-		}
-		value, err := strconv.Unquote(literal.Value)
-		if err != nil {
-			return true
-		}
-		normalized := strings.Join(strings.Fields(strings.ToLower(value)), " ")
+	report := func(value string) {
+		normalized := p108bNormalizeAuditSQL(value)
 		isMutation := strings.Contains(normalized, "update audit_events") ||
 			strings.Contains(normalized, "delete from audit_events") ||
 			strings.Contains(normalized, "drop table audit_events") ||
-			strings.Contains(normalized, "drop trigger audit_events_no_") ||
+			(strings.Contains(normalized, "drop trigger") && strings.Contains(normalized, "audit_events_no_")) ||
 			strings.Contains(normalized, "alter table audit_events")
 		if !isMutation {
-			return true
+			return
 		}
 		if (normalizedPath == migrationPath || strings.HasSuffix(normalizedPath, "/"+migrationPath)) && allowedMigrationSQL[normalized] {
-			return true
+			return
 		}
 		violations = append(violations, path+":"+normalized)
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		if expr, ok := node.(ast.Expr); ok {
+			if value, ok := p108bStaticStringValue(expr); ok {
+				report(value)
+			}
+		}
 		return true
 	})
 	return violations
 }
 
-func TestP108B_S11_StaticGateRejectsRawAuditMutationFixture(t *testing.T) {
-	fixture := []byte(`package fixture
+func p108bStaticStringValue(expr ast.Expr) (string, bool) {
+	switch value := expr.(type) {
+	case *ast.BasicLit:
+		if value.Kind != token.STRING {
+			return "", false
+		}
+		decoded, err := strconv.Unquote(value.Value)
+		return decoded, err == nil
+	case *ast.BinaryExpr:
+		if value.Op != token.ADD {
+			return "", false
+		}
+		left, leftOK := p108bStaticStringValue(value.X)
+		right, rightOK := p108bStaticStringValue(value.Y)
+		return left + right, leftOK && rightOK
+	case *ast.ParenExpr:
+		return p108bStaticStringValue(value.X)
+	default:
+		return "", false
+	}
+}
 
-func mutate(db interface{ Exec(string, ...interface{}) }) {
-	db.Exec("DELETE FROM audit_events WHERE id = 1")
-}`)
-	violations := p108bAuditSQLMutationViolations("internal/handlers/fixture.go", fixture)
-	if len(violations) == 0 {
-		t.Fatal("static gate must reject raw audit_events mutation outside migration.go")
+func p108bNormalizeAuditSQL(value string) string {
+	value = strings.ToLower(value)
+	value = strings.NewReplacer(
+		`"audit_events"`, "audit_events",
+		"`audit_events`", "audit_events",
+		"[audit_events]", "audit_events",
+		`"audit_events_no_update"`, "audit_events_no_update",
+		"`audit_events_no_update`", "audit_events_no_update",
+		"[audit_events_no_update]", "audit_events_no_update",
+		`"audit_events_no_delete"`, "audit_events_no_delete",
+		"`audit_events_no_delete`", "audit_events_no_delete",
+		"[audit_events_no_delete]", "audit_events_no_delete",
+	).Replace(value)
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func TestP108B_S11_StaticGateRejectsRawAuditMutationFixture(t *testing.T) {
+	fixtures := []string{
+		`package fixture; func mutate(db interface{ Exec(string, ...interface{}) }) { db.Exec("DELETE FROM audit_events WHERE id = 1") }`,
+		`package fixture; func mutate(db interface{ Exec(string, ...interface{}) }) { db.Exec("UPDATE \"audit_events\" SET reason = 'x'") }`,
+		"package fixture; func mutate(db interface{ Exec(string, ...interface{}) }) { db.Exec(\"ALTER TABLE [audit_events] ADD COLUMN payload text\") }",
+		"package fixture; func mutate(db interface{ Exec(string, ...interface{}) }) { db.Exec(\"DROP TABLE `audit_events`\") }",
+		`package fixture; func mutate(db interface{ Exec(string, ...interface{}) }) { db.Exec("DROP TRIGGER \"audit_events_no_update\"") }`,
+		`package fixture; func mutate(db interface{ Exec(string, ...interface{}) }) { db.Exec("DELETE FROM " + "\"audit_events\"") }`,
+	}
+	for _, fixture := range fixtures {
+		if violations := p108bAuditSQLMutationViolations("internal/handlers/fixture.go", []byte(fixture)); len(violations) == 0 {
+			t.Fatalf("static gate must reject fixture: %s", fixture)
+		}
 	}
 }
 

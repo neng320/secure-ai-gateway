@@ -87,7 +87,7 @@ func newP104EnvWithStore(t *testing.T, initial http.HandlerFunc, envCapture *cap
 	}
 	env.dbPath = dbPath
 	env.capture = envCapture
-	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
+	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}); err != nil {
 		t.Fatal(err)
 	}
 	migrateHandlerAudit(t, db)
