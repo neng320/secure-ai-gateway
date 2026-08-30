@@ -216,6 +216,13 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 		return
 	}
+	if err := enforceOpenAIRequestLimits(client, req, body); err != nil {
+		writeStructuredAPIError(r, w, http.StatusBadRequest, err.(*APIError))
+		if h.statsService != nil {
+			h.statsService.DecrementRequestsInProgress()
+		}
+		return
+	}
 
 	provider, err := h.resolveProvider(client)
 	if err != nil {
@@ -243,6 +250,45 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.handleNonStreamingRequestWithFallback(w, r, client, req, provider, chatReq, string(body), fallbackModels)
+}
+
+func enforceOpenAIRequestLimits(client *models.Client, req OpenAIChatRequest, body []byte) error {
+	if client.MaxInputTokens > 0 {
+		inputTokens := estimateInputTokens(string(body))
+		if inputTokens > client.MaxInputTokens {
+			return &APIError{Err: APIErrorBody{
+				Message: "Input token count exceeds limit",
+				Code:    "MAX_INPUT_TOKENS_EXCEEDED",
+				Status:  "INVALID_ARGUMENT",
+				Details: []map[string]interface{}{{"limit": client.MaxInputTokens, "received": inputTokens}},
+			}}
+		}
+	}
+	if client.MaxOutputTokens > 0 && req.MaxTokens > client.MaxOutputTokens {
+		return &APIError{Err: APIErrorBody{
+			Message: "Output token count exceeds limit",
+			Code:    "MAX_OUTPUT_TOKENS_EXCEEDED",
+			Status:  "INVALID_ARGUMENT",
+			Details: []map[string]interface{}{{"limit": client.MaxOutputTokens, "requested": req.MaxTokens}},
+		}}
+	}
+	return nil
+}
+
+func (h *OpenAIHandler) logCompletedRequest(r *http.Request, client *models.Client, provider providers.Provider, model string, statusCode, inputTokens, outputTokens int, streaming bool) {
+	_ = h.geminiService.LogRequest(services.RequestRecord{
+		RequestID:    middleware.GetRequestID(r),
+		ClientID:     client.ID,
+		Provider:     provider.Name(),
+		Model:        model,
+		StatusCode:   statusCode,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		ErrorCode:    services.ClassifyUpstreamError(statusCode, nil),
+		IsStreaming:  streaming,
+		Reservation:  services.UsageReservationFromContext(r.Context()),
+	})
+	RecordRequest(client.ID, model, fmt.Sprintf("%d", statusCode), inputTokens, outputTokens, 0)
 }
 
 func parseFallbackModels(fallbackStr string) []string {
@@ -409,6 +455,8 @@ func (h *OpenAIHandler) tryNonStreamingRequest(r *http.Request, w http.ResponseW
 		if isRetryableError(502, err.Error()) {
 			return 0, err
 		}
+		// No upstream response exists on a transport/setup failure, so the
+		// quota middleware's deferred Release remains the charging boundary.
 		writeOpenAIError(r, w, http.StatusBadGateway, "Upstream request failed: "+err.Error(), "api_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
@@ -421,6 +469,7 @@ func (h *OpenAIHandler) tryNonStreamingRequest(r *http.Request, w http.ResponseW
 		if isRetryableError(statusCode, errMsg) {
 			return statusCode, fmt.Errorf("status %d: %s", statusCode, errMsg)
 		}
+		h.logCompletedRequest(r, client, provider, chatReq.Model, statusCode, 0, 0, false)
 		writeOpenAIError(r, w, mapUpstreamStatusToHTTP(statusCode), errMsg, "api_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
@@ -435,6 +484,7 @@ func (h *OpenAIHandler) tryNonStreamingRequest(r *http.Request, w http.ResponseW
 		}
 
 		if client.ToolMode == "pass-through" {
+			h.logCompletedRequest(r, client, provider, chatReq.Model, statusCode, 0, 0, false)
 			toolCallsResp := make([]map[string]interface{}, len(toolCalls))
 			for i, tc := range toolCalls {
 				toolCallsResp[i] = map[string]interface{}{
@@ -488,6 +538,7 @@ func (h *OpenAIHandler) tryNonStreamingRequest(r *http.Request, w http.ResponseW
 		IsStreaming:  false,
 		HasTools:     len(toolNames) > 0,
 		ToolNames:    strings.Join(toolNames, ","),
+		Reservation:  services.UsageReservationFromContext(r.Context()),
 	})
 	RecordRequest(client.ID, chatReq.Model, fmt.Sprintf("%d", statusCode), it, ot, latencyMs)
 	if h.statsService != nil {
@@ -555,6 +606,7 @@ func (h *OpenAIHandler) tryStreamingRequest(r *http.Request, w http.ResponseWrit
 		if isRetryableError(resp.StatusCode, errMsg) {
 			return resp.StatusCode, fmt.Errorf("status %d: %s", resp.StatusCode, errMsg)
 		}
+		h.logCompletedRequest(r, client, provider, chatReq.Model, resp.StatusCode, 0, 0, true)
 		writeOpenAIError(r, w, mapUpstreamStatusToHTTP(resp.StatusCode), errMsg, "api_error")
 		if h.statsService != nil {
 			h.statsService.DecrementRequestsInProgress()
@@ -650,6 +702,7 @@ toolLoop:
 		}
 
 		if client.ToolMode == "pass-through" {
+			h.logCompletedRequest(r, client, provider, chatReq.Model, resp.StatusCode, 0, 0, true)
 			toolCallsChunk := map[string]interface{}{"tool_calls": []map[string]interface{}{{"id": toolCallID, "index": 0, "type": "function", "function": map[string]interface{}{"name": toolCallName, "arguments": toolCallArgs}}}}
 			sendSSEChunk(w, flusher, responseID, req.Model, created, toolCallsChunk, "tool_calls")
 			fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -704,6 +757,7 @@ toolLoop:
 		IsStreaming:  true,
 		HasTools:     len(toolNames) > 0,
 		ToolNames:    strings.Join(toolNames, ","),
+		Reservation:  services.UsageReservationFromContext(r.Context()),
 	})
 	RecordRequest(client.ID, chatReq.Model, fmt.Sprintf("%d", resp.StatusCode), it, ot, int(time.Since(start).Milliseconds()))
 	if h.statsService != nil {

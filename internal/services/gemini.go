@@ -21,11 +21,12 @@ import (
 type GeminiService struct {
 	db              *gorm.DB
 	cfg             *config.Config
+	usage           *UsageLedger
 	onRequestLogged func() // called after each request is logged, used for live dashboard updates
 }
 
 func NewGeminiService(db *gorm.DB, cfg *config.Config) *GeminiService {
-	return &GeminiService{db: db, cfg: cfg}
+	return &GeminiService{db: db, cfg: cfg, usage: NewUsageLedger(db)}
 }
 
 // GetConfig returns the service's config for access to provider configurations.
@@ -202,6 +203,7 @@ type RequestRecord struct {
 	IsStreaming  bool
 	HasTools     bool
 	ToolNames    string
+	Reservation  *UsageReservation
 }
 
 // bounded 稳定错误码集合（SEC-003）。固定取值、固定语义，禁止拼接任何动态文本。
@@ -274,15 +276,25 @@ func (s *GeminiService) LogRequest(rec RequestRecord) error {
 		CreatedAt:    time.Now(),
 	}
 
-	if err := s.db.Create(entry).Error; err != nil {
-		if isClientGoneForeignKey(err) {
-			// P1-05B：client 已被删除——禁止 late-write 重建行；请求正常结束
-			return nil
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(entry).Error; err != nil {
+			if isClientGoneForeignKey(err) {
+				// P1-05B：client 已被删除——禁止 late-write 重建行；请求正常结束
+				return nil
+			}
+			return fmt.Errorf("failed to log request: %w", err)
 		}
-		return fmt.Errorf("failed to log request: %w", err)
+		if rec.Reservation != nil {
+			return rec.Reservation.finalizeTx(tx, rec.InputTokens, rec.OutputTokens)
+		}
+		return s.usage.addTx(tx, rec.ClientID, rec.InputTokens, rec.OutputTokens, UsageDate(time.Now()))
+	})
+	if err != nil {
+		return err
 	}
-
-	err := s.updateDailyUsage(rec.ClientID, rec.InputTokens, rec.OutputTokens, rec.StatusCode)
+	if rec.Reservation != nil {
+		rec.Reservation.markFinalized()
+	}
 
 	// Notify dashboard hub about the new request
 	if s.onRequestLogged != nil {
@@ -293,35 +305,7 @@ func (s *GeminiService) LogRequest(rec RequestRecord) error {
 }
 
 func (s *GeminiService) updateDailyUsage(clientID string, inputTokens, outputTokens, statusCode int) error {
-	today := time.Now().Truncate(24 * time.Hour)
-
-	var usage models.DailyUsage
-	err := s.db.Where("client_id = ? AND date = ?", clientID, today).First(&usage).Error
-
-	if err != nil && err != gorm.ErrRecordNotFound {
-		return err
-	}
-
-	if err == gorm.ErrRecordNotFound {
-		usage = models.DailyUsage{
-			ClientID: clientID,
-			Date:     today,
-		}
-	}
-
-	usage.TotalRequests++
-	usage.TotalInputTokens += inputTokens
-	usage.TotalOutputTokens += outputTokens
-
-	if err := s.db.Save(&usage).Error; err != nil {
-		if isClientGoneForeignKey(err) {
-			// P1-05B：同上——client 已删除，usage 行不得重建
-			return nil
-		}
-		return fmt.Errorf("failed to update daily usage: %w", err)
-	}
-
-	return nil
+	return s.usage.Add(clientID, inputTokens, outputTokens)
 }
 
 func (s *GeminiService) isModelAllowed(model string) bool {

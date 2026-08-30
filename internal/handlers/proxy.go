@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,6 +98,7 @@ func (h *ProxyHandler) GenerateContent(w http.ResponseWriter, r *http.Request) {
 		ErrorCode:    services.ClassifyUpstreamError(statusCode, err),
 		IsStreaming:  false,
 		HasTools:     false,
+		Reservation:  services.UsageReservationFromContext(r.Context()),
 	})
 	RecordRequest(client.ID, model, fmt.Sprintf("%d", statusCode), inputTokens, outputTokens, latencyMs)
 
@@ -105,11 +107,11 @@ func (h *ProxyHandler) GenerateContent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-RateLimit-Limit-Minute", string(rune(client.RateLimitMinute)))
-	w.Header().Set("X-RateLimit-Limit-Hour", string(rune(client.RateLimitHour)))
-	w.Header().Set("X-RateLimit-Limit-Day", string(rune(client.RateLimitDay)))
-	w.Header().Set("X-TokenLimit-Input", string(rune(client.MaxInputTokens)))
-	w.Header().Set("X-TokenLimit-Output", string(rune(client.MaxOutputTokens)))
+	w.Header().Set("X-RateLimit-Limit-Minute", strconv.Itoa(client.RateLimitMinute))
+	w.Header().Set("X-RateLimit-Limit-Hour", strconv.Itoa(client.RateLimitHour))
+	w.Header().Set("X-RateLimit-Limit-Day", strconv.Itoa(client.RateLimitDay))
+	w.Header().Set("X-TokenLimit-Input", strconv.Itoa(client.MaxInputTokens))
+	w.Header().Set("X-TokenLimit-Output", strconv.Itoa(client.MaxOutputTokens))
 
 	w.WriteHeader(statusCode)
 	if respBody != nil {
@@ -162,7 +164,9 @@ func (h *ProxyHandler) capOutputTokens(client *models.Client, body []byte) []byt
 }
 
 func estimateInputTokens(text string) int {
-	return len(text) / 4
+	// Conservative upper bound only. This is deliberately not presented as an
+	// exact tokenizer; a byte can account for at most one token in the V1 gate.
+	return len(text)
 }
 
 func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +264,7 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 		LatencyMs:   int(time.Since(streamStart).Milliseconds()),
 		ErrorCode:   services.ClassifyUpstreamError(resp.StatusCode, nil),
 		IsStreaming: true,
+		Reservation: services.UsageReservationFromContext(r.Context()),
 	})
 
 	if h.statsService != nil {
@@ -297,6 +302,13 @@ type APIErrorBody struct {
 	Code    string                   `json:"code"`
 	Status  string                   `json:"status"`
 	Details []map[string]interface{} `json:"details,omitempty"`
+}
+
+func writeStructuredAPIError(r *http.Request, w http.ResponseWriter, statusCode int, apiErr *APIError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("x-request-id", middleware.GetRequestID(r))
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(apiErr)
 }
 
 func (e *APIError) Error() string {

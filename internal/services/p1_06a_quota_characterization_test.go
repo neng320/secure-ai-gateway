@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -65,31 +66,36 @@ func (e *p106aUsageEnv) record(requestID string, inputTokens, outputTokens, stat
 func (e *p106aUsageEnv) usage(t *testing.T) models.DailyUsage {
 	t.Helper()
 	var usage models.DailyUsage
-	today := time.Now().Truncate(24 * time.Hour)
+	today := UsageDate(time.Now())
 	if err := e.db.Where("client_id = ? AND date = ?", e.client.ID, today).First(&usage).Error; err != nil {
 		t.Fatal(err)
 	}
 	return usage
 }
 
-// G–I: quota values are persisted and reported, but the current request/logging path
-// does not consult them as a preflight enforcement gate.
-func TestP106A_GHI_QuotaFieldsAreNotEnforcedByAccountingPath(t *testing.T) {
+// G–I: request/token quota reservations are enforced before downstream and
+// completed usage charges the actual observed token values.
+func TestP106B_GHI_QuotaReservationAndAtomicCharge(t *testing.T) {
 	env := newP106aUsageEnv(t)
-	if err := env.record("p106a-g-1", 20, 30, 200, false); err != nil {
+	ledger := NewUsageLedger(env.db)
+	reservation, err := ledger.Reserve(env.client)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := env.record("p106a-g-2", 20, 30, 200, false); err != nil {
+	if err := reservation.Finalize(2, 3); err != nil {
 		t.Fatal(err)
 	}
 	usage := env.usage(t)
-	if usage.TotalRequests != 2 || usage.TotalInputTokens != 40 || usage.TotalOutputTokens != 60 {
-		t.Fatalf("[G/H/I] accounting should reflect both calls and tokens, got %+v", usage)
+	if usage.TotalRequests != 1 || usage.TotalInputTokens != 2 || usage.TotalOutputTokens != 3 || usage.ReservedRequests != 0 || usage.ReservedInputTokens != 0 || usage.ReservedOutputTokens != 0 {
+		t.Fatalf("[G/H/I] reservation finalize should charge actual values and release reservation: %+v", usage)
 	}
-	t.Logf("[G/H/I CURRENT] QuotaRequestsDay=%d, input=%d, output=%d do not block accounting: usage=%+v", env.client.QuotaRequestsDay, env.client.QuotaInputTokensDay, env.client.QuotaOutputTokensDay, usage)
+	if _, err := ledger.Reserve(env.client); !errors.Is(err, ErrQuotaRequestsExceeded) {
+		t.Fatalf("[G] second request should be rejected at request quota: %v", err)
+	}
+	t.Logf("[G/H/I FIXED] quotas reserve before downstream and finalize actual usage: request=%d input=%d output=%d", env.client.QuotaRequestsDay, env.client.QuotaInputTokensDay, env.client.QuotaOutputTokensDay)
 }
 
-func TestP106A_J_ConcurrentDailyUsageCharacterization(t *testing.T) {
+func TestP106B_J_ConcurrentDailyUsageIsAtomic(t *testing.T) {
 	env := newP106aUsageEnv(t)
 	const calls = 32
 	start := make(chan struct{})
@@ -118,14 +124,13 @@ func TestP106A_J_ConcurrentDailyUsageCharacterization(t *testing.T) {
 	if successes.Load() == 0 {
 		t.Fatalf("[J] concurrent characterization produced no successful updates: failures=%d", failures.Load())
 	}
-	if int32(usage.TotalRequests) != successes.Load() {
-		t.Logf("[J KNOWN-GAP] read-modify-save is not a single atomic increment: calls=%d successes=%d failures=%d stored_requests=%d", calls, successes.Load(), failures.Load(), usage.TotalRequests)
-	} else {
-		t.Logf("[J CURRENT] all successful concurrent updates were retained: calls=%d failures=%d usage=%+v; implementation still uses read-modify-save", calls, failures.Load(), usage)
+	if int32(usage.TotalRequests) != successes.Load() || int32(usage.TotalInputTokens) != successes.Load() || int32(usage.TotalOutputTokens) != successes.Load() {
+		t.Fatalf("[J] atomic accounting must retain every successful update: calls=%d successes=%d failures=%d usage=%+v", calls, successes.Load(), failures.Load(), usage)
 	}
+	t.Logf("[J FIXED] atomic DailyUsage upsert retained all %d successful concurrent updates", successes.Load())
 }
 
-func TestP106A_K_StreamingUsageAccounting(t *testing.T) {
+func TestP106B_K_StreamingUsageAccounting(t *testing.T) {
 	env := newP106aUsageEnv(t)
 	if err := env.record("p106a-k-1", 7, 11, 200, true); err != nil {
 		t.Fatal(err)
@@ -141,18 +146,18 @@ func TestP106A_K_StreamingUsageAccounting(t *testing.T) {
 	if usage.TotalRequests != 1 || usage.TotalInputTokens != 7 || usage.TotalOutputTokens != 11 {
 		t.Fatalf("[K] streaming usage should charge once: %+v", usage)
 	}
-	t.Logf("[K CURRENT] streaming request logs once and charges usage once: %+v", usage)
+	t.Logf("[K FIXED] streaming request logs once and charges usage once: %+v", usage)
 }
 
-func TestP106A_DailyUsageBoundaryIsUTCAligned(t *testing.T) {
+func TestP106B_DailyUsageBoundaryIsUTCAligned(t *testing.T) {
 	boundary := time.Now().Truncate(24 * time.Hour).UTC()
 	if boundary.Hour() != 0 || boundary.Minute() != 0 || boundary.Second() != 0 {
 		t.Fatalf("[supporting fact] daily usage boundary should align to UTC midnight, got %v", boundary)
 	}
-	t.Logf("[CURRENT] DailyUsage date uses time.Now().Truncate(24h), aligned to UTC midnight: %v", boundary)
+	t.Logf("[FIXED] DailyUsage date uses UsageDate, aligned to UTC midnight: %v", boundary)
 }
 
-func TestP106A_AccountingErrorDoesNotHideInput(t *testing.T) {
+func TestP106B_AccountingErrorDoesNotHideInput(t *testing.T) {
 	env := newP106aUsageEnv(t)
 	if err := env.record(fmt.Sprintf("%s-error", env.client.ID), 1, 1, 500, false); err != nil {
 		t.Fatal(err)
@@ -164,5 +169,5 @@ func TestP106A_AccountingErrorDoesNotHideInput(t *testing.T) {
 	if entry.ErrorCode != "" || entry.StatusCode != 500 {
 		t.Fatalf("[L supporting fact] expected current raw accounting metadata, got %+v", entry)
 	}
-	t.Log("[L CURRENT] direct LogRequest records a 500 as metadata; request-path error response mapping is handler-specific")
+	t.Log("[L FIXED] direct LogRequest records a 500 as metadata; request-path error response mapping is handler-specific")
 }

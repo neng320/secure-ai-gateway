@@ -1,76 +1,50 @@
 package middleware
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"time"
 
 	"ai-gateway/internal/models"
-
-	"github.com/patrickmn/go-cache"
 )
 
+type Clock func() time.Time
+
 type RateLimiter struct {
-	cache     *cache.Cache
-	rateLimit sync.Map
+	clock  Clock
+	limits sync.Map // client ID -> *clientLimits
 }
 
 type clientLimits struct {
-	minute *tokenBucket
-	hour   *tokenBucket
-	day    *tokenBucket
+	mu     sync.Mutex
+	minute rateWindow
+	hour   rateWindow
+	day    rateWindow
 }
 
-type tokenBucket struct {
+type rateWindow struct {
 	capacity   int
 	tokens     int
+	window     time.Duration
 	lastRefill time.Time
-	mu         sync.Mutex
 }
 
-func newTokenBucket(capacity int) *tokenBucket {
-	return &tokenBucket{
-		capacity:   capacity,
-		tokens:     capacity,
-		lastRefill: time.Now(),
-	}
-}
-
-func (tb *tokenBucket) refill() {
-	now := time.Now()
-	elapsed := now.Sub(tb.lastRefill)
-
-	if elapsed >= time.Minute {
-		tb.tokens = tb.capacity
-		tb.lastRefill = now
-	}
-}
-
-func (tb *tokenBucket) tryConsume() bool {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	tb.refill()
-
-	if tb.tokens > 0 {
-		tb.tokens--
-		return true
-	}
-	return false
-}
-
-func (tb *tokenBucket) remaining() int {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	tb.refill()
-	return tb.tokens
+func newRateWindow(capacity int, window time.Duration, now time.Time) rateWindow {
+	return rateWindow{capacity: capacity, tokens: capacity, window: window, lastRefill: now}
 }
 
 func NewRateLimiter() *RateLimiter {
-	return &RateLimiter{
-		cache: cache.New(1*time.Hour, 24*time.Hour),
+	return NewRateLimiterWithClock(time.Now)
+}
+
+func NewRateLimiterWithClock(clock Clock) *RateLimiter {
+	if clock == nil {
+		clock = time.Now
 	}
+	return &RateLimiter{clock: clock}
 }
 
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
@@ -83,56 +57,197 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 		limits, err := rl.getOrCreateLimits(client)
 		if err != nil {
-			http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
+			writeRateLimitError(w, rateLimitError{code: "RATE_LIMIT_CONFIGURATION_INVALID", message: "rate limit configuration invalid", status: http.StatusInternalServerError})
 			return
 		}
 
-		if !limits.minute.tryConsume() {
-			w.Header().Set("X-RateLimit-Remaining", "0")
-			w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(1*time.Minute).Unix()))
-			http.Error(w, `{"error": "Rate limit exceeded (minute)"}`, http.StatusTooManyRequests)
+		result := limits.tryConsume(client.RateLimitMinute, client.RateLimitHour, client.RateLimitDay, rl.clock())
+		if !result.allowed {
+			writeRateLimitError(w, result.err)
 			return
 		}
 
-		if !limits.hour.tryConsume() {
-			w.Header().Set("X-RateLimit-Remaining", "0")
-			w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(1*time.Hour).Unix()))
-			http.Error(w, `{"error": "Rate limit exceeded (hour)"}`, http.StatusTooManyRequests)
-			return
-		}
-
-		if !limits.day.tryConsume() {
-			w.Header().Set("X-RateLimit-Remaining", "0")
-			w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(24*time.Hour).Unix()))
-			http.Error(w, `{"error": "Rate limit exceeded (day)"}`, http.StatusTooManyRequests)
-			return
-		}
-
-		w.Header().Set("X-RateLimit-Remaining-Minute", fmt.Sprintf("%d", limits.minute.remaining()))
-		w.Header().Set("X-RateLimit-Remaining-Hour", fmt.Sprintf("%d", limits.hour.remaining()))
-		w.Header().Set("X-RateLimit-Remaining-Day", fmt.Sprintf("%d", limits.day.remaining()))
-
+		setRateLimitHeaders(w, client, result.remaining)
 		next.ServeHTTP(w, r)
 	})
 }
 
+type rateLimitError struct {
+	code       string
+	message    string
+	window     string
+	reset      time.Time
+	status     int
+	limit      int
+	remaining  rateLimitRemaining
+	limits     rateLimitRemaining
+	retryAfter int
+}
+
+type consumeResult struct {
+	allowed   bool
+	remaining rateLimitRemaining
+	err       rateLimitError
+}
+
+type rateLimitRemaining struct {
+	minute int
+	hour   int
+	day    int
+}
+
+func (limits *clientLimits) tryConsume(minuteCapacity, hourCapacity, dayCapacity int, now time.Time) consumeResult {
+	limits.mu.Lock()
+	defer limits.mu.Unlock()
+
+	limits.minute.adjustCapacity(minuteCapacity, now)
+	limits.hour.adjustCapacity(hourCapacity, now)
+	limits.day.adjustCapacity(dayCapacity, now)
+	limits.minute.refill(now)
+	limits.hour.refill(now)
+	limits.day.refill(now)
+
+	windows := []*rateWindow{&limits.minute, &limits.hour, &limits.day}
+	names := []string{"minute", "hour", "day"}
+	for i, window := range windows {
+		if window.capacity <= 0 || window.tokens <= 0 {
+			for j := 0; j < i; j++ {
+				windows[j].tokens++
+			}
+			reset := window.lastRefill.Add(window.window)
+			retryAfter := int(math.Ceil(reset.Sub(now).Seconds()))
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			return consumeResult{err: rateLimitError{
+				code:    "RATE_LIMIT_EXCEEDED",
+				message: "rate limit exceeded",
+				window:  names[i],
+				reset:   reset,
+				status:  http.StatusTooManyRequests,
+				limit:   window.capacity,
+				remaining: rateLimitRemaining{
+					minute: limits.minute.tokens,
+					hour:   limits.hour.tokens,
+					day:    limits.day.tokens,
+				},
+				limits: rateLimitRemaining{
+					minute: limits.minute.capacity,
+					hour:   limits.hour.capacity,
+					day:    limits.day.capacity,
+				},
+				retryAfter: retryAfter,
+			}}
+		}
+		window.tokens--
+	}
+
+	return consumeResult{
+		allowed: true,
+		remaining: rateLimitRemaining{
+			minute: limits.minute.tokens,
+			hour:   limits.hour.tokens,
+			day:    limits.day.tokens,
+		},
+	}
+}
+
+func (window *rateWindow) adjustCapacity(capacity int, now time.Time) {
+	if capacity == window.capacity {
+		return
+	}
+	consumed := window.capacity - window.tokens
+	if consumed < 0 {
+		consumed = 0
+	}
+	window.capacity = capacity
+	window.tokens = capacity - consumed
+	if window.tokens < 0 {
+		window.tokens = 0
+	}
+	if window.tokens > capacity {
+		window.tokens = capacity
+	}
+	if window.lastRefill.IsZero() {
+		window.lastRefill = now
+	}
+}
+
+func (window *rateWindow) refill(now time.Time) {
+	if now.Sub(window.lastRefill) >= window.window {
+		window.tokens = window.capacity
+		window.lastRefill = now
+	}
+}
+
 func (rl *RateLimiter) getOrCreateLimits(client *models.Client) (*clientLimits, error) {
-	key := "limits:" + client.ID
-
-	if cached, found := rl.cache.Get(key); found {
-		return cached.(*clientLimits), nil
+	if client == nil {
+		return nil, fmt.Errorf("nil client")
 	}
-
-	limits := &clientLimits{
-		minute: newTokenBucket(client.RateLimitMinute),
-		hour:   newTokenBucket(client.RateLimitHour),
-		day:    newTokenBucket(client.RateLimitDay),
+	now := rl.clock()
+	candidate := &clientLimits{
+		minute: newRateWindow(client.RateLimitMinute, time.Minute, now),
+		hour:   newRateWindow(client.RateLimitHour, time.Hour, now),
+		day:    newRateWindow(client.RateLimitDay, 24*time.Hour, now),
 	}
-
-	rl.cache.Set(key, limits, 24*time.Hour)
-	return limits, nil
+	actual, _ := rl.limits.LoadOrStore(client.ID, candidate)
+	return actual.(*clientLimits), nil
 }
 
 func (rl *RateLimiter) ResetClient(clientID string) {
-	rl.cache.Delete("limits:" + clientID)
+	rl.limits.Delete(clientID)
+}
+
+func setRateLimitHeaders(w http.ResponseWriter, client *models.Client, remaining rateLimitRemaining) {
+	w.Header().Set("X-RateLimit-Limit-Minute", fmt.Sprintf("%d", client.RateLimitMinute))
+	w.Header().Set("X-RateLimit-Limit-Hour", fmt.Sprintf("%d", client.RateLimitHour))
+	w.Header().Set("X-RateLimit-Limit-Day", fmt.Sprintf("%d", client.RateLimitDay))
+	w.Header().Set("X-RateLimit-Remaining-Minute", fmt.Sprintf("%d", remaining.minute))
+	w.Header().Set("X-RateLimit-Remaining-Hour", fmt.Sprintf("%d", remaining.hour))
+	w.Header().Set("X-RateLimit-Remaining-Day", fmt.Sprintf("%d", remaining.day))
+}
+
+func writeRateLimitError(w http.ResponseWriter, err rateLimitError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", rateLimitErrorRemaining(err)))
+	w.Header().Set("X-RateLimit-Remaining-Minute", fmt.Sprintf("%d", err.remaining.minute))
+	w.Header().Set("X-RateLimit-Remaining-Hour", fmt.Sprintf("%d", err.remaining.hour))
+	w.Header().Set("X-RateLimit-Remaining-Day", fmt.Sprintf("%d", err.remaining.day))
+	if !err.reset.IsZero() {
+		w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", err.reset.Unix()))
+		retryAfter := err.retryAfter
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+	}
+	if err.limit >= 0 {
+		w.Header().Set("X-RateLimit-Limit-Minute", fmt.Sprintf("%d", err.limits.minute))
+		w.Header().Set("X-RateLimit-Limit-Hour", fmt.Sprintf("%d", err.limits.hour))
+		w.Header().Set("X-RateLimit-Limit-Day", fmt.Sprintf("%d", err.limits.day))
+	}
+	if err.status == 0 {
+		err.status = http.StatusTooManyRequests
+	}
+	w.WriteHeader(err.status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]string{
+			"code":    err.code,
+			"message": err.message,
+			"window":  err.window,
+		},
+	})
+}
+
+func rateLimitErrorRemaining(err rateLimitError) int {
+	switch err.window {
+	case "minute":
+		return err.remaining.minute
+	case "hour":
+		return err.remaining.hour
+	case "day":
+		return err.remaining.day
+	default:
+		return 0
+	}
 }

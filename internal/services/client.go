@@ -58,6 +58,13 @@ type ClientService struct {
 	audit *audit.Service
 }
 
+func clientDefault(value, fallback int) int {
+	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
 func NewClientService(db *gorm.DB) *ClientService {
 	return &ClientService{db: db, audit: audit.NewService(db)}
 }
@@ -104,14 +111,14 @@ func (s *ClientService) createClient(name, description, keyType, keyPrefix strin
 		APIKeyHash:           apiKeyHash,
 		KeyPrefix:            keyPrefix,
 		IsActive:             true,
-		RateLimitMinute:      cfg.Defaults.RateLimit.RequestsPerMinute,
-		RateLimitHour:        cfg.Defaults.RateLimit.RequestsPerHour,
-		RateLimitDay:         cfg.Defaults.RateLimit.RequestsPerDay,
-		QuotaInputTokensDay:  cfg.Defaults.Quota.MaxInputTokensPerDay,
-		QuotaOutputTokensDay: cfg.Defaults.Quota.MaxOutputTokensPerDay,
-		QuotaRequestsDay:     cfg.Defaults.Quota.MaxRequestsPerDay,
-		MaxInputTokens:       cfg.Defaults.Quota.MaxInputTokens,
-		MaxOutputTokens:      cfg.Defaults.Quota.MaxOutputTokens,
+		RateLimitMinute:      clientDefault(cfg.Defaults.RateLimit.RequestsPerMinute, 60),
+		RateLimitHour:        clientDefault(cfg.Defaults.RateLimit.RequestsPerHour, 1000),
+		RateLimitDay:         clientDefault(cfg.Defaults.RateLimit.RequestsPerDay, 10000),
+		QuotaInputTokensDay:  clientDefault(cfg.Defaults.Quota.MaxInputTokensPerDay, 1000000),
+		QuotaOutputTokensDay: clientDefault(cfg.Defaults.Quota.MaxOutputTokensPerDay, 500000),
+		QuotaRequestsDay:     clientDefault(cfg.Defaults.Quota.MaxRequestsPerDay, 1000),
+		MaxInputTokens:       clientDefault(cfg.Defaults.Quota.MaxInputTokens, 1000000),
+		MaxOutputTokens:      clientDefault(cfg.Defaults.Quota.MaxOutputTokens, 8192),
 		CreatedAt:            time.Now(),
 		UpdatedAt:            time.Now(),
 	}
