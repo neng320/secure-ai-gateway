@@ -17,9 +17,10 @@ import (
 )
 
 type p106b1PublicGateway struct {
-	api   *httptest.Server
-	deps  gatewayDeps
-	calls *int32
+	api      *httptest.Server
+	deps     gatewayDeps
+	calls    *int32
+	lastSeen *testLastSeenPool
 }
 
 func newP106b1PublicGateway(t *testing.T) *p106b1PublicGateway {
@@ -52,16 +53,29 @@ func newP106b1PublicGateway(t *testing.T) *p106b1PublicGateway {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
+	lastSeen := attachTestLastSeenPool(db)
 	t.Cleanup(func() {
-		if sqlDB, err := db.DB(); err == nil {
-			_ = sqlDB.Close()
+		if err := closeTestLastSeenDB(db, lastSeen); err != nil {
+			t.Errorf("close p106b1 test database: %v", err)
 		}
 	})
 
 	deps := newGatewayDeps(cfg, cfg, db, false, nil, nil)
 	api := httptest.NewServer(buildAPIRouter(deps))
 	t.Cleanup(api.Close)
-	return &p106b1PublicGateway{api: api, deps: deps, calls: &calls}
+	return &p106b1PublicGateway{api: api, deps: deps, calls: &calls, lastSeen: lastSeen}
+}
+
+func (e *p106b1PublicGateway) doPublicRequest(t *testing.T, request *http.Request) (*http.Response, error) {
+	t.Helper()
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusUnauthorized {
+		e.lastSeen.waitForCompletion(t)
+	}
+	return response, nil
 }
 
 func TestP106B1_PublicGenerativeRoutesBlockExhaustedRequestQuota(t *testing.T) {
@@ -96,7 +110,7 @@ func TestP106B1_PublicGenerativeRoutesBlockExhaustedRequestQuota(t *testing.T) {
 			}
 			request.Header.Set("Authorization", "Bearer "+apiKey)
 			request.Header.Set("Content-Type", "application/json")
-			response, err := http.DefaultClient.Do(request)
+			response, err := env.doPublicRequest(t, request)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -76,6 +76,16 @@ P1-07 overall：✅ COMPLETE
   P1-08 不在本任务范围内。
 ```
 
+### P1-08 Audit Logging 执行状态（2026-08-30）
+
+```text
+P1-08A Audit Logging Characterization ✅（当前分支；tests/docs only）
+  固化 P1-05C 六个 lifecycle action、同事务 rollback、无 FK 保留、
+  application-only append-only 边界，以及登录/配置/诊断/离线操作的审计缺口。
+P1-08B Audit Logging Enforcement ⛔ NOT STARTED
+P1-08 overall：🟡 VERIFYING（不得视为 COMPLETE）
+```
+
 ### Hardening Backlog（非阻塞，SEC-002 保持 CLOSED）
 
 | ID | 描述 | 来源 | 状态 |

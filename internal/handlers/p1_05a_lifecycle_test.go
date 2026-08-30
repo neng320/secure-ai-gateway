@@ -16,7 +16,9 @@ package handlers
 // 仍留待 P1-05C：REVOKED 状态 / RevokedAt / RevokedBy / Reason / append-only AuditEvent。
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -55,6 +57,109 @@ type p105Env struct {
 	rateLimiter *mw.RateLimiter
 	api         http.Handler // auth middleware + rate limiter + 200 next
 	admin       http.Handler
+	lastSeen    *p105LastSeenPool
+}
+
+// p105LastSeenPool is a test-only ConnPool wrapper. The real AuthMiddleware
+// launches ClientService.UpdateLastSeen asynchronously, so shared P105
+// fixtures must wait for that side effect before SQLite cleanup.
+type p105LastSeenPool struct {
+	gorm.ConnPool
+	completed chan struct{}
+}
+
+func newP105LastSeenPool(pool gorm.ConnPool) *p105LastSeenPool {
+	return &p105LastSeenPool{ConnPool: pool, completed: make(chan struct{})}
+}
+
+func (p *p105LastSeenPool) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	result, err := p.ConnPool.ExecContext(ctx, query, args...)
+	p.signalIfLastSeen(query)
+	return result, err
+}
+
+func (p *p105LastSeenPool) GetDBConn() (*sql.DB, error) {
+	if sqlDB, ok := p.ConnPool.(*sql.DB); ok {
+		return sqlDB, nil
+	}
+	return nil, errors.New("P105 test pool has no underlying database connection")
+}
+
+func (p *p105LastSeenPool) signalIfLastSeen(query string) {
+	if isP105LastSeenUpdate(query) {
+		p.completed <- struct{}{}
+	}
+}
+
+func (p *p105LastSeenPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	beginner, ok := p.ConnPool.(gorm.TxBeginner)
+	if !ok {
+		return nil, errors.New("P105 test pool cannot begin transaction")
+	}
+	tx, err := beginner.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &p105LastSeenTx{Tx: tx, pool: p}, nil
+}
+
+type p105LastSeenTx struct {
+	*sql.Tx
+	pool          *p105LastSeenPool
+	lastSeenWrite bool
+}
+
+func (tx *p105LastSeenTx) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	result, err := tx.Tx.ExecContext(ctx, query, args...)
+	if isP105LastSeenUpdate(query) {
+		tx.lastSeenWrite = true
+	}
+	return result, err
+}
+
+func (tx *p105LastSeenTx) Commit() error {
+	err := tx.Tx.Commit()
+	if tx.lastSeenWrite {
+		tx.pool.completed <- struct{}{}
+	}
+	return err
+}
+
+func (tx *p105LastSeenTx) Rollback() error {
+	err := tx.Tx.Rollback()
+	if tx.lastSeenWrite {
+		tx.pool.completed <- struct{}{}
+	}
+	return err
+}
+
+func isP105LastSeenUpdate(query string) bool {
+	query = strings.ToLower(strings.ReplaceAll(query, "`", ""))
+	return strings.Contains(query, "update clients set last_seen")
+}
+
+func (p *p105LastSeenPool) waitForCompletion(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.completed:
+	case <-t.Context().Done():
+		t.Fatal("P105 test context canceled before UpdateLastSeen completed")
+	}
+}
+
+func (e *p105Env) closeDB() {
+	if e.lastSeen != nil {
+		if sqlDB, ok := e.lastSeen.ConnPool.(*sql.DB); ok {
+			_ = sqlDB.Close()
+		}
+		e.lastSeen = nil
+		return
+	}
+	if e.db != nil {
+		if sqlDB, err := e.db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	}
 }
 
 func newP105Env(t *testing.T) *p105Env {
@@ -69,10 +174,12 @@ func newP105Env(t *testing.T) *p105Env {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
+	lastSeen := newP105LastSeenPool(db.ConnPool)
+	db.ConnPool = lastSeen
+	db.Statement.ConnPool = lastSeen
 	t.Cleanup(func() {
-		if sqlDB, e := db.DB(); e == nil {
-			_ = sqlDB.Close()
-		}
+		env := &p105Env{db: db, lastSeen: lastSeen}
+		env.closeDB()
 	})
 
 	cfg := &config.Config{
@@ -110,7 +217,7 @@ func newP105Env(t *testing.T) *p105Env {
 	adminMux := chi.NewRouter()
 	adminH.RegisterRoutes(adminMux)
 
-	return &p105Env{db: db, dbPath: dbPath, cfg: cfg, clientSvc: clientSvc, gemini: geminiSvc, rateLimiter: sharedLimiter, api: apiMux, admin: adminMux}
+	return &p105Env{db: db, dbPath: dbPath, cfg: cfg, clientSvc: clientSvc, gemini: geminiSvc, rateLimiter: sharedLimiter, api: apiMux, admin: adminMux, lastSeen: lastSeen}
 }
 
 // insertClientWithKey: 以指定 key 的 SHA-256 直接入库（控制 key 值为 canary）
@@ -137,7 +244,11 @@ func (e *p105Env) doAuth(t *testing.T, key string) *http.Response {
 	req.Header.Set("Authorization", "Bearer "+key)
 	w := httptest.NewRecorder()
 	e.api.ServeHTTP(w, req)
-	return w.Result()
+	resp := w.Result()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusTooManyRequests {
+		e.lastSeen.waitForCompletion(t)
+	}
+	return resp
 }
 
 func (e *p105Env) countAll(t *testing.T, table string) int64 {

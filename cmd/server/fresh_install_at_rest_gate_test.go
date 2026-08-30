@@ -135,6 +135,7 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
+	lastSeen := attachTestLastSeenPool(db)
 
 	mgr, err := ensureProviderSecretsRunnable(cfg, db)
 	if err != nil {
@@ -161,11 +162,11 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	apiSrv := httptest.NewServer(apiMux)
 	clientSvc := services.NewClientService(db)
 
-	freshDoChat(t, apiSrv.URL, freshGatewayKeyOf(t, clientSvc, "fresh-client-global"))
+	freshDoChat(t, apiSrv.URL, freshGatewayKeyOf(t, clientSvc, "fresh-client-global"), lastSeen)
 	if got := up.lastAuth(t); got != "Bearer "+freshCanaryGlobal {
 		t.Fatalf("[功能回归失败] global fallback 应携带解密后的全局 key，实际 %q", got)
 	}
-	freshDoChat(t, apiSrv.URL, freshGatewayKeyOf(t, clientSvc, "fresh-client-override"))
+	freshDoChat(t, apiSrv.URL, freshGatewayKeyOf(t, clientSvc, "fresh-client-override"), lastSeen)
 	if got := up.lastAuth(t); got != "Bearer "+freshCanaryClient {
 		t.Fatalf("[功能回归失败] client 密文 override 应生效，实际 %q", got)
 	}
@@ -173,7 +174,7 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	// ---- 停止 gateway（httptest close + SQLite 干净关闭）----
 	apiSrv.Close()
 	adminSrv.Close()
-	if err := closeSQLDB(db); err != nil {
+	if err := closeTestLastSeenDB(db, lastSeen); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,6 +198,7 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lastSeen2 := attachTestLastSeenPool(dbCheck)
 	var legacyCount, encCount int64
 	if err := dbCheck.Raw("SELECT count(*) FROM clients WHERE backend_api_key != ''").Scan(&legacyCount).Error; err != nil {
 		t.Fatal(err)
@@ -265,25 +267,15 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	apiSrv2 := httptest.NewServer(buildAPIRouter(deps2))
 	defer apiSrv2.Close()
 	clientSvc2 := services.NewClientService(dbCheck) // 重启后的新句柄（db 已在停服时关闭）
-	freshDoChat(t, apiSrv2.URL, freshGatewayKeyOf(t, clientSvc2, "fresh-client-global"))
+	freshDoChat(t, apiSrv2.URL, freshGatewayKeyOf(t, clientSvc2, "fresh-client-global"), lastSeen2)
 	if got := up.lastAuth(t); got != "Bearer "+freshCanaryGlobal {
 		t.Fatalf("[功能回归失败] 重启后 global key 未恢复，实际 %q", got)
 	}
 
-	_ = closeSQLDB(dbCheck)
+	_ = closeTestLastSeenDB(dbCheck, lastSeen2)
 }
 
-func closeSQLDB(db *gorm.DB) error {
-	if db == nil {
-		return nil
-	}
-	if sqlDB, err := db.DB(); err == nil {
-		return sqlDB.Close()
-	}
-	return nil
-}
-
-func freshDoChat(t *testing.T, baseURL, gwKey string) {
+func freshDoChat(t *testing.T, baseURL, gwKey string, lastSeen *testLastSeenPool) {
 	t.Helper()
 	body := `{"model":"test-model","messages":[{"role":"user","content":"ping"}]}`
 	req, err := http.NewRequest("POST", baseURL+"/v1/chat/completions", strings.NewReader(body))
@@ -295,6 +287,9 @@ func freshDoChat(t *testing.T, baseURL, gwKey string) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		lastSeen.waitForCompletion(t)
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)

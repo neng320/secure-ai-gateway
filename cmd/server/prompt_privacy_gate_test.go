@@ -115,6 +115,22 @@ type privacyEnv struct {
 	admin    http.Handler
 	upstream *privacyUpstream
 	logBuf   syncBuffer
+	lastSeen *testLastSeenPool
+}
+
+func (e *privacyEnv) closeDB(t *testing.T) {
+	if e.lastSeen != nil {
+		if err := closeTestLastSeenDB(e.db, e.lastSeen); err != nil {
+			t.Errorf("close privacy test database: %v", err)
+		}
+		e.lastSeen = nil
+		return
+	}
+	if e.db != nil {
+		if sqlDB, err := e.db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	}
 }
 
 func newPrivacyEnv(t *testing.T, captureOn bool) *privacyEnv {
@@ -181,17 +197,14 @@ func newPrivacyEnv(t *testing.T, captureOn bool) *privacyEnv {
 	env.admin = adminMux
 	env.cfg = cfg
 	env.db = db
+	env.lastSeen = attachTestLastSeenPool(db)
 
 	// runtime log 捕获（log 包默认 writer；handlers 的日志都经 log.Printf）
 	log.SetOutput(&env.logBuf)
 	t.Cleanup(func() {
 		log.SetOutput(os.Stderr)
 		// 关闭【当前】句柄（rawScanCanaryHits 会重开 DB 并替换 e.db）
-		if cur := env.db; cur != nil {
-			if sqlDB, err := cur.DB(); err == nil {
-				_ = sqlDB.Close()
-			}
-		}
+		env.closeDB(t)
 	})
 	return env
 }
@@ -199,9 +212,7 @@ func newPrivacyEnv(t *testing.T, captureOn bool) *privacyEnv {
 // rawScanCanaryHits: 关闭 DB → 扫描 config/db/WAL/journal → 重开 DB
 func (e *privacyEnv) rawScanCanaryHits(t *testing.T, canaries ...string) int {
 	t.Helper()
-	if sqlDB, err := e.db.DB(); err == nil {
-		_ = sqlDB.Close()
-	}
+	e.closeDB(t)
 	hits := 0
 	for _, p := range []string{e.cfgPath, e.dbPath, e.dbPath + "-wal", e.dbPath + "-shm", e.dbPath + "-journal"} {
 		raw, err := os.ReadFile(p)
@@ -217,6 +228,7 @@ func (e *privacyEnv) rawScanCanaryHits(t *testing.T, canaries ...string) int {
 		t.Fatal(err)
 	}
 	e.db = db
+	e.lastSeen = nil
 	return hits
 }
 
@@ -224,13 +236,14 @@ func newGateClientSvc(env *privacyEnv) *services.ClientService {
 	return services.NewClientService(env.db)
 }
 
-func privacyChat(t *testing.T, api http.Handler, gwKey, body string, target string) string {
+func privacyChat(t *testing.T, env *privacyEnv, gwKey, body string, target string) string {
 	t.Helper()
 	req := httptest.NewRequest("POST", target, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+gwKey)
 	w := httptest.NewRecorder()
-	api.ServeHTTP(w, req)
+	env.api.ServeHTTP(w, req)
+	env.lastSeen.waitForCompletion(t)
 	resp := w.Result()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
@@ -332,15 +345,15 @@ func TestPromptPrivacyGate_DefaultMode_NoPlaintextAnywhere(t *testing.T) {
 	promptBody := `{"model":"test-model","messages":[{"role":"user","content":"` + gateCanaryPrompt + `"}]}`
 
 	// a) openai 非流式（global fallback）
-	idA := privacyChat(t, env.api, gwA, promptBody, "/v1/chat/completions")
+	idA := privacyChat(t, env, gwA, promptBody, "/v1/chat/completions")
 	// b) openai 流式（client override）
 	env.upstream.setBehavior(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
 	})
-	idB := privacyChat(t, env.api, gwB, `{"model":"test-model","stream":true,"messages":[{"role":"user","content":"`+gateCanaryPrompt+`"}]}`, "/v1/chat/completions")
+	idB := privacyChat(t, env, gwB, `{"model":"test-model","stream":true,"messages":[{"role":"user","content":"`+gateCanaryPrompt+`"}]}`, "/v1/chat/completions")
 	// c) gemini native（global）
-	idC := privacyChat(t, env.api, gwA, `{"contents":[{"parts":[{"text":"`+gateCanaryPrompt+`"}]}]}`, "/v1/models/test-model:generateContent")
+	idC := privacyChat(t, env, gwA, `{"contents":[{"parts":[{"text":"`+gateCanaryPrompt+`"}]}]}`, "/v1/models/test-model:generateContent")
 
 	// Gate 3：唯一性
 	if idA == idB || idB == idC || idA == "" {
@@ -405,6 +418,7 @@ func TestPromptPrivacyGate_RuntimeUpstreamError_BoundedOnly(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+gwKey)
 	w := httptest.NewRecorder()
 	env.api.ServeHTTP(w, req)
+	env.lastSeen.waitForCompletion(t)
 
 	if strings.Contains(env.logBuf.String(), gateCanaryUPErr) {
 		t.Fatal("[安全回归失败] runtime log 回显 upstream error body")
@@ -429,7 +443,7 @@ func TestPromptPrivacyGate_DiagnosticMode_MemoryOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := privacyChat(t, env.api, gwKey, `{"contents":[{"parts":[{"text":"`+gateCanaryPrompt+`"}]}]}`, "/v1/models/test-model:generateContent")
+	id := privacyChat(t, env, gwKey, `{"contents":[{"parts":[{"text":"`+gateCanaryPrompt+`"}]}]}`, "/v1/models/test-model:generateContent")
 
 	// Admin 端点按需可读
 	token := privacyAdminLogin(t, env.admin)
@@ -472,7 +486,7 @@ func TestPromptPrivacyGate_Bounds_TruncationThroughEndpoint(t *testing.T) {
 	}
 
 	big := strings.Repeat("P", 100*1024)
-	id := privacyChat(t, env.api, gwKey, `{"contents":[{"parts":[{"text":"`+big+`"}]}]}`, "/v1/models/test-model:generateContent")
+	id := privacyChat(t, env, gwKey, `{"contents":[{"parts":[{"text":"`+big+`"}]}]}`, "/v1/models/test-model:generateContent")
 
 	token := privacyAdminLogin(t, env.admin)
 	adminReq := httptest.NewRequest("GET", "/admin/request-bodies/"+id, nil)

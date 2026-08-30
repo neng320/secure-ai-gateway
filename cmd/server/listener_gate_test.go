@@ -33,12 +33,13 @@ import (
 type chiRouter = chi.Router
 
 type gatewayEnv struct {
-	cfg     *config.Config
-	deps    gatewayDeps
-	api     *httptest.Server
-	admin   *httptest.Server
-	metrics *httptest.Server // prometheus 未启用时为 nil
-	store   *auth.SQLiteStore
+	cfg      *config.Config
+	deps     gatewayDeps
+	api      *httptest.Server
+	admin    *httptest.Server
+	metrics  *httptest.Server // prometheus 未启用时为 nil
+	store    *auth.SQLiteStore
+	lastSeen *testLastSeenPool
 }
 
 func newTestGateway(t *testing.T, prometheusEnabled, setupRequired bool) *gatewayEnv {
@@ -68,9 +69,10 @@ func newTestGateway(t *testing.T, prometheusEnabled, setupRequired bool) *gatewa
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	lastSeen := attachTestLastSeenPool(db)
 	t.Cleanup(func() {
-		if sqlDB, e := db.DB(); e == nil {
-			_ = sqlDB.Close()
+		if err := closeTestLastSeenDB(db, lastSeen); err != nil {
+			t.Errorf("close listener test database: %v", err)
 		}
 	})
 
@@ -82,7 +84,7 @@ func newTestGateway(t *testing.T, prometheusEnabled, setupRequired bool) *gatewa
 	}
 	metricsMux := buildMetricsRouter(deps)
 
-	env := &gatewayEnv{cfg: cfg, deps: deps, api: httptest.NewServer(apiMux), admin: httptest.NewServer(adminMux), store: deps.sessionStore.(*auth.SQLiteStore)}
+	env := &gatewayEnv{cfg: cfg, deps: deps, api: httptest.NewServer(apiMux), admin: httptest.NewServer(adminMux), store: deps.sessionStore.(*auth.SQLiteStore), lastSeen: lastSeen}
 	if metricsMux != nil {
 		env.metrics = httptest.NewServer(metricsMux)
 	}
@@ -115,6 +117,15 @@ func get(t *testing.T, url string, headers ...string) int {
 	return resp.StatusCode
 }
 
+func getWithLastSeen(t *testing.T, pool *testLastSeenPool, url string, headers ...string) int {
+	t.Helper()
+	status := get(t, url, headers...)
+	if status != http.StatusUnauthorized {
+		pool.waitForCompletion(t)
+	}
+	return status
+}
+
 func post(t *testing.T, url string, headers ...string) int {
 	t.Helper()
 	req, _ := http.NewRequest("POST", url, strings.NewReader("{}"))
@@ -145,7 +156,7 @@ func TestGateListener_PublicAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = client
-	if got := get(t, env.api.URL+"/v1/models", "Authorization", "Bearer "+apiKey); got != http.StatusOK {
+	if got := getWithLastSeen(t, env.lastSeen, env.api.URL+"/v1/models", "Authorization", "Bearer "+apiKey); got != http.StatusOK {
 		t.Fatalf("public /v1/models 合法 key 期望 200，实际 %d", got)
 	}
 
