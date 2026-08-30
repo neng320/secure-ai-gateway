@@ -68,11 +68,11 @@ P1-06 overall：✅ COMPLETE
 ```text
 P1-07A Request Validation Characterization ✅（PR #20；merge dc2db17c）
   仅 tests/docs；固化 10 MiB body cap、JSON/media/schema 缺口与 upstream bypass 事实。
-P1-07B Request Validation Enforcement ✅（本分支）
+P1-07B Request Validation Enforcement ✅（本分支；PR #21）
   完成：Auth→Rate→Validation→Quota 顺序、一次 bounded body read/context 复用、
         stable 413/415 JSON errors、JSON depth 64、protocol minimums、
         model/token/collection bounds、invalid input upstream=0 canaries。
-P1-07 overall：🟠 VERIFYING（待本分支 PR/CI/merge 门禁完成）
+P1-07 overall：✅ COMPLETE
   P1-08 不在本任务范围内。
 ```
 
