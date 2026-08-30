@@ -196,7 +196,7 @@ func buildAPIRouter(d gatewayDeps) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(mw.Recovery)
 	r.Use(mw.SecurityHeaders)
-	r.Use(mw.MaxRequestSize(10 << 20))
+	r.Use(mw.MaxRequestSize(mw.DefaultRequestBodyMaxBytes))
 	// SEC-003（P1-04B）：全 API 面 request ID——响应头 X-Request-ID == DB RequestLog.RequestID
 	r.Use(mw.RequestID())
 
@@ -212,6 +212,7 @@ func buildAPIRouter(d gatewayDeps) *chi.Mux {
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware.Handler)
 		r.Use(rateLimiter.Middleware)
+		r.Use(mw.RequestValidation(mw.DefaultRequestBodyMaxBytes))
 		r.Use(mw.NewQuotaMiddleware(d.db))
 		proxyHandler.RegisterRoutes(r)
 		openaiHandler.RegisterRoutes(r)

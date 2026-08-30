@@ -47,7 +47,7 @@ func TestP107A_PublicRouteRegistrationCurrentMatrix(t *testing.T) {
 	}
 }
 
-func TestP107A_PublicOversizedGenerativeBodyCurrentError(t *testing.T) {
+func TestP107B_PublicOversizedGenerativeBodyStable413(t *testing.T) {
 	env := newTestGateway(t, false, false)
 	_, apiKey, err := env.deps.clientService.CreateClient("p107a-body-limit", "", "gemini", "sk-", env.cfg, "test-admin")
 	if err != nil {
@@ -65,8 +65,8 @@ func TestP107A_PublicOversizedGenerativeBodyCurrentError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("[CURRENT] oversized public generative body status=%d, want current quota/config 500", resp.StatusCode)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("[FIXED] oversized public generative body status=%d, want 413", resp.StatusCode)
 	}
-	t.Log("[KNOWN-GAP] public generative MaxBytesError is currently surfaced as QUOTA_CONFIGURATION_INVALID/500 by quota preflight; P1-07B target is stable 413")
+	t.Log("[FIXED] public generative MaxBytesError is caught by request validation as stable 413 REQUEST_TOO_LARGE")
 }

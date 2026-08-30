@@ -55,7 +55,7 @@ func (h *ProxyHandler) GenerateContent(w http.ResponseWriter, r *http.Request) {
 		model = "gemini-flash-lite-latest"
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := middleware.ReadRequestBody(r)
 	if err != nil {
 		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
 		return
@@ -182,7 +182,7 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 		model = "gemini-flash-lite-latest"
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := middleware.ReadRequestBody(r)
 	if err != nil {
 		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
 		return
