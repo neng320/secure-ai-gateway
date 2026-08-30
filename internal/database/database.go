@@ -18,7 +18,7 @@ import (
 )
 
 func Open(path string) (*gorm.DB, error) {
-	return gorm.Open(sqlite.Open(path+"?_foreign_keys=on"), &gorm.Config{
+	return gorm.Open(sqlite.Open(path+"?_foreign_keys=on&_busy_timeout=5000"), &gorm.Config{
 		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
 	})
 }

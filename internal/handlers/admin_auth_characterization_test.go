@@ -79,6 +79,7 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	migrateHandlerAudit(t, db)
 	// Windows 下 TempDir 清理需要先释放 SQLite 文件句柄
 	t.Cleanup(func() {
 		if sqlDB, err := db.DB(); err == nil {

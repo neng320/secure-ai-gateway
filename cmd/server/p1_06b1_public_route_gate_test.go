@@ -53,6 +53,7 @@ func newP106b1PublicGateway(t *testing.T) *p106b1PublicGateway {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
+	migrateTestAudit(t, db)
 	lastSeen := attachTestLastSeenPool(db)
 	t.Cleanup(func() {
 		if err := closeTestLastSeenDB(db, lastSeen); err != nil {

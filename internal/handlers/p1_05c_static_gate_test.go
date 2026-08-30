@@ -76,7 +76,7 @@ func TestP105C_StaticGate_AuditAppendOnly(t *testing.T) {
 		t.Fatalf("[static] AuditEvent production path must not update/delete events: %v", forbidden)
 	}
 	auditSrc := p105bRead(t, root, "internal/audit/audit.go")
-	if !strings.Contains(auditSrc, "func (s *Service) RecordTx") || !strings.Contains(auditSrc, "return tx.Create(&e).Error") {
+	if !strings.Contains(auditSrc, "func (s *Service) RecordTx") || !strings.Contains(auditSrc, "tx.Create(&e)") {
 		t.Fatal("[static] audit service must expose transactional append through RecordTx")
 	}
 	for _, action := range []string{
@@ -92,6 +92,30 @@ func TestP105C_StaticGate_AuditAppendOnly(t *testing.T) {
 		}
 	}
 	t.Log("[static] AuditEvent production path is append/read-only with fixed actions")
+}
+
+func TestP108B_S1_StaticGate_DedicatedAuditMigrationOwnership(t *testing.T) {
+	root := p105bModuleRoot(t)
+	mainSrc := p105bRead(t, root, "cmd/server/main.go")
+	start := strings.Index(mainSrc, "func autoMigrate")
+	if start < 0 {
+		t.Fatal("[static] main.go must keep an explicit autoMigrate function")
+	}
+	block := mainSrc[start:]
+	if end := strings.Index(block, "\n}"); end >= 0 {
+		block = block[:end]
+	}
+	if strings.Contains(block, "AuditEvent") || strings.Contains(block, "AuditChainState") {
+		t.Fatal("[static] generic autoMigrate must not own audit schema changes")
+	}
+	if !strings.Contains(mainSrc, "audit.MigrateIntegrity(db)") {
+		t.Fatal("[static] startup must call dedicated audit.MigrateIntegrity")
+	}
+	migrationSrc := p105bRead(t, root, "internal/audit/migration.go")
+	if !strings.Contains(migrationSrc, "func MigrateIntegrity") || !strings.Contains(migrationSrc, "UPDATE audit_events SET chain_version") {
+		t.Fatal("[static] dedicated audit migration must own schema/backfill changes")
+	}
+	t.Log("[static] generic business migration is separated from dedicated audit integrity migration")
 }
 
 func TestP105C_StaticGate_TrustedActorAndBoundedClientWrites(t *testing.T) {

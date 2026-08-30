@@ -17,7 +17,7 @@ func newAuditTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.AuditEvent{}); err != nil {
+	if err := MigrateIntegrity(db); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -67,7 +67,10 @@ func TestRecordTx_RejectsUnboundedOrControlFields(t *testing.T) {
 		{Action: ActionClientCreated, ActorType: "admin", ActorID: "admin", TargetID: ""},
 	}
 	for _, event := range cases {
-		if err := svc.RecordTx(db, event); err == nil {
+		err := db.Transaction(func(tx *gorm.DB) error {
+			return svc.RecordTx(tx, event)
+		})
+		if err == nil {
 			t.Fatalf("expected invalid event to be rejected: %+v", event)
 		}
 	}
@@ -76,11 +79,13 @@ func TestRecordTx_RejectsUnboundedOrControlFields(t *testing.T) {
 func TestRecordTx_UnknownActionDoesNotEchoInput(t *testing.T) {
 	db := newAuditTestDB(t)
 	secret := "P105C_AUDIT_ACTION_CANARY"
-	err := NewService(db).RecordTx(db, models.AuditEvent{
-		Action:    secret,
-		ActorType: "admin",
-		ActorID:   "admin",
-		TargetID:  "client-1",
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return NewService(db).RecordTx(tx, models.AuditEvent{
+			Action:    secret,
+			ActorType: "admin",
+			ActorID:   "admin",
+			TargetID:  "client-1",
+		})
 	})
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("unknown action error must be generic and non-echoing: %v", err)

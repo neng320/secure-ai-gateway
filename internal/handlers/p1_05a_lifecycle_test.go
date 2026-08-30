@@ -174,6 +174,7 @@ func newP105Env(t *testing.T) *p105Env {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
+	migrateHandlerAudit(t, db)
 	lastSeen := newP105LastSeenPool(db.ConnPool)
 	db.ConnPool = lastSeen
 	db.Statement.ConnPool = lastSeen

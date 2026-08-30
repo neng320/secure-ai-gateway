@@ -135,6 +135,7 @@ func TestFreshInstall_SecretAtRest_Gate(t *testing.T) {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
+	migrateTestAudit(t, db)
 	lastSeen := attachTestLastSeenPool(db)
 
 	mgr, err := ensureProviderSecretsRunnable(cfg, db)

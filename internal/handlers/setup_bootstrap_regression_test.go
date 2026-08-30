@@ -74,6 +74,7 @@ func TestP1044_FreshBootstrap_SetupFlowRegression(t *testing.T) {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatal(err)
 	}
+	migrateHandlerAudit(t, db)
 	t.Cleanup(func() {
 		if sqlDB, e := db.DB(); e == nil {
 			_ = sqlDB.Close()

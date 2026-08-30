@@ -8,8 +8,27 @@ import (
 	"sync"
 	"testing"
 
+	"ai-gateway/internal/audit"
+
 	"gorm.io/gorm"
 )
+
+func migrateTestAudit(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := audit.MigrateIntegrity(db); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func migrateTestSchema(t *testing.T, db *gorm.DB, modelsToMigrate ...interface{}) {
+	t.Helper()
+	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.MigrateIntegrity(db); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // testLastSeenPool is a test-only ConnPool wrapper. The real AuthMiddleware
 // launches ClientService.UpdateLastSeen asynchronously, so fixtures must wait

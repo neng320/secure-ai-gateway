@@ -2,6 +2,7 @@ package audit
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"ai-gateway/internal/models"
@@ -33,8 +34,9 @@ func TestP108A_AuditEventSchemaIsMinimalAndUnlinked(t *testing.T) {
 	}
 
 	want := []string{"id", "event_id", "action", "actor_type", "actor_id", "target_type", "target_id", "reason", "created_at"}
+	want = append(want, "chain_version", "prev_hash", "event_hash")
 	if len(columns) != len(want) {
-		t.Fatalf("audit_events schema changed from the P1-05C minimal shape: got %v", columns)
+		t.Fatalf("audit_events schema does not match the P1-08B chained shape: got %v", columns)
 	}
 	for _, name := range want {
 		if !columns[name] {
@@ -59,15 +61,15 @@ func TestP108A_AuditEventSchemaIsMinimalAndUnlinked(t *testing.T) {
 	if err := db.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'audit_events'").Scan(&triggers).Error; err != nil {
 		t.Fatal(err)
 	}
-	if triggers != 0 {
-		t.Fatalf("P1-08A baseline must not have audit_events integrity triggers, got %d", triggers)
+	if triggers != 2 {
+		t.Fatalf("P1-08B baseline must have two audit_events integrity triggers, got %d", triggers)
 	}
 }
 
 func TestP108A_ApplicationAppendOnlyDoesNotImplyDatabaseImmutability(t *testing.T) {
 	db := newAuditTestDB(t)
 	svc := NewService(db)
-	if err := svc.RecordTx(db, models.AuditEvent{
+	if err := svc.Record(models.AuditEvent{
 		Action:    ActionClientCreated,
 		ActorType: "admin",
 		ActorID:   "p108a-test-admin",
@@ -81,30 +83,19 @@ func TestP108A_ApplicationAppendOnlyDoesNotImplyDatabaseImmutability(t *testing.
 	if err := db.First(&event).Error; err != nil {
 		t.Fatal(err)
 	}
-	update := db.Model(&event).Update("reason", "direct database mutation")
-	if update.Error != nil {
-		t.Fatalf("current application-only foundation unexpectedly rejected direct update: %v", update.Error)
+	if err := db.Model(&event).Update("reason", "direct database mutation").Error; err == nil || !strings.Contains(err.Error(), "AUDIT_EVENT_IMMUTABLE") {
+		t.Fatalf("direct update should be blocked by the P1-08B guard, got %v", err)
 	}
-	if update.RowsAffected != 1 {
-		t.Fatalf("direct update should affect one audit event, got %d rows", update.RowsAffected)
-	}
-	var updated models.AuditEvent
-	if err := db.First(&updated, event.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if updated.Reason != "direct database mutation" {
-		t.Fatalf("direct update did not change the stored reason: %q", updated.Reason)
-	}
-	if err := db.Delete(&event).Error; err != nil {
-		t.Fatalf("current application-only foundation unexpectedly rejected direct delete: %v", err)
+	if err := db.Delete(&event).Error; err == nil || !strings.Contains(err.Error(), "AUDIT_EVENT_IMMUTABLE") {
+		t.Fatalf("direct delete should be blocked by the P1-08B guard, got %v", err)
 	}
 
 	var count int64
 	if err := db.Model(&models.AuditEvent{}).Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("direct delete should currently be possible before P1-08B immutability controls, got %d rows", count)
+	if count != 1 {
+		t.Fatalf("database mutation guard should retain the audit event, got %d rows", count)
 	}
 }
 

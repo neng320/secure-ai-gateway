@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/database"
@@ -129,6 +130,9 @@ func main() {
 	}
 	if err := autoMigrate(db); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
+	}
+	if err := audit.MigrateIntegrity(db); err != nil {
+		log.Fatalf("AUDIT_INTEGRITY_CHECK_FAILED: %v", err)
 	}
 
 	// P1-04D 启动 preflight：legacy prompt/error 正文残留 → 拒绝启动（须离线 scrub）
@@ -276,7 +280,6 @@ func autoMigrate(db *gorm.DB) error {
 		&models.RequestLog{},
 		&models.DailyUsage{},
 		&models.AdminSession{},
-		&models.AuditEvent{}, // P1-05C：通用审计事件（additive new table）
 	)
 }
 

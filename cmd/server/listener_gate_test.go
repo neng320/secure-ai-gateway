@@ -69,6 +69,7 @@ func newTestGateway(t *testing.T, prometheusEnabled, setupRequired bool) *gatewa
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	migrateTestAudit(t, db)
 	lastSeen := attachTestLastSeenPool(db)
 	t.Cleanup(func() {
 		if err := closeTestLastSeenDB(db, lastSeen); err != nil {
