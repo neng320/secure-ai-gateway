@@ -55,6 +55,14 @@ type UsageReservation struct {
 	finalized bool
 }
 
+// ConservativeUsage returns the bounded token reservation for a successful
+// request whose provider did not return usage metadata.
+func (reservation *UsageReservation) ConservativeUsage() (int, int) {
+	reservation.mu.Lock()
+	defer reservation.mu.Unlock()
+	return reservation.reservedInputTokens, reservation.reservedOutputTokens
+}
+
 func (l *UsageLedger) Reserve(client *models.Client, reservationLimits ...int) (*UsageReservation, error) {
 	if client == nil || client.ID == "" {
 		return nil, ErrQuotaConfiguration

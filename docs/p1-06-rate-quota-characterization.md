@@ -1,9 +1,10 @@
 # P1-06 · Rate / Quota Characterization and Enforcement
 
 > P1-06A 基线：`origin/develop` `8b6559ef016cad3aaed586ec718036ae15a54136`（P1-05C complete）。
-> 当前 P1-06B 分支：`task/p1-06b-rate-quota-enforcement`，起点为 P1-06A merge `a3f9008b2294c304c4dc8b31f8966a3eed677826`。
+> P1-06B 分支：`task/p1-06b-rate-quota-enforcement`，已合入 develop `34b4b919612dc487048b097f01f3e072c920127d`。
+> 当前 correction 分支：`task/p1-06b1-route-streaming-closure`，起点为该 P1-06B merge。
 > P1-06A 阶段只做审计、characterization tests 与文档，生产行为修改数 = 0；
-> P1-06B enforcement 结果记录在 §8。
+> P1-06B enforcement 结果记录在 §8；独立复验修正记录在 §9。
 > 测试：`internal/middleware/p1_06a_rate_characterization_test.go`、
 > `internal/services/p1_06a_quota_characterization_test.go`、
 > `internal/handlers/p1_06a_request_limits_characterization_test.go`。
@@ -115,15 +116,21 @@ P1-06A 结论：以上是 enforcement 前的可复现事实与明确缺口；P1-
 
 ### Quota / usage
 
-- `NewQuotaMiddleware` 只对 generative POST（chat completions、Gemini generateContent）生效，排除 count_tokens 与 GET models；reservation 发生在 downstream/upstream handler 前。
+- `NewQuotaMiddleware` 对显式 generative POST matrix 生效：`/v1/chat/completions`、`/chat/completions`、`/v1/messages`，以及 `v1/v1beta` 的 Gemini `generateContent` / `streamGenerateContent`；排除 `/v1/messages/count_tokens` 与 GET models。reservation 发生在 downstream/upstream handler 前。
 - Request quota 每个请求预留 1；input reservation 使用 request body 的 conservative byte upper bound（截到 Client MaxInputTokens），不宣称精确 tokenizer；output reservation 使用请求声明值或 Client MaxOutputTokens 上界。
 - `DailyUsage` 新增 reservation counters。SQLite upsert 条件原子检查 total+reserved 不超过日 quota；并发 reservation 不超额。完成后 transaction 内将实际 usage 加入 totals 并释放 reservation，早期/传输失败由 middleware release。
 - 无效负数 quota/max-token 配置返回稳定 `QUOTA_CONFIGURATION_INVALID`；达到 request/input/output 日 quota 返回 HTTP 429 与对应 stable code；历史 usage 不因动态 quota 编辑重置。
 - `LogRequest` 将 request log insert 与 unreserved usage upsert 放入同一 transaction；reserved request 的 log 与实际 token charge 也同一 transaction。所有 stats 查询使用同一 UTC `UsageDate`。
-- Gemini 与 OpenAI request paths 都执行 conservative MaxInput gate；OpenAI `max_tokens` 超过 Client MaxOutputTokens 返回 `MAX_OUTPUT_TOKENS_EXCEEDED`；Gemini output 请求继续受 client cap 限制。
+- Gemini 与 OpenAI request paths 都执行 conservative MaxInput gate；OpenAI `max_tokens` 超过 Client MaxOutputTokens 返回 `MAX_OUTPUT_TOKENS_EXCEEDED`；Gemini output 请求继续受 client cap 限制。Gemini streaming 逐行 bounded 解析 `usageMetadata`，存在时 charge actual usage，缺失时 charge reservation upper bound，不再以 0 token finalize。
 
 ### V1 charging boundary
 
 完整 upstream response 并成功写入 metadata log 才 charge request/actual tokens；这包括 non-retryable upstream HTTP error（按请求计数、无实际 token 时按 0 charge）。invalid request、provider setup failure 和 transport failure 在没有可 charge response 时释放 reservation。后续若要求“所有 upstream attempt 均计费”，需在后续迭代中为各 fallback/retry/error path 增加统一 charge contract。
 
 P1-06B 关闭 P1-06A 的 rate-window、cold-cache、dynamic-edit、atomic DailyUsage、stable-429 与 request/token quota enforcement gaps；P1-05 lifecycle、P1-04 privacy 与 audit 回归继续作为 required regression。
+
+## 9. P1-06B.1 Independent Review Correction
+
+独立复验发现原 P1-06B classifier 遗漏两个真实生成入口：`POST /v1/messages` 与 `POST ...:streamGenerateContent`；Gemini streaming 也只转发响应字节，最终 `RequestRecord` 的 input/output token 默认为 0。该状态曾使 Daily Quota 可被绕过，因此 P1-06 在 correction 合入前保持 `VERIFYING`。
+
+P1-06B.1 通过显式 route matrix 与每个生成入口的 exhausted-request-quota regression，补齐两类 route；Gemini stream 使用有上限的 SSE line parser 提取 `usageMetadata`，成功响应缺失 metadata 时采用本次 reservation 的 conservative upper bound，成功响应最终只经过一次 `LogRequest` finalize，reservation counters 清零。`count_tokens` 与 GET model routes 继续不进入 quota preflight。Correction tests、全量回归、race、vet 与 verify 均通过后，P1-06 恢复为 `COMPLETE`。
