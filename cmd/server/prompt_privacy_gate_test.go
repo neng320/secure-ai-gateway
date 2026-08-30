@@ -23,10 +23,7 @@ package main
 // Canary：P104_FINAL_DISK_CANARY / P104_CANARY_UPSTREAM_ERROR_DO_NOT_LOG（明显标记串）。
 
 import (
-	"context"
-	"database/sql"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -118,92 +115,14 @@ type privacyEnv struct {
 	admin    http.Handler
 	upstream *privacyUpstream
 	logBuf   syncBuffer
-	lastSeen *privacyLastSeenPool
+	lastSeen *testLastSeenPool
 }
 
-// privacyLastSeenPool is a test-only ConnPool wrapper. AuthMiddleware launches
-// UpdateLastSeen asynchronously, so the privacy fixture must observe completion
-// of that specific side effect before closing or scanning SQLite.
-type privacyLastSeenPool struct {
-	gorm.ConnPool
-	completed chan struct{}
-}
-
-func newPrivacyLastSeenPool(pool gorm.ConnPool) *privacyLastSeenPool {
-	return &privacyLastSeenPool{ConnPool: pool, completed: make(chan struct{})}
-}
-
-func (p *privacyLastSeenPool) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
-	result, err := p.ConnPool.ExecContext(ctx, query, args...)
-	p.signalIfLastSeen(query)
-	return result, err
-}
-
-func (p *privacyLastSeenPool) signalIfLastSeen(query string) {
-	if isPrivacyLastSeenUpdate(query) {
-		p.completed <- struct{}{}
-	}
-}
-
-func (p *privacyLastSeenPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
-	beginner, ok := p.ConnPool.(gorm.TxBeginner)
-	if !ok {
-		return nil, fmt.Errorf("privacy test pool cannot begin transaction")
-	}
-	tx, err := beginner.BeginTx(ctx, opts)
-	if err != nil {
-		return nil, err
-	}
-	return &privacyLastSeenTx{Tx: tx, pool: p}, nil
-}
-
-type privacyLastSeenTx struct {
-	*sql.Tx
-	pool          *privacyLastSeenPool
-	lastSeenWrite bool
-}
-
-func (tx *privacyLastSeenTx) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
-	result, err := tx.Tx.ExecContext(ctx, query, args...)
-	if isPrivacyLastSeenUpdate(query) {
-		tx.lastSeenWrite = true
-	}
-	return result, err
-}
-
-func (tx *privacyLastSeenTx) Commit() error {
-	err := tx.Tx.Commit()
-	if tx.lastSeenWrite {
-		tx.pool.completed <- struct{}{}
-	}
-	return err
-}
-
-func (tx *privacyLastSeenTx) Rollback() error {
-	err := tx.Tx.Rollback()
-	if tx.lastSeenWrite {
-		tx.pool.completed <- struct{}{}
-	}
-	return err
-}
-
-func isPrivacyLastSeenUpdate(query string) bool {
-	query = strings.ToLower(strings.ReplaceAll(query, "`", ""))
-	return strings.Contains(query, "update clients set last_seen")
-}
-
-func (p *privacyLastSeenPool) waitForCompletion(t *testing.T) {
-	t.Helper()
-	select {
-	case <-p.completed:
-	case <-t.Context().Done():
-		t.Fatal("privacy test context canceled before UpdateLastSeen completed")
-	}
-}
-
-func (e *privacyEnv) closeDB() {
+func (e *privacyEnv) closeDB(t *testing.T) {
 	if e.lastSeen != nil {
-		_ = e.lastSeen.ConnPool.(*sql.DB).Close()
+		if err := closeTestLastSeenDB(e.db, e.lastSeen); err != nil {
+			t.Errorf("close privacy test database: %v", err)
+		}
 		e.lastSeen = nil
 		return
 	}
@@ -278,16 +197,14 @@ func newPrivacyEnv(t *testing.T, captureOn bool) *privacyEnv {
 	env.admin = adminMux
 	env.cfg = cfg
 	env.db = db
-	env.lastSeen = newPrivacyLastSeenPool(db.ConnPool)
-	db.ConnPool = env.lastSeen
-	db.Statement.ConnPool = env.lastSeen
+	env.lastSeen = attachTestLastSeenPool(db)
 
 	// runtime log 捕获（log 包默认 writer；handlers 的日志都经 log.Printf）
 	log.SetOutput(&env.logBuf)
 	t.Cleanup(func() {
 		log.SetOutput(os.Stderr)
 		// 关闭【当前】句柄（rawScanCanaryHits 会重开 DB 并替换 e.db）
-		env.closeDB()
+		env.closeDB(t)
 	})
 	return env
 }
@@ -295,7 +212,7 @@ func newPrivacyEnv(t *testing.T, captureOn bool) *privacyEnv {
 // rawScanCanaryHits: 关闭 DB → 扫描 config/db/WAL/journal → 重开 DB
 func (e *privacyEnv) rawScanCanaryHits(t *testing.T, canaries ...string) int {
 	t.Helper()
-	e.closeDB()
+	e.closeDB(t)
 	hits := 0
 	for _, p := range []string{e.cfgPath, e.dbPath, e.dbPath + "-wal", e.dbPath + "-shm", e.dbPath + "-journal"} {
 		raw, err := os.ReadFile(p)

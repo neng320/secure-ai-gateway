@@ -64,6 +64,9 @@ func TestP107B_PublicOversizedGenerativeBodyStable413(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		env.lastSeen.waitForCompletion(t)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("[FIXED] oversized public generative body status=%d, want 413", resp.StatusCode)

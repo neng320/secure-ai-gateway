@@ -95,6 +95,7 @@ type gateEnv struct {
 	upstream   *gateUpstream
 	cfgPath    string
 	clientSvc  *services.ClientService
+	lastSeen   *testLastSeenPool
 }
 
 func newGateEnv(t *testing.T, encryptedGlobal bool) *gateEnv {
@@ -137,9 +138,10 @@ func newGateEnv(t *testing.T, encryptedGlobal bool) *gateEnv {
 	if err := db.AutoMigrate(&models.Client{}, &models.RequestLog{}, &models.DailyUsage{}, &models.AdminSession{}, &models.AuditEvent{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	lastSeen := attachTestLastSeenPool(db)
 	t.Cleanup(func() {
-		if sqlDB, e := db.DB(); e == nil {
-			_ = sqlDB.Close()
+		if err := closeTestLastSeenDB(db, lastSeen); err != nil {
+			t.Errorf("close migration test database: %v", err)
 		}
 	})
 
@@ -163,7 +165,7 @@ func newGateEnv(t *testing.T, encryptedGlobal bool) *gateEnv {
 	return &gateEnv{
 		cfg: cfg, runtimeCfg: runtimeCfg, mgr: mgr, db: db,
 		api: apiMux, admin: adminMux, upstream: up, cfgPath: cfgPath,
-		clientSvc: services.NewClientService(db),
+		clientSvc: services.NewClientService(db), lastSeen: lastSeen,
 	}
 }
 
@@ -195,6 +197,9 @@ func (e *gateEnv) doChat(t *testing.T, gwKey string) {
 	req.Header.Set("Authorization", "Bearer "+gwKey)
 	w := httptest.NewRecorder()
 	e.api.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		e.lastSeen.waitForCompletion(t)
+	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("chat 期望 200，实际 %d body=%s", w.Code, w.Body.String())
 	}

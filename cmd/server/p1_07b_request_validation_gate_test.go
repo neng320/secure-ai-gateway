@@ -49,7 +49,14 @@ func p107bPublicRequest(t *testing.T, env *p106b1PublicGateway, path, apiKey str
 	if contentLength != 0 {
 		req.ContentLength = contentLength
 	}
-	return http.DefaultClient.Do(req)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusUnauthorized {
+		env.lastSeen.waitForCompletion(t)
+	}
+	return response, nil
 }
 
 func p107bResponseCode(t *testing.T, response *http.Response) string {
