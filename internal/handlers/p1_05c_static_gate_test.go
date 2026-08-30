@@ -300,6 +300,40 @@ func TestP108B_S3_StaticManagementAuditBoundaries(t *testing.T) {
 	}
 }
 
+func TestP108B_S4_StaticConfigAuditMutationGates(t *testing.T) {
+	root := p105bModuleRoot(t)
+	adminSrc := p105bRead(t, root, "internal/handlers/admin.go")
+	start := strings.Index(adminSrc, "func (h *AdminHandler) UpdateServerTools")
+	if start < 0 {
+		t.Fatal("UpdateServerTools handler not found")
+	}
+	block := adminSrc[start:]
+	if end := strings.Index(block, "\nfunc "); end >= 0 {
+		block = block[:end]
+	}
+	for _, marker := range []string{"adminActorFromContext", "configAudit.Run", "configaudit.Mutation", "audit.ActionServerToolsUpdated"} {
+		if !strings.Contains(block, marker) {
+			t.Fatalf("server-tools coordinator boundary missing %q", marker)
+		}
+	}
+	for _, forbidden := range []string{"h.cfg.ServerTools.Tools =", "h.cfg.ServerTools.Enabled =", "config.SaveConfig", "audit.Record("} {
+		if strings.Contains(block, forbidden) {
+			t.Fatalf("server-tools handler contains forbidden direct mutation %q", forbidden)
+		}
+	}
+	provisionSrc := p105bRead(t, root, "cmd/server/provision.go")
+	for _, marker := range []string{"openProviderAuditDB", "audit.MigrateIntegrity", "configaudit.New", "audit.ActionGlobalProviderSecretChanged", "ActorID: \"set-provider-key\""} {
+		if !strings.Contains(provisionSrc, marker) {
+			t.Fatalf("provider provisioning audit boundary missing %q", marker)
+		}
+	}
+	for _, forbidden := range []string{"config.SaveConfig", "atomicWriteConfigFile", "EventID: providerName", "Reason: providerName"} {
+		if strings.Contains(provisionSrc, forbidden) {
+			t.Fatalf("provider provisioning contains forbidden config/audit bypass %q", forbidden)
+		}
+	}
+}
+
 func TestP108B_S1_StaticGate_DedicatedAuditMigrationOwnership(t *testing.T) {
 	root := p105bModuleRoot(t)
 	mainSrc := p105bRead(t, root, "cmd/server/main.go")

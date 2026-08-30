@@ -22,12 +22,20 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/configaudit"
+	"ai-gateway/internal/database"
+	"ai-gateway/internal/models"
 	"ai-gateway/internal/secrets"
 
 	"golang.org/x/term"
+	"gorm.io/gorm"
 )
 
 // provisionResult: 仅供输出摘要使用（不含任何 secret 材料）。
@@ -43,8 +51,13 @@ type provisionResult struct {
 // 修改磁盘上的 config。
 func runSetProviderKey(configPath, providerName string, allowReplace bool, readSecret func() ([]byte, error), stdout io.Writer) (*provisionResult, error) {
 	providerName = strings.TrimSpace(providerName)
-	if providerName == "" {
-		return nil, errors.New("provider name is required (-set-provider-key <name>)")
+	if providerName == "" || !utf8.ValidString(providerName) || len([]rune(providerName)) > 64 {
+		return nil, errors.New("invalid provider name")
+	}
+	for _, r := range providerName {
+		if unicode.IsControl(r) {
+			return nil, errors.New("invalid provider name")
+		}
 	}
 	if configPath == "" {
 		return nil, errors.New("config path is required")
@@ -83,6 +96,15 @@ func runSetProviderKey(configPath, providerName string, allowReplace bool, readS
 			return nil, fmt.Errorf("provider %q already has an encrypted key — pass -replace-provider-key to overwrite it deliberately", providerName)
 		}
 	}
+	auditDB, err := openProviderAuditDB(cfg.Database.Path)
+	if err != nil {
+		return nil, fmt.Errorf("audit preflight: %w", err)
+	}
+	defer func() {
+		if sqlDB, dbErr := auditDB.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	}()
 
 	secret, err := readSecret()
 	if err != nil {
@@ -109,12 +131,27 @@ func runSetProviderKey(configPath, providerName string, allowReplace bool, readS
 
 	// candidate 模式：只在副本上改，原子替换成功前磁盘内容不变
 	candidate := *cfg
+	candidate.Providers = make(map[string]config.ProviderConfig, len(cfg.Providers))
+	for name, provider := range cfg.Providers {
+		candidate.Providers[name] = provider
+	}
 	pc := candidate.Providers[providerName]
 	pc.APIKey = "" // 持久化视图绝不持有明文
 	pc.APIKeyEncrypted = envelope
 	candidate.Providers[providerName] = pc
 
-	if err := atomicWriteConfigFile(configPath, &candidate); err != nil {
+	candidateBytes, err := config.MarshalYAML(&candidate)
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	if err := configaudit.New(audit.NewService(auditDB)).Run(configaudit.Mutation{
+		ConfigPath: configPath,
+		Candidate:  candidateBytes,
+		Event: models.AuditEvent{
+			Action: audit.ActionGlobalProviderSecretChanged, ActorType: "cli", ActorID: "set-provider-key",
+			TargetType: "provider", TargetID: providerName,
+		},
+	}); err != nil {
 		return nil, err
 	}
 
@@ -129,21 +166,37 @@ func runSetProviderKey(configPath, providerName string, allowReplace bool, readS
 	return res, nil
 }
 
-// atomicWriteConfigFile: 同目录临时文件 + rename 原子替换（与迁移引擎同语义）。
-func atomicWriteConfigFile(path string, cfg *config.Config) error {
-	data, err := config.MarshalYAML(cfg)
+func openProviderAuditDB(path string) (*gorm.DB, error) {
+	if path == "" {
+		return nil, errors.New("database path is required for audited provisioning")
+	}
+	st, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("database %s: %w (refusing to create)", path, err)
+		}
+		// Fresh-install provisioning may be the first database operation. It
+		// bootstraps the audit schema before the config candidate is persisted;
+		// this is never an unaudited config-write exception.
+		if dir := filepath.Dir(path); dir != "." {
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				return nil, fmt.Errorf("create database directory: %w", err)
+			}
+		}
+	} else if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("database %s is not a regular file", path)
 	}
-	tmp := path + ".provisioning"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("write temp config: %w", err)
+	db, err := database.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("replace config: %w", err)
+	if err := audit.MigrateIntegrity(db); err != nil {
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+		return nil, err
 	}
-	return nil
+	return db, nil
 }
 
 // newProviderKeyReader: 构造默认的 secret 读取器。

@@ -156,6 +156,8 @@ func TestP108B_ActionWhitelistIncludesApprovedManagementActions(t *testing.T) {
 		"CLIENT_SETTINGS_UPDATED":        true,
 		"CLIENT_PROVIDER_SECRET_CHANGED": true,
 		"CLIENT_MODELS_UPDATED":          true,
+		"SERVER_TOOLS_UPDATED":           true,
+		"GLOBAL_PROVIDER_SECRET_CHANGED": true,
 	}
 	if len(allowedActions) != len(expected) {
 		t.Fatalf("audit action whitelist must contain exactly the approved lifecycle/management actions, got %d", len(allowedActions))
@@ -174,10 +176,8 @@ func TestP108B_ActionWhitelistIncludesApprovedManagementActions(t *testing.T) {
 		"ADMIN_LOGIN_SUCCEEDED",
 		"ADMIN_LOGOUT",
 		"SETUP_COMPLETED",
-		"SERVER_TOOLS_UPDATED",
 		"REQUEST_BODY_CAPTURE_READ",
 		"ADMIN_PASSWORD_RESET",
-		"GLOBAL_PROVIDER_SECRET_CHANGED",
 		"REQUEST_LOG_SCRUB",
 		"PROVIDER_SECRET_MIGRATION",
 	} {

@@ -220,6 +220,26 @@ func TestP108B_S3_InvalidAndNotFoundProduceNoAudit(t *testing.T) {
 	}
 }
 
+func TestP108B_S4_EmptyClientSettingsIsTrueNoOp(t *testing.T) {
+	db, svc, cfg := newP108BS3Env(t)
+	client := createP108BS3Client(t, svc, cfg, "s4-empty-settings")
+	before, err := svc.GetClientByID(client.ID)
+	if err != nil || before == nil {
+		t.Fatal("client missing before empty settings test")
+	}
+	countBefore, headBefore := s3EventCount(t, db), s3Head(t, db)
+	if err := svc.UpdateClientSettings(client.ID, "trusted-session-admin", map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := svc.GetClientByID(client.ID)
+	if err != nil || after == nil {
+		t.Fatal("client missing after empty settings test")
+	}
+	if !reflect.DeepEqual(before, after) || s3EventCount(t, db) != countBefore || s3Head(t, db) != headBefore {
+		t.Fatalf("empty settings was not a true no-op: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestP108B_S3_CreateWithSettingsStillOnlyCreatesOneEvent(t *testing.T) {
 	db, svc, cfg := newP108BS3Env(t)
 	client, _, err := svc.CreateClientWithSettings("s3-create", "", "openai", "sk-", cfg, "trusted-session-admin", func(string) (map[string]interface{}, error) {

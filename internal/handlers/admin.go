@@ -11,13 +11,16 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/configaudit"
 	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
@@ -122,6 +125,7 @@ type AdminHandler struct {
 	loginLimiter  *auth.LoginRateLimiter
 	secretMgr     *secrets.Manager
 	configPath    string
+	configAudit   *configaudit.Coordinator
 	capture       *capture.Store // MEMORY-ONLY 诊断正文读取（SEC-003/P1-04C）；nil = 永不可用
 	wsUpgrader    *websocket.Upgrader
 	// P1-05B：与公开 API 面共享的 RateLimiter——DeleteClient 事务成功后
@@ -175,6 +179,7 @@ func NewAdminHandler(cfg *config.Config, clientService *services.ClientService, 
 		loginLimiter:  loginLimiter,
 		secretMgr:     secretMgr,
 		configPath:    configPath,
+		configAudit:   configaudit.New(clientService.AuditService()),
 		capture:       captureStore,
 		rateLimiter:   rateLimiter,
 		wsUpgrader: &websocket.Upgrader{
@@ -884,35 +889,57 @@ func (h *AdminHandler) ShowServerTools(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) UpdateServerTools(w http.ResponseWriter, r *http.Request) {
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 	r.ParseForm()
 
-	enabledTools := r.Form["tool"]
-
-	h.cfg.ServerTools.Tools = enabledTools
-	h.cfg.ServerTools.Enabled = len(enabledTools) > 0
-
-	// P1-03C3：持久化必须写真实配置来源路径（废除硬编码 "config.yaml"——
-	// 那会在配置不在 CWD 时分裂出第二份配置，并把运行态 cfg 落到错误位置）。
-	// h.cfg 为持久化视图：Provider 密钥只含信封，不含运行态明文。
-	if h.configPath == "" {
-		http.Error(w, "config source path unknown; refusing to persist", http.StatusInternalServerError)
-		return
-	}
-	if err := config.SaveConfig(h.cfg, h.configPath); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Update tool service
+	knownTools := make(map[string]bool)
 	for _, name := range h.toolService.ToolNames() {
-		enabled := false
-		for _, t := range enabledTools {
-			if t == name {
-				enabled = true
-				break
-			}
+		knownTools[name] = true
+	}
+	selected := make(map[string]bool)
+	for _, name := range r.Form["tool"] {
+		if !knownTools[name] {
+			http.Error(w, "Unknown server tool", http.StatusBadRequest)
+			return
 		}
-		_ = enabled // The tool service will be rebuilt on restart
+		selected[name] = true
+	}
+	enabledTools := make([]string, 0, len(selected))
+	for name := range selected {
+		enabledTools = append(enabledTools, name)
+	}
+	sort.Strings(enabledTools)
+
+	candidate := *h.cfg
+	candidate.ServerTools.Tools = enabledTools
+	candidate.ServerTools.Enabled = len(enabledTools) > 0
+	candidateBytes, err := config.MarshalYAML(&candidate)
+	if err != nil {
+		http.Error(w, "Failed to serialize config", http.StatusInternalServerError)
+		return
+	}
+	if h.configAudit == nil {
+		http.Error(w, "Config audit unavailable", http.StatusInternalServerError)
+		return
+	}
+	if err := h.configAudit.Run(configaudit.Mutation{
+		ConfigPath: h.configPath,
+		Candidate:  candidateBytes,
+		Event: models.AuditEvent{
+			Action: audit.ActionServerToolsUpdated, ActorType: "admin", ActorID: actor,
+			TargetType: "server", TargetID: "server-tools",
+		},
+		Apply: func() {
+			h.cfg.ServerTools = candidate.ServerTools
+		},
+	}); err != nil {
+		log.Printf("[ADMIN] server tools update failed: %v", err)
+		http.Error(w, "Failed to update server tools", http.StatusInternalServerError)
+		return
 	}
 
 	http.Redirect(w, r, "/admin/server-tools", http.StatusFound)

@@ -144,3 +144,26 @@ func TestP108B_S3_ProviderEncryptionFailureDoesNotMutate(t *testing.T) {
 		t.Fatalf("provider encryption failure leaked mutation: before=%+v after=%+v", before, after)
 	}
 }
+
+func TestP108B_S4_HTTPKeyRotationUsesValidatedSessionActor(t *testing.T) {
+	env := newP105Env(t)
+	client, _ := env.createTestClient(t, "s4-http-rotation")
+	token, err := auth.NewSQLiteStore(env.db).Create(context.Background(), "trusted-rotation-admin", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := trustedS3AdminPost(t, env, token, "/admin/clients/"+client.ID+"/regenerate?actor=evil-query-admin", "key_type=openai&key_prefix=sk-&reason=trusted-rotation&actor=evil-form-admin")
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("key rotation status=%d body=%s", w.Result().StatusCode, w.Body.String())
+	}
+	var event models.AuditEvent
+	if err := env.db.Where("target_id = ? AND action = ?", client.ID, audit.ActionClientKeyRotated).First(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	if event.ActorType != "admin" || event.ActorID != "trusted-rotation-admin" {
+		t.Fatalf("rotation used wrong actor: %+v", event)
+	}
+	if strings.Contains(event.ActorID+event.Reason+event.TargetID, "evil-") {
+		t.Fatal("forged rotation actor material reached audit event")
+	}
+}

@@ -69,6 +69,12 @@ func NewClientService(db *gorm.DB) *ClientService {
 	return &ClientService{db: db, audit: audit.NewService(db)}
 }
 
+// AuditService exposes the service-owned audit writer to other coordinators
+// that share the same database, such as config-backed admin mutations.
+func (s *ClientService) AuditService() *audit.Service {
+	return s.audit
+}
+
 // lifecycleTransitionError: 条件更新 RowsAffected==0 时，区分 client 不存在 /
 // 已 revoked / 非目标状态（§3 terminal invariants 的 sentinel 映射）。
 func lifecycleTransitionError(tx *gorm.DB, id, op string) error {
@@ -244,6 +250,9 @@ func (s *ClientService) UpdateClientSettings(id, actor string, updates map[strin
 	filtered, err := filterSettings(updates)
 	if err != nil {
 		return err
+	}
+	if len(filtered) == 0 {
+		return nil
 	}
 	_, hasSecret := filtered["backend_api_key_encrypted"]
 	_, hasModels := filtered["backend_models"]

@@ -13,7 +13,10 @@ import (
 	"strings"
 	"testing"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/database"
+	"ai-gateway/internal/models"
 	"ai-gateway/internal/secrets"
 )
 
@@ -31,8 +34,20 @@ func mustProvCipher(t *testing.T) *secrets.AESGCMCipher {
 
 func writeProvConfig(t *testing.T, providerLines string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	content := "server:\n  host: 127.0.0.1\n  port: 8090\nadmin:\n  username: admin\nproviders:\n  openai:\n" + providerLines
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "gateway.db")
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.MigrateIntegrity(db); err != nil {
+		t.Fatal(err)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+	content := "server:\n  host: 127.0.0.1\n  port: 8090\nadmin:\n  username: admin\ndatabase:\n  path: \"" + filepath.ToSlash(dbPath) + "\"\nproviders:\n  openai:\n" + providerLines
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +61,28 @@ func runProv(t *testing.T, configPath, provider string, allowReplace bool, secre
 	reader := newProviderKeyReader(strings.NewReader(secret+"\n"), true)
 	_, err := runSetProviderKey(configPath, provider, allowReplace, reader, &out)
 	return out.String(), err
+}
+
+func provisionAuditEvents(t *testing.T, configPath string) []models.AuditEvent {
+	t.Helper()
+	cfg, err := config.LoadExistingForMigration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(cfg.Database.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+	var events []models.AuditEvent
+	if err := db.Order("id ASC").Find(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	return events
 }
 
 // Happy path：EMPTY provider → 表单 canary 经隐藏输入加密落盘；明文/信封绝不进 stdout
@@ -73,6 +110,10 @@ func TestProvision_SetProviderKey_HappyPath(t *testing.T) {
 	}
 	if !secrets.IsEncryptedEnvelope(p.APIKeyEncrypted) {
 		t.Fatalf("[安全回归失败] api_key_encrypted 应为信封，实际 %q", p.APIKeyEncrypted)
+	}
+	events := provisionAuditEvents(t, path)
+	if len(events) != 1 || events[0].Action != audit.ActionGlobalProviderSecretChanged || events[0].ActorType != "cli" || events[0].ActorID != "set-provider-key" || events[0].TargetType != "provider" || events[0].TargetID != "openai" || events[0].Reason != "" {
+		t.Fatalf("provisioning audit event mismatch: %+v", events)
 	}
 	mgr := secrets.NewManager(mustProvCipher(t))
 	pt, err := mgr.DecryptGlobalProviderKey("openai", p.APIKeyEncrypted)
@@ -116,6 +157,22 @@ func TestProvision_UnknownProvider_Refused(t *testing.T) {
 	after, _ := os.ReadFile(path)
 	if !bytes.Equal(before, after) {
 		t.Fatal("[安全回归失败] 拒绝路径修改了 config")
+	}
+}
+
+func TestProvision_InvalidProviderName_RefusedWithoutMutation(t *testing.T) {
+	for _, name := range []string{"", "bad\nname", strings.Repeat("p", 65)} {
+		t.Run("invalid", func(t *testing.T) {
+			path := writeProvConfig(t, "    type: openai\n")
+			before, _ := os.ReadFile(path)
+			if _, err := runProv(t, path, name, false, provCanary); err == nil {
+				t.Fatal("invalid provider name must be rejected")
+			}
+			after, _ := os.ReadFile(path)
+			if !bytes.Equal(before, after) {
+				t.Fatal("invalid provider name changed config")
+			}
+		})
 	}
 }
 
@@ -176,6 +233,9 @@ func TestProvision_EncryptedExists_ReplaceSemantics(t *testing.T) {
 	if newEnv == "" || newEnv == oldEnv {
 		t.Fatalf("[安全回归失败] 应产生新信封，实际 %q", newEnv)
 	}
+	if events := provisionAuditEvents(t, path); len(events) != 1 || events[0].Action != audit.ActionGlobalProviderSecretChanged {
+		t.Fatalf("replacement should append exactly one global provider audit event: %+v", events)
+	}
 	pt, err := mgr.DecryptGlobalProviderKey("openai", newEnv)
 	if err != nil || string(pt) != provCanaryRotated {
 		t.Fatalf("新信封应解密为新 key，实际 %q err=%v", string(pt), err)
@@ -198,6 +258,32 @@ func TestProvision_MasterKeyMissing_FailClosed(t *testing.T) {
 	after, _ := os.ReadFile(path)
 	if !bytes.Equal(before, after) {
 		t.Fatal("[安全回归失败] 失败路径修改了 config")
+	}
+}
+
+func TestProvision_AuditPreflightFailureLeavesConfigUnchanged(t *testing.T) {
+	path := writeProvConfig(t, "    type: openai\n")
+	cfg, err := config.LoadExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(cfg.Database.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+		t.Fatal(err)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+	before, _ := os.ReadFile(path)
+	if _, err := runProv(t, path, "openai", false, provCanary); err == nil {
+		t.Fatal("corrupt audit preflight must reject provider provisioning")
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("audit preflight failure changed config")
 	}
 }
 
