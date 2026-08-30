@@ -195,7 +195,7 @@ func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := middleware.ReadRequestBody(r)
 	if err != nil {
 		writeOpenAIError(r, w, http.StatusBadRequest, "Failed to read request body", "invalid_request_error")
 		return
@@ -831,7 +831,9 @@ func (h *OpenAIHandler) CountTokens(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Prompt string `json:"prompt"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if body, err := middleware.ReadRequestBody(r); err == nil {
+		_ = json.Unmarshal(body, &req)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"tokens": len(req.Prompt) / 4})
 }

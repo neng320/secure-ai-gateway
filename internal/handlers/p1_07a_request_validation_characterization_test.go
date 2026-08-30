@@ -267,7 +267,7 @@ func TestP107A_OpenAIRequestBodyIsJSONObjectContractOnlyByHandler(t *testing.T) 
 	t.Log("[CURRENT] JSON object parsing is protocol-specific and accepts charset parameter")
 }
 
-func TestP107A_CountTokensCurrentBehavior(t *testing.T) {
+func TestP107B_CountTokensUsesValidatedBody(t *testing.T) {
 	h := &OpenAIHandler{}
 	for _, tc := range []struct {
 		name string
@@ -276,7 +276,7 @@ func TestP107A_CountTokensCurrentBehavior(t *testing.T) {
 	}{
 		{name: "prompt", body: `{"prompt":"abcdefgh"}`, want: 2},
 		{name: "malformed", body: `{"prompt":`, want: 0},
-		{name: "trailing value is ignored", body: `{"prompt":"abcdefgh"}{}`, want: 2},
+		{name: "trailing value is not parsed by direct fallback", body: `{"prompt":"abcdefgh"}{}`, want: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(tc.body))
@@ -291,5 +291,5 @@ func TestP107A_CountTokensCurrentBehavior(t *testing.T) {
 			}
 		})
 	}
-	t.Log("[KNOWN-GAP] count_tokens uses Decoder without error/trailing-value validation and returns len(prompt)/4")
+	t.Log("[FIXED] public RequestValidation rejects malformed/trailing count_tokens input before this handler; valid prompt still returns len(prompt)/4")
 }

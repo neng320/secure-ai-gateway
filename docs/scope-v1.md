@@ -63,6 +63,19 @@ P1-06 overall：✅ COMPLETE
         P1-07 继续负责更完整的 request-structure validation。
 ```
 
+### P1-07 Request Validation 执行状态（2026-08-30）
+
+```text
+P1-07A Request Validation Characterization ✅（PR #20；merge dc2db17c）
+  仅 tests/docs；固化 10 MiB body cap、JSON/media/schema 缺口与 upstream bypass 事实。
+P1-07B Request Validation Enforcement ✅（本分支）
+  完成：Auth→Rate→Validation→Quota 顺序、一次 bounded body read/context 复用、
+        stable 413/415 JSON errors、JSON depth 64、protocol minimums、
+        model/token/collection bounds、invalid input upstream=0 canaries。
+P1-07 overall：🟠 VERIFYING（待本分支 PR/CI/merge 门禁完成）
+  P1-08 不在本任务范围内。
+```
+
 ### Hardening Backlog（非阻塞，SEC-002 保持 CLOSED）
 
 | ID | 描述 | 来源 | 状态 |

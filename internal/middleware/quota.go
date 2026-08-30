@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
 
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/services"
@@ -15,26 +14,12 @@ import (
 )
 
 func IsQuotaRequest(r *http.Request) bool {
-	if r.Method != http.MethodPost {
+	switch requestKindFor(r) {
+	case requestKindOpenAIChat, requestKindGeminiGenerate, requestKindGeminiStream:
+		return true
+	default:
 		return false
 	}
-	path := r.URL.Path
-	switch path {
-	case "/v1/chat/completions", "/chat/completions", "/v1/messages":
-		return true
-	}
-	return isGeminiGenerativePath(path)
-}
-
-func isGeminiGenerativePath(path string) bool {
-	for _, prefix := range []string{"/v1/models/", "/v1beta/models/"} {
-		if !strings.HasPrefix(path, prefix) {
-			continue
-		}
-		modelAction := strings.TrimPrefix(path, prefix)
-		return strings.HasSuffix(modelAction, ":generateContent") || strings.HasSuffix(modelAction, ":streamGenerateContent")
-	}
-	return false
 }
 
 func NewQuotaMiddleware(db *gorm.DB) func(http.Handler) http.Handler {
@@ -46,10 +31,14 @@ func NewQuotaMiddleware(db *gorm.DB) func(http.Handler) http.Handler {
 				return
 			}
 			client := GetClientFromContext(r.Context())
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				writeQuotaError(w, services.ErrQuotaConfiguration)
-				return
+			body, ok := RequestBodyFromContext(r.Context())
+			if !ok {
+				var err error
+				body, err = ReadRequestBody(r)
+				if err != nil {
+					writeQuotaError(w, services.ErrQuotaConfiguration)
+					return
+				}
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			inputReservation, outputReservation := requestReservations(client, body)
