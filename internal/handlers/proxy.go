@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -243,28 +244,53 @@ func (h *ProxyHandler) StreamGenerateContent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	buffer := make([]byte, 1024)
-	for {
-		n, err := resp.Body.Read(buffer)
-		if n > 0 {
-			w.Write(buffer[:n])
-			flusher.Flush()
+	var inputTokens, outputTokens int
+	var usageFound bool
+	scanner := bufio.NewScanner(resp.Body)
+	// Keep stream parsing bounded: Gemini SSE data lines are expected to be
+	// small, and an oversized line is treated as an incomplete stream.
+	scanner.Buffer(make([]byte, 4<<10), 1<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "data:") {
+			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if payload != "" && payload != "[DONE]" {
+				var chunk services.GeminiResponse
+				if json.Unmarshal([]byte(payload), &chunk) == nil && chunk.UsageMetadata != nil {
+					inputTokens = chunk.UsageMetadata.PromptTokenCount
+					outputTokens = chunk.UsageMetadata.CandidatesTokenCount
+					usageFound = true
+				}
+			}
 		}
-		if err != nil {
-			break
+		_, _ = io.WriteString(w, line+"\n")
+		flusher.Flush()
+	}
+	if err := scanner.Err(); err != nil {
+		// A partial/oversized stream has no chargeable completion. The quota
+		// middleware's deferred Release will clear any reservation.
+		return
+	}
+	if resp.StatusCode < http.StatusBadRequest && !usageFound {
+		if reservation := services.UsageReservationFromContext(r.Context()); reservation != nil {
+			// Missing provider metadata must not become a zero-token bypass.
+			inputTokens, outputTokens = reservation.ConservativeUsage()
 		}
 	}
 
 	h.geminiService.LogRequest(services.RequestRecord{
-		RequestID:   middleware.GetRequestID(r),
-		ClientID:    client.ID,
-		Provider:    "gemini",
-		Model:       model,
-		StatusCode:  resp.StatusCode,
-		LatencyMs:   int(time.Since(streamStart).Milliseconds()),
-		ErrorCode:   services.ClassifyUpstreamError(resp.StatusCode, nil),
-		IsStreaming: true,
-		Reservation: services.UsageReservationFromContext(r.Context()),
+		RequestID:    middleware.GetRequestID(r),
+		ClientID:     client.ID,
+		Provider:     "gemini",
+		Model:        model,
+		StatusCode:   resp.StatusCode,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		LatencyMs:    int(time.Since(streamStart).Milliseconds()),
+		ErrorCode:    services.ClassifyUpstreamError(resp.StatusCode, nil),
+		IsStreaming:  true,
+		Reservation:  services.UsageReservationFromContext(r.Context()),
 	})
 
 	if h.statsService != nil {

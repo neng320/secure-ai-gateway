@@ -19,10 +19,22 @@ func IsQuotaRequest(r *http.Request) bool {
 		return false
 	}
 	path := r.URL.Path
-	if strings.HasSuffix(path, "/count_tokens") {
-		return false
+	switch path {
+	case "/v1/chat/completions", "/chat/completions", "/v1/messages":
+		return true
 	}
-	return strings.HasSuffix(path, "/chat/completions") || strings.Contains(path, ":generateContent")
+	return isGeminiGenerativePath(path)
+}
+
+func isGeminiGenerativePath(path string) bool {
+	for _, prefix := range []string{"/v1/models/", "/v1beta/models/"} {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		modelAction := strings.TrimPrefix(path, prefix)
+		return strings.HasSuffix(modelAction, ":generateContent") || strings.HasSuffix(modelAction, ":streamGenerateContent")
+	}
+	return false
 }
 
 func NewQuotaMiddleware(db *gorm.DB) func(http.Handler) http.Handler {
