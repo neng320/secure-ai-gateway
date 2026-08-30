@@ -184,7 +184,7 @@ func (e *gateEnv) createGateClient(t *testing.T, backend, overrideBaseURL string
 	if overrideKeyEnv != "" {
 		updates["backend_api_key_encrypted"] = overrideKeyEnv
 	}
-	if err := e.clientSvc.UpdateClientSettings(client.ID, updates); err != nil {
+	if err := e.clientSvc.UpdateClientSettings(client.ID, "test-admin", updates); err != nil {
 		t.Fatal(err)
 	}
 	return client.ID, gwKey
@@ -268,7 +268,7 @@ func TestMigrationGate_ClientEncryptedOverride_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := e.clientSvc.UpdateClientSettings(client.ID, map[string]interface{}{
+	if err := e.clientSvc.UpdateClientSettings(client.ID, "test-admin", map[string]interface{}{
 		"backend_base_url":          e.upstream.URL + "/v1",
 		"backend_api_key_encrypted": envC,
 	}); err != nil {

@@ -244,6 +244,62 @@ func TestP108B_S21_RecordStaticGateHasNoApplicationRetry(t *testing.T) {
 	}
 }
 
+func TestP108B_S3_StaticManagementAuditBoundaries(t *testing.T) {
+	root := p105bModuleRoot(t)
+	auditSrc := p105bRead(t, root, "internal/audit/audit.go")
+	for _, action := range []string{
+		"ActionClientSettingsUpdated",
+		"ActionClientProviderSecretChanged",
+		"ActionClientModelsUpdated",
+	} {
+		if !strings.Contains(auditSrc, action) {
+			t.Fatalf("missing Slice 3 fixed action %q", action)
+		}
+	}
+	serviceSrc := p105bRead(t, root, "internal/services/client.go")
+	for _, marker := range []string{
+		"func (s *ClientService) UpdateClientSettings(id, actor string",
+		"func (s *ClientService) UpdateClientModels(id, actor, modelList string)",
+		"s.db.Transaction(func(tx *gorm.DB) error",
+		"audit.ActionClientSettingsUpdated",
+		"audit.ActionClientProviderSecretChanged",
+		"audit.ActionClientModelsUpdated",
+	} {
+		if !strings.Contains(serviceSrc, marker) {
+			t.Fatalf("management audit transaction boundary missing %q", marker)
+		}
+	}
+	adminSrc := p105bRead(t, root, "internal/handlers/admin.go")
+	if strings.Contains(adminSrc, "audit.Record(") {
+		t.Fatal("Admin handlers must not append management audit outside ClientService transactions")
+	}
+	fetchStart := strings.Index(adminSrc, "func (h *AdminHandler) FetchClientModels")
+	if fetchStart < 0 {
+		t.Fatal("FetchClientModels handler not found")
+	}
+	fetchBlock := adminSrc[fetchStart:]
+	if end := strings.Index(fetchBlock, "\nfunc "); end >= 0 {
+		fetchBlock = fetchBlock[:end]
+	}
+	for _, forbidden := range []string{"UpdateClientModels", ".Updates(", ".Save("} {
+		if strings.Contains(fetchBlock, forbidden) {
+			t.Fatalf("GET FetchClientModels contains persistence call %q", forbidden)
+		}
+	}
+	if strings.Contains(adminSrc, "UpdateClientSettings(id, h.cfg.Admin.Username") ||
+		strings.Contains(adminSrc, "UpdateClientModels(id, h.cfg.Admin.Username") ||
+		strings.Contains(adminSrc, "SuspendClient(id, h.cfg.Admin.Username") ||
+		strings.Contains(adminSrc, "ResumeClient(id, h.cfg.Admin.Username") ||
+		strings.Contains(adminSrc, "RevokeClient(id, h.cfg.Admin.Username") ||
+		strings.Contains(adminSrc, "DeleteClient(id, h.cfg.Admin.Username") {
+		t.Fatal("audited Admin mutation passes config-derived actor")
+	}
+	openaiSrc := p105bRead(t, root, "internal/handlers/openai.go")
+	if strings.Contains(openaiSrc, "UpdateClientModels") || strings.Contains(openaiSrc, "updateClientModels") {
+		t.Fatal("public OpenAI handler must not persist fetched models without an admin actor")
+	}
+}
+
 func TestP108B_S1_StaticGate_DedicatedAuditMigrationOwnership(t *testing.T) {
 	root := p105bModuleRoot(t)
 	mainSrc := p105bRead(t, root, "cmd/server/main.go")
@@ -325,8 +381,8 @@ func TestP105C_StaticGate_TrustedActorAndBoundedClientWrites(t *testing.T) {
 	if strings.Contains(clientSrc, ".Save(") {
 		t.Fatal("[static] client service must not use whole-row Save")
 	}
-	if got := strings.Count(clientSrc, "s.audit.RecordTx"); got != 6 {
-		t.Fatalf("[static] six lifecycle mutations must each append one audit event, found %d RecordTx calls", got)
+	if got := strings.Count(clientSrc, "s.audit.RecordTx"); got != 10 {
+		t.Fatalf("[static] six lifecycle plus four management category append points must each call RecordTx, found %d", got)
 	}
 	for _, rel := range []string{"internal/handlers/admin.go", "internal/handlers/openai.go"} {
 		if strings.Contains(p105bRead(t, root, rel), ".Save(") {

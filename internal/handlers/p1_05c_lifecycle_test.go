@@ -315,11 +315,11 @@ func TestP105C_I_SettingsCannotResurrectRevoked(t *testing.T) {
 	}
 
 	// 服务层：白名单外字段（is_active）被拒绝
-	if err := env.clientSvc.UpdateClientSettings(c.ID, map[string]interface{}{"is_active": true}); !errors.Is(err, services.ErrInvalidSettingsField) {
+	if err := env.clientSvc.UpdateClientSettings(c.ID, "test-admin", map[string]interface{}{"is_active": true}); !errors.Is(err, services.ErrInvalidSettingsField) {
 		t.Fatalf("[I] settings 写入 is_active 应被拒绝（ErrInvalidSettingsField），实际 %v", err)
 	}
 	// 合法 settings 编辑允许（name 等），但不复活
-	if err := env.clientSvc.UpdateClientSettings(c.ID, map[string]interface{}{"name": "p105c-i-renamed"}); err != nil {
+	if err := env.clientSvc.UpdateClientSettings(c.ID, "test-admin", map[string]interface{}{"name": "p105c-i-renamed"}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := env.clientSvc.GetClientByID(c.ID)
@@ -732,7 +732,7 @@ func TestP105C_W_AuditSecretCanaryZero(t *testing.T) {
 	// client 网关 key 用 canary 注入（哈希落库）
 	c := env.insertClientWithKey(t, "p105c-w", p105cClientKey, true)
 	// provider secret canary：经真实 AES-GCM Manager 写入信封（明文不进库）
-	if err := env.clientSvc.UpdateClientSettings(c.ID, map[string]interface{}{
+	if err := env.clientSvc.UpdateClientSettings(c.ID, "test-admin", map[string]interface{}{
 		"backend_api_key_encrypted": p105cEncryptedProviderKey(t, c.ID, p105cProviderSec),
 	}); err != nil {
 		t.Fatal(err)
@@ -761,10 +761,10 @@ func TestP105C_W_AuditSecretCanaryZero(t *testing.T) {
 	if err := env.db.Order("id ASC").Find(&evs).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(evs) != 5 {
-		t.Fatalf("[W] direct-insert client 的生命周期应有 5 条事件，实际 %d", len(evs))
+	if len(evs) != 6 {
+		t.Fatalf("[W] direct-insert client 的管理/生命周期应有 6 条事件，实际 %d", len(evs))
 	}
-	wantActions := []string{"CLIENT_KEY_ROTATED", "CLIENT_SUSPENDED", "CLIENT_RESUMED", "CLIENT_REVOKED", "CLIENT_DELETED"}
+	wantActions := []string{"CLIENT_PROVIDER_SECRET_CHANGED", "CLIENT_KEY_ROTATED", "CLIENT_SUSPENDED", "CLIENT_RESUMED", "CLIENT_REVOKED", "CLIENT_DELETED"}
 	if gotActions := actionsOf(evs); strings.Join(gotActions, "|") != strings.Join(wantActions, "|") {
 		t.Fatalf("[W] 生命周期事件顺序不符，实际 %v", gotActions)
 	}

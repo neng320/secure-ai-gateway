@@ -161,7 +161,7 @@ func (e *p104Env) newP104Client(t *testing.T, name, backend, baseURLOverride str
 	if baseURLOverride != "" {
 		updates["backend_base_url"] = baseURLOverride
 	}
-	if err := e.clientService.UpdateClientSettings(client.ID, updates); err != nil {
+	if err := e.clientService.UpdateClientSettings(client.ID, "test-admin", updates); err != nil {
 		t.Fatal(err)
 	}
 	return client.ID, gwKey
@@ -456,7 +456,7 @@ func TestP104B_Fixed_RuntimeLog_BoundedErrorCodeOnly(t *testing.T) {
 	if err != nil || client == nil {
 		t.Fatal("client 不存在")
 	}
-	if err := env.clientService.UpdateClientSettings(client.ID, map[string]interface{}{"fallback_models": "fallback-x"}); err != nil {
+	if err := env.clientService.UpdateClientSettings(client.ID, "test-admin", map[string]interface{}{"fallback_models": "fallback-x"}); err != nil {
 		t.Fatal(err)
 	}
 

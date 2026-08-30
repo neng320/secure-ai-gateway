@@ -145,17 +145,20 @@ func TestP108A_RecordTxParticipatesInCallerTransaction(t *testing.T) {
 	}
 }
 
-func TestP108A_ActionWhitelistIsLifecycleOnly(t *testing.T) {
+func TestP108B_ActionWhitelistIncludesApprovedManagementActions(t *testing.T) {
 	expected := map[string]bool{
-		"CLIENT_CREATED":     true,
-		"CLIENT_KEY_ROTATED": true,
-		"CLIENT_SUSPENDED":   true,
-		"CLIENT_RESUMED":     true,
-		"CLIENT_REVOKED":     true,
-		"CLIENT_DELETED":     true,
+		"CLIENT_CREATED":                 true,
+		"CLIENT_KEY_ROTATED":             true,
+		"CLIENT_SUSPENDED":               true,
+		"CLIENT_RESUMED":                 true,
+		"CLIENT_REVOKED":                 true,
+		"CLIENT_DELETED":                 true,
+		"CLIENT_SETTINGS_UPDATED":        true,
+		"CLIENT_PROVIDER_SECRET_CHANGED": true,
+		"CLIENT_MODELS_UPDATED":          true,
 	}
 	if len(allowedActions) != len(expected) {
-		t.Fatalf("P1-08A baseline must have exactly six whitelisted actions, got %d", len(allowedActions))
+		t.Fatalf("audit action whitelist must contain exactly the approved lifecycle/management actions, got %d", len(allowedActions))
 	}
 	for action := range expected {
 		if !IsKnownAction(action) || !allowedActions[action] {
@@ -171,9 +174,6 @@ func TestP108A_ActionWhitelistIsLifecycleOnly(t *testing.T) {
 		"ADMIN_LOGIN_SUCCEEDED",
 		"ADMIN_LOGOUT",
 		"SETUP_COMPLETED",
-		"CLIENT_SETTINGS_UPDATED",
-		"CLIENT_PROVIDER_SECRET_CHANGED",
-		"CLIENT_MODELS_UPDATED",
 		"SERVER_TOOLS_UPDATED",
 		"REQUEST_BODY_CAPTURE_READ",
 		"ADMIN_PASSWORD_RESET",
@@ -182,7 +182,7 @@ func TestP108A_ActionWhitelistIsLifecycleOnly(t *testing.T) {
 		"PROVIDER_SECRET_MIGRATION",
 	} {
 		if IsKnownAction(action) {
-			t.Fatalf("P1-08A baseline must not claim unsupported action %q", action)
+			t.Fatalf("audit whitelist must not claim unsupported action %q", action)
 		}
 	}
 }

@@ -237,33 +237,71 @@ func filterSettings(updates map[string]interface{}) (map[string]interface{}, err
 	return filtered, nil
 }
 
-// UpdateClientSettings: allowlisted settings update（只写白名单列 + UpdatedAt；
-// 部分字段更新，未提供的列保持不变）。不产生 audit event（非 lifecycle action）；
-// 任何路径都无法清 RevokedAt / 改 RevokedBy / 写回 APIKeyHash / 把 IsActive
-// 重新设 true（§3 terminal invariants）。
-func (s *ClientService) UpdateClientSettings(id string, updates map[string]interface{}) error {
+// UpdateClientSettings: allowlisted settings mutation plus category audit in
+// one SQLite transaction. The actor is supplied by the authenticated admin
+// request context; no handler-side mutation or standalone audit is allowed.
+func (s *ClientService) UpdateClientSettings(id, actor string, updates map[string]interface{}) error {
 	filtered, err := filterSettings(updates)
 	if err != nil {
 		return err
 	}
-	filtered["updated_at"] = time.Now()
-
-	// SQLite 对值未变化的行 RowsAffected=0——存在性必须显式预检，不能靠 RowsAffected 判 not-found
-	var n int64
-	if err := s.db.Model(&models.Client{}).Where("id = ?", id).Count(&n).Error; err != nil {
-		return err
+	_, hasSecret := filtered["backend_api_key_encrypted"]
+	_, hasModels := filtered["backend_models"]
+	hasGeneral := false
+	for key := range filtered {
+		if key != "backend_api_key_encrypted" && key != "backend_models" {
+			hasGeneral = true
+			break
+		}
 	}
-	if n == 0 {
-		return ErrClientNotFound
-	}
-	return s.db.Model(&models.Client{}).Where("id = ?", id).Updates(filtered).Error
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var client models.Client
+		if err := tx.Select("id").Where("id = ?", id).First(&client).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrClientNotFound
+			}
+			return err
+		}
+		filtered["updated_at"] = time.Now()
+		if err := tx.Model(&models.Client{}).Where("id = ?", id).Updates(filtered).Error; err != nil {
+			return err
+		}
+		if hasGeneral {
+			if err := s.audit.RecordTx(tx, models.AuditEvent{Action: audit.ActionClientSettingsUpdated, ActorType: "admin", ActorID: actor, TargetType: "client", TargetID: id}); err != nil {
+				return err
+			}
+		}
+		if hasSecret {
+			if err := s.audit.RecordTx(tx, models.AuditEvent{Action: audit.ActionClientProviderSecretChanged, ActorType: "admin", ActorID: actor, TargetType: "client", TargetID: id}); err != nil {
+				return err
+			}
+		}
+		if hasModels {
+			if err := s.audit.RecordTx(tx, models.AuditEvent{Action: audit.ActionClientModelsUpdated, ActorType: "admin", ActorID: actor, TargetType: "client", TargetID: id}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
-// UpdateClientModels: dedicated bounded update（FetchClientModels/UpdateClientModels
-// 不再整行 Save）——只写 backend_models + updated_at。
-func (s *ClientService) UpdateClientModels(id, modelList string) error {
-	return s.db.Model(&models.Client{}).Where("id = ?", id).
-		Updates(map[string]interface{}{"backend_models": modelList, "updated_at": time.Now()}).Error
+// UpdateClientModels: dedicated bounded model update plus audit in one
+// transaction. Fetch-only paths must not call this method.
+func (s *ClientService) UpdateClientModels(id, actor, modelList string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var client models.Client
+		if err := tx.Select("id").Where("id = ?", id).First(&client).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrClientNotFound
+			}
+			return err
+		}
+		if err := tx.Model(&models.Client{}).Where("id = ?", id).
+			Updates(map[string]interface{}{"backend_models": modelList, "updated_at": time.Now()}).Error; err != nil {
+			return err
+		}
+		return s.audit.RecordTx(tx, models.AuditEvent{Action: audit.ActionClientModelsUpdated, ActorType: "admin", ActorID: actor, TargetType: "client", TargetID: id})
+	})
 }
 
 // SuspendClient: ACTIVE → SUSPENDED（§13）。reason required；hash 保留；

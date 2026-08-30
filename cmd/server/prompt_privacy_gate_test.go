@@ -329,14 +329,14 @@ func TestPromptPrivacyGate_DefaultMode_NoPlaintextAnywhere(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.UpdateClientSettings(cA.ID, map[string]interface{}{"backend": "openai"}); err != nil {
+	if err := svc.UpdateClientSettings(cA.ID, "test-admin", map[string]interface{}{"backend": "openai"}); err != nil {
 		t.Fatal(err)
 	}
 	cB, gwB, err := svc.CreateClient("pp-override", "", "openai", "sk-", env.cfg, "test-admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.UpdateClientSettings(cB.ID, map[string]interface{}{
+	if err := svc.UpdateClientSettings(cB.ID, "test-admin", map[string]interface{}{
 		"backend":          "openai",
 		"backend_base_url": env.upstream.URL + "/v1",
 	}); err != nil {
@@ -406,7 +406,7 @@ func TestPromptPrivacyGate_RuntimeUpstreamError_BoundedOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.UpdateClientSettings(c.ID, map[string]interface{}{
+	if err := svc.UpdateClientSettings(c.ID, "test-admin", map[string]interface{}{
 		"backend":         "openai",
 		"fallback_models": "fallback-x",
 	}); err != nil {
@@ -440,7 +440,7 @@ func TestPromptPrivacyGate_DiagnosticMode_MemoryOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.UpdateClientSettings(c.ID, map[string]interface{}{}); err != nil {
+	if err := svc.UpdateClientSettings(c.ID, "test-admin", map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -482,7 +482,7 @@ func TestPromptPrivacyGate_Bounds_TruncationThroughEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.UpdateClientSettings(c.ID, map[string]interface{}{}); err != nil {
+	if err := svc.UpdateClientSettings(c.ID, "test-admin", map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -160,7 +160,7 @@ func (e *fallbackEnv) createFallbackClient(t *testing.T, overrideKey string, ove
 		}
 		updates["backend_api_key_encrypted"] = env
 	}
-	if err := e.clientSvc.UpdateClientSettings(client.ID, updates); err != nil {
+	if err := e.clientSvc.UpdateClientSettings(client.ID, "test-admin", updates); err != nil {
 		t.Fatal(err)
 	}
 	return client

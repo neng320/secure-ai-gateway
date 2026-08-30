@@ -34,7 +34,7 @@ func TestP104C_CaptureEnabled_E2E_MemoryOnly(t *testing.T) {
 	if err != nil || client == nil {
 		t.Fatal("client 不存在")
 	}
-	if err := env.clientService.UpdateClientSettings(clientID, map[string]interface{}{"max_output_tokens": 100}); err != nil { // 触发 cap，验证捕获的是原始 payload
+	if err := env.clientService.UpdateClientSettings(clientID, "test-admin", map[string]interface{}{"max_output_tokens": 100}); err != nil { // 触发 cap，验证捕获的是原始 payload
 		t.Fatal(err)
 	}
 

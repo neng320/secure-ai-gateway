@@ -190,7 +190,7 @@ func (e *keyFlowEnv) createClientWithKey(t *testing.T, backendAPIKey string) *mo
 		}
 		updates["backend_api_key_encrypted"] = env
 	}
-	if err := e.clientService.UpdateClientSettings(client.ID, updates); err != nil {
+	if err := e.clientService.UpdateClientSettings(client.ID, "test-admin", updates); err != nil {
 		t.Fatal(err)
 	}
 	return client
@@ -288,7 +288,7 @@ func TestP103A_KeyPrecedence_ClientKeyWins_ThenGlobalFallback(t *testing.T) {
 	}
 
 	// b) client key 清空（encrypted 字段清空，BaseURL 保留）→ 全局 key 回退
-	if err := env.clientService.UpdateClientSettings(client.ID, map[string]interface{}{"backend_api_key_encrypted": ""}); err != nil {
+	if err := env.clientService.UpdateClientSettings(client.ID, "test-admin", map[string]interface{}{"backend_api_key_encrypted": ""}); err != nil {
 		t.Fatal(err)
 	}
 	env.doChat(t, clientAPIKeyOf(t, env, client), "test-model")
@@ -297,7 +297,7 @@ func TestP103A_KeyPrecedence_ClientKeyWins_ThenGlobalFallback(t *testing.T) {
 	}
 
 	// c) client key 与 BaseURL 都空 → registry 全局 provider（其 BaseURL 亦为 upstream）
-	if err := env.clientService.UpdateClientSettings(client.ID, map[string]interface{}{"backend_base_url": ""}); err != nil {
+	if err := env.clientService.UpdateClientSettings(client.ID, "test-admin", map[string]interface{}{"backend_base_url": ""}); err != nil {
 		t.Fatal(err)
 	}
 	env.doChat(t, clientAPIKeyOf(t, env, client), "test-model")

@@ -94,6 +94,15 @@ func KnownProviderTypes() []string {
 // adminCSRFKey: request context 中携带的会话绑定 CSRF token
 type adminCSRFKey struct{}
 
+// adminActorKey carries the username returned by the server-side session
+// store. It is private so clients cannot forge the value.
+type adminActorKey struct{}
+
+func adminActorFromContext(ctx context.Context) (string, bool) {
+	actor, ok := ctx.Value(adminActorKey{}).(string)
+	return actor, ok && strings.TrimSpace(actor) != ""
+}
+
 func csrfFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(adminCSRFKey{}).(string); ok {
 		return v
@@ -232,14 +241,16 @@ func (h *AdminHandler) RequireAuth(next http.Handler) http.Handler {
 
 		// SEC-001 修复（P1-01D）：服务端权威校验——存在 / 未撤销 / 未过期。
 		// Cookie 内容本身不再是权限；任何无法通过服务端会话校验的值一律拒绝。
-		if _, err := h.sessionStore.Validate(r.Context(), cookie.Value); err != nil {
+		username, err := h.sessionStore.Validate(r.Context(), cookie.Value)
+		if err != nil {
 			log.Printf("[ADMIN] session rejected (%s): %v", r.URL.Path, err)
 			http.Redirect(w, r, "/admin/login", http.StatusFound)
 			return
 		}
 
 		// SEC-004 修复（P1-02B）：派生会话绑定 CSRF token 注入 context，供模板渲染
-		ctx := context.WithValue(r.Context(), adminCSRFKey{}, auth.CSRFToken(h.cfg.Admin.SessionSecret, cookie.Value))
+		ctx := context.WithValue(r.Context(), adminActorKey{}, username)
+		ctx = context.WithValue(ctx, adminCSRFKey{}, auth.CSRFToken(h.cfg.Admin.SessionSecret, cookie.Value))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -524,6 +535,11 @@ func (h *AdminHandler) buildClientRuntimeProviderConfig(client *models.Client, t
 }
 
 func (h *AdminHandler) CreateClient(w http.ResponseWriter, r *http.Request) {
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 	r.ParseForm()
 	name := r.Form.Get("name")
 	description := r.Form.Get("description")
@@ -564,7 +580,7 @@ func (h *AdminHandler) CreateClient(w http.ResponseWriter, r *http.Request) {
 	// 失败时不留下半创建 client，也不需要事后补偿 Delete。
 	var encryptionErr *keyOpError
 	client, apiKey, err := h.clientService.CreateClientWithSettings(
-		name, description, keyType, keyPrefix, h.cfg, h.cfg.Admin.Username,
+		name, description, keyType, keyPrefix, h.cfg, actor,
 		func(clientID string) (map[string]interface{}, error) {
 			settings := make(map[string]interface{}, len(st)+1)
 			for key, value := range st {
@@ -635,6 +651,11 @@ func (h *AdminHandler) ShowClient(w http.ResponseWriter, r *http.Request) {
 // （§4：整行 Save 的 lifecycle footgun 已消灭；REVOKED 不能被普通编辑复活）。
 func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	r.ParseForm()
 	backendAPIKey := r.Form.Get("backend_api_key")
@@ -691,7 +712,7 @@ func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 		st["backend_api_key_encrypted"] = env
 	}
 
-	if err := h.clientService.UpdateClientSettings(id, st); err != nil {
+	if err := h.clientService.UpdateClientSettings(id, actor, st); err != nil {
 		http.Error(w, "Failed to update client", http.StatusInternalServerError)
 		return
 	}
@@ -704,14 +725,19 @@ func (h *AdminHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 // 表单缺失目标状态 → 400（杜绝盲 toggle 的隐式行为）。
 func (h *AdminHandler) ToggleClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	raw := r.FormValue("active")
 	var err error
 	switch {
 	case raw == "true" || raw == "on":
-		err = h.clientService.ResumeClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
+		err = h.clientService.ResumeClient(id, actor, r.FormValue("reason"))
 	case raw == "false":
-		err = h.clientService.SuspendClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
+		err = h.clientService.SuspendClient(id, actor, r.FormValue("reason"))
 	default:
 		http.Error(w, "Missing target state (active=true/false)", http.StatusBadRequest)
 		return
@@ -729,8 +755,13 @@ func (h *AdminHandler) ToggleClient(w http.ResponseWriter, r *http.Request) {
 // reason required（§5）；不存在 → 404。
 func (h *AdminHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
-	err := h.clientService.DeleteClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
+	err := h.clientService.DeleteClient(id, actor, r.FormValue("reason"))
 	if err != nil {
 		h.writeLifecycleError(w, err, "Failed to delete client")
 		return
@@ -746,6 +777,11 @@ func (h *AdminHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
 // 不渲染无主 key；DB error → 500 generic。成功仍只在结果页一次性展示明文 key。
 func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 	r.ParseForm()
 	keyType := r.Form.Get("key_type")
 	if keyType == "" {
@@ -754,7 +790,7 @@ func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 	keyPrefix := r.Form.Get("key_prefix")
 
 	// P1-05C：ROTATE 必须携带 reason（§5）
-	apiKey, err := h.clientService.RegenerateAPIKey(id, keyType, keyPrefix, h.cfg.Admin.Username, r.Form.Get("reason"))
+	apiKey, err := h.clientService.RegenerateAPIKey(id, keyType, keyPrefix, actor, r.Form.Get("reason"))
 	if err != nil {
 		h.writeLifecycleError(w, err, "Failed to regenerate API key")
 		return
@@ -786,12 +822,17 @@ func (h *AdminHandler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
 // actor/revoked_by）。成功 commit 后才 ResetClient 运行时限流 bucket（§14）。
 func (h *AdminHandler) RevokeClient(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	if r.FormValue("confirm_revoke") != "REVOKE" {
 		http.Error(w, "Confirmation required: confirm_revoke=REVOKE", http.StatusBadRequest)
 		return
 	}
-	err := h.clientService.RevokeClient(id, h.cfg.Admin.Username, r.FormValue("reason"))
+	err := h.clientService.RevokeClient(id, actor, r.FormValue("reason"))
 	if err != nil {
 		h.writeLifecycleError(w, err, "Failed to revoke client")
 		return
@@ -1011,19 +1052,17 @@ func (h *AdminHandler) FetchClientModels(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	client.BackendModels = formatModelArray(models)
-	if err := h.clientService.UpdateClientModels(client.ID, client.BackendModels); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"success":false,"error":"Failed to persist models"}`)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"success":true,"models":[%s]}`, formatStringArray(models))
 }
 
 func (h *AdminHandler) UpdateClientModels(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 	r.ParseForm()
 
 	models := r.Form["models"]
@@ -1039,7 +1078,7 @@ func (h *AdminHandler) UpdateClientModels(w http.ResponseWriter, r *http.Request
 	}
 
 	// P1-05C：dedicated bounded update——不再整行 Save（§4）
-	if err := h.clientService.UpdateClientModels(id, formatModelArray(models)); err != nil {
+	if err := h.clientService.UpdateClientModels(id, actor, formatModelArray(models)); err != nil {
 		http.Error(w, "Failed to update models", http.StatusInternalServerError)
 		return
 	}

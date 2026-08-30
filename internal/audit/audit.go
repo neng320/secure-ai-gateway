@@ -36,22 +36,28 @@ var (
 
 // 固定 action 常量（§10）——禁止自由字符串拼接；审计写入按白名单校验。
 const (
-	ActionClientCreated    = "CLIENT_CREATED"
-	ActionClientKeyRotated = "CLIENT_KEY_ROTATED"
-	ActionClientSuspended  = "CLIENT_SUSPENDED"
-	ActionClientResumed    = "CLIENT_RESUMED"
-	ActionClientRevoked    = "CLIENT_REVOKED"
-	ActionClientDeleted    = "CLIENT_DELETED"
+	ActionClientCreated               = "CLIENT_CREATED"
+	ActionClientKeyRotated            = "CLIENT_KEY_ROTATED"
+	ActionClientSuspended             = "CLIENT_SUSPENDED"
+	ActionClientResumed               = "CLIENT_RESUMED"
+	ActionClientRevoked               = "CLIENT_REVOKED"
+	ActionClientDeleted               = "CLIENT_DELETED"
+	ActionClientSettingsUpdated       = "CLIENT_SETTINGS_UPDATED"
+	ActionClientProviderSecretChanged = "CLIENT_PROVIDER_SECRET_CHANGED"
+	ActionClientModelsUpdated         = "CLIENT_MODELS_UPDATED"
 )
 
 // allowedActions: 审计写入白名单（静态 Gate 断言生产 action 只能来自常量）。
 var allowedActions = map[string]bool{
-	ActionClientCreated:    true,
-	ActionClientKeyRotated: true,
-	ActionClientSuspended:  true,
-	ActionClientResumed:    true,
-	ActionClientRevoked:    true,
-	ActionClientDeleted:    true,
+	ActionClientCreated:               true,
+	ActionClientKeyRotated:            true,
+	ActionClientSuspended:             true,
+	ActionClientResumed:               true,
+	ActionClientRevoked:               true,
+	ActionClientDeleted:               true,
+	ActionClientSettingsUpdated:       true,
+	ActionClientProviderSecretChanged: true,
+	ActionClientModelsUpdated:         true,
 }
 
 func IsKnownAction(action string) bool {

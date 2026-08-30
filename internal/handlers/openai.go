@@ -168,26 +168,6 @@ func (h *OpenAIHandler) resolveProvider(client *models.Client) (providers.Provid
 	return h.registry.Get(backend)
 }
 
-func (h *OpenAIHandler) updateClientModels(client *models.Client, provider providers.Provider) {
-	models, err := provider.FetchModels()
-	if err != nil {
-		log.Printf("[%s] Failed to fetch models for client %s: %v", provider.Name(), client.Name, err)
-		return
-	}
-
-	if len(models) == 0 {
-		return
-	}
-
-	modelsJSON, err := json.Marshal(models)
-	if err != nil {
-		return
-	}
-
-	// P1-05C：dedicated bounded update——绝不整行 Save（§4）
-	_ = h.clientService.UpdateClientModels(client.ID, string(modelsJSON))
-}
-
 func (h *OpenAIHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	client := middleware.GetClientFromContext(r.Context())
 	if client == nil {
@@ -555,9 +535,6 @@ func (h *OpenAIHandler) tryNonStreamingRequest(r *http.Request, w http.ResponseW
 		Usage:   map[string]interface{}{"prompt_tokens": it, "completion_tokens": ot, "total_tokens": it + ot},
 	})
 
-	if client.BackendModels == "" {
-		h.updateClientModels(client, provider)
-	}
 	return statusCode, nil
 }
 
@@ -762,9 +739,6 @@ toolLoop:
 	RecordRequest(client.ID, chatReq.Model, fmt.Sprintf("%d", resp.StatusCode), it, ot, int(time.Since(start).Milliseconds()))
 	if h.statsService != nil {
 		h.statsService.DecrementRequestsInProgress()
-	}
-	if client.BackendModels == "" {
-		h.updateClientModels(client, provider)
 	}
 	return resp.StatusCode, nil
 }

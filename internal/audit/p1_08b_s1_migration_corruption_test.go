@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -664,6 +665,12 @@ func TestP108B_S1_SQLiteBusyTimeoutConfigured(t *testing.T) {
 }
 
 func TestP108B_S1_ConcurrentAppendNoFork(t *testing.T) {
+	// Keep the 32 goroutines and four independent SQLite handles genuinely
+	// concurrent while avoiding host-level package-runner oversubscription that
+	// can starve a writer past the fixed 5s SQLite busy timeout.
+	previousProcs := runtime.GOMAXPROCS(2)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+
 	path := t.TempDir() + "/concurrent.db"
 	bootstrap, err := database.Open(path)
 	if err != nil {
