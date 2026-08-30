@@ -183,7 +183,11 @@ func MigrateIntegrity(db *gorm.DB) error {
 		if err := verifyAuditChainDB(tx); err != nil {
 			return err
 		}
-		if err := ensureExactMutationTriggers(tx, schema.triggers); err != nil {
+		if schema.family == auditSchemaFreshNoTable || schema.family == auditSchemaLegacyP105C {
+			if err := ensureExactMutationTriggers(tx, schema.triggers); err != nil {
+				return err
+			}
+		} else if err := verifyExactMutationTriggers(schema.triggers); err != nil {
 			return err
 		}
 		return nil
@@ -262,7 +266,7 @@ func inspectAuditSchema(db *gorm.DB) (auditSchemaSnapshot, error) {
 			if err := verifyExpectedAuditIndexes(db, auditIndexSpecs); err != nil {
 				return schema, err
 			}
-			if err := validateExistingTriggerDefinitions(schema.triggers); err != nil {
+			if err := verifyExactMutationTriggers(schema.triggers); err != nil {
 				return schema, err
 			}
 			schema.family = auditSchemaCurrentChain

@@ -194,6 +194,56 @@ func TestP108B_S11_StaticGateRejectsRawAuditMutationFixture(t *testing.T) {
 	}
 }
 
+func TestP108B_S21_RecordStaticGateHasNoApplicationRetry(t *testing.T) {
+	root := p105bModuleRoot(t)
+	source := p105bRead(t, root, "internal/audit/audit.go")
+	file, err := parser.ParseFile(token.NewFileSet(), "internal/audit/audit.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == "Record" {
+			record = function
+			break
+		}
+	}
+	if record == nil || record.Body == nil {
+		t.Fatal("audit.Service.Record function not found")
+	}
+	transactions := 0
+	recordTxCalls := 0
+	var forbidden []string
+	ast.Inspect(record.Body, func(node ast.Node) bool {
+		switch value := node.(type) {
+		case *ast.ForStmt:
+			forbidden = append(forbidden, "for")
+		case *ast.RangeStmt:
+			forbidden = append(forbidden, "range")
+		case *ast.CallExpr:
+			if selector, ok := value.Fun.(*ast.SelectorExpr); ok {
+				switch selector.Sel.Name {
+				case "Transaction":
+					transactions++
+				case "RecordTx":
+					recordTxCalls++
+				case "Sleep":
+					forbidden = append(forbidden, "time.Sleep")
+				}
+			}
+		case *ast.Ident:
+			if strings.Contains(strings.ToLower(value.Name), "retry") || strings.Contains(strings.ToLower(value.Name), "backoff") {
+				forbidden = append(forbidden, value.Name)
+			}
+		}
+		return true
+	})
+	if transactions != 1 || recordTxCalls != 1 || len(forbidden) != 0 {
+		t.Fatalf("Service.Record must be one transaction/RecordTx with no retry loop: transactions=%d recordTx=%d forbidden=%v", transactions, recordTxCalls, forbidden)
+	}
+}
+
 func TestP108B_S1_StaticGate_DedicatedAuditMigrationOwnership(t *testing.T) {
 	root := p105bModuleRoot(t)
 	mainSrc := p105bRead(t, root, "cmd/server/main.go")

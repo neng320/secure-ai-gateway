@@ -320,3 +320,111 @@ func TestP108B_S2_StartupOrderStaticGate(t *testing.T) {
 		t.Fatal("startup must centralize audit integrity migration in runAuditStartupPreflight")
 	}
 }
+
+func assertS21CurrentTriggerStartupFails(t *testing.T, triggerNames ...string) {
+	t.Helper()
+	db, dbPath, _ := newS2MigratedDB(t)
+	defer closeS2DB(t, db)
+	for _, name := range triggerNames {
+		if err := db.Exec("DROP TRIGGER " + name).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := false
+	preflightErr := runAuditPreflightThen(db, func() error {
+		started = true
+		return nil
+	})
+	if preflightErr == nil || !strings.Contains(preflightErr.Error(), "AUDIT_INTEGRITY_CHECK_FAILED") || started {
+		t.Fatalf("current missing trigger must block startup: err=%v started=%v", preflightErr, started)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("startup preflight repaired a missing current trigger")
+	}
+	for _, name := range triggerNames {
+		var count int64
+		if err := db.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?", name).Scan(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("startup preflight recreated missing trigger %q", name)
+		}
+	}
+}
+
+func TestP108B_S21_CurrentMissingUpdateTriggerStartupFailsClosed(t *testing.T) {
+	assertS21CurrentTriggerStartupFails(t, "audit_events_no_update")
+}
+
+func TestP108B_S21_CurrentMissingDeleteTriggerStartupFailsClosed(t *testing.T) {
+	assertS21CurrentTriggerStartupFails(t, "audit_events_no_delete")
+}
+
+func TestP108B_S21_CurrentBothTriggersMissingStartupFailsClosed(t *testing.T) {
+	assertS21CurrentTriggerStartupFails(t, "audit_events_no_update", "audit_events_no_delete")
+}
+
+func TestP108B_S21_CurrentWrongTriggerStartupFailsClosed(t *testing.T) {
+	db, dbPath, _ := newS2MigratedDB(t)
+	defer closeS2DB(t, db)
+	if err := db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT 1; END").Error; err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := false
+	preflightErr := runAuditPreflightThen(db, func() error {
+		started = true
+		return nil
+	})
+	if preflightErr == nil || !strings.Contains(preflightErr.Error(), "AUDIT_INTEGRITY_CHECK_FAILED") || started {
+		t.Fatalf("wrong current trigger must block startup: err=%v started=%v", preflightErr, started)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("startup preflight repaired a wrong current trigger")
+	}
+}
+
+func TestP108B_S21_CurrentExtraTriggerStartupFailsClosed(t *testing.T) {
+	db, dbPath, _ := newS2MigratedDB(t)
+	defer closeS2DB(t, db)
+	if err := db.Exec("CREATE TRIGGER audit_events_extra_guard BEFORE INSERT ON audit_events BEGIN SELECT 1; END").Error; err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := false
+	preflightErr := runAuditPreflightThen(db, func() error {
+		started = true
+		return nil
+	})
+	if preflightErr == nil || !strings.Contains(preflightErr.Error(), "AUDIT_INTEGRITY_CHECK_FAILED") || started {
+		t.Fatalf("extra current trigger must block startup: err=%v started=%v", preflightErr, started)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("startup preflight deleted an extra current trigger")
+	}
+}

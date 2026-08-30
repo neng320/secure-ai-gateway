@@ -73,16 +73,9 @@ func NewService(db *gorm.DB) *Service {
 }
 
 func (s *Service) Record(e models.AuditEvent) error {
-	const maxBusyRetries = 4
-	for attempt := 0; ; attempt++ {
-		err := s.db.Transaction(func(tx *gorm.DB) error {
-			return s.RecordTx(tx, e)
-		})
-		if !errors.Is(err, ErrAuditBusy) || attempt >= maxBusyRetries {
-			return err
-		}
-		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
-	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		return s.RecordTx(tx, e)
+	})
 }
 
 func normalizeAuditDBError(err error) error {
