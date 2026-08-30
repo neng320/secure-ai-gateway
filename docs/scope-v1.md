@@ -55,11 +55,11 @@ P1-06B Rate / Quota Enforcement ✅（PR #18；merge 34b4b919）
   完成：60s/1h/24h 独立窗口、cold-cache 原子初始化、动态限额保留已消费量、
         stable rate/quota error contract、并发 reservation、原子 usage charge、
         OpenAI/Gemini MaxInput/MaxOutput gate、stream/non-stream 统一 reservation。
-P1-06 overall：🟠 VERIFYING（P1-06B.1 correction pending）
-  独立复验发现 /v1/messages 与 Gemini :streamGenerateContent 未进入 quota preflight，
-  且 Gemini streaming 曾以 0 input/output token finalize；详见 p1-06 doc §9。
-P1-06 Rate Limit / Quota：⛔ NOT YET COMPLETE
-  说明：P1-06B.1 只修 route matrix 与 Gemini streaming usage accounting；
+P1-06B.1 Route & Streaming Closure ✅（PR #19；correction commit 30264f4）
+  关闭：显式 generative route matrix、/v1/messages 与 Gemini stream quota gate、
+        bounded usageMetadata accounting、missing-metadata conservative charge、no double charge。
+P1-06 overall：✅ COMPLETE
+  说明：token 计数使用 conservative byte upper bound，不冒充精确 tokenizer；
         P1-07 继续负责更完整的 request-structure validation。
 ```
 

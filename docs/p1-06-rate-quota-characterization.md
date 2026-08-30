@@ -133,4 +133,4 @@ P1-06B 关闭 P1-06A 的 rate-window、cold-cache、dynamic-edit、atomic DailyU
 
 独立复验发现原 P1-06B classifier 遗漏两个真实生成入口：`POST /v1/messages` 与 `POST ...:streamGenerateContent`；Gemini streaming 也只转发响应字节，最终 `RequestRecord` 的 input/output token 默认为 0。该状态曾使 Daily Quota 可被绕过，因此 P1-06 在 correction 合入前保持 `VERIFYING`。
 
-P1-06B.1 通过显式 route matrix 与每个生成入口的 exhausted-request-quota regression，补齐两类 route；Gemini stream 使用有上限的 SSE line parser 提取 `usageMetadata`，成功响应缺失 metadata 时采用本次 reservation 的 conservative upper bound，成功响应最终只经过一次 `LogRequest` finalize，reservation counters 清零。`count_tokens` 与 GET model routes 继续不进入 quota preflight。
+P1-06B.1 通过显式 route matrix 与每个生成入口的 exhausted-request-quota regression，补齐两类 route；Gemini stream 使用有上限的 SSE line parser 提取 `usageMetadata`，成功响应缺失 metadata 时采用本次 reservation 的 conservative upper bound，成功响应最终只经过一次 `LogRequest` finalize，reservation counters 清零。`count_tokens` 与 GET model routes 继续不进入 quota preflight。Correction tests、全量回归、race、vet 与 verify 均通过后，P1-06 恢复为 `COMPLETE`。
