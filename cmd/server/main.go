@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -56,15 +57,20 @@ var (
 	backupDirFl  = flag.String("migration-backup-dir", "", "Backup root dir for provider secret migration (required with -migrate-provider-secrets)")
 	// P1-03D1A：安全 Global Provider Key provisioning。
 	// Key 绝不允许作为 CLI 参数（防 shell history / argv 泄露）——只能 TTY 隐藏输入或显式 stdin。
-	setProvKeyFl = flag.String("set-provider-key", "", "Provider name whose API key to provision securely (hidden TTY input + confirm; or -provider-key-stdin). Never pass the key as an argument.")
-	provKeyStdin = flag.Bool("provider-key-stdin", false, "Read the provider key from stdin instead of the TTY (explicit non-interactive mode; input is never echoed)")
-	replacePKey  = flag.Bool("replace-provider-key", false, "Allow overwriting an existing encrypted provider key (deliberate replacement)")
+	setProvKeyFl   = flag.String("set-provider-key", "", "Provider name whose API key to provision securely (hidden TTY input + confirm; or -provider-key-stdin). Never pass the key as an argument.")
+	provKeyStdin   = flag.Bool("provider-key-stdin", false, "Read the provider key from stdin instead of the TTY (explicit non-interactive mode; input is never echoed)")
+	replacePKey    = flag.Bool("replace-provider-key", false, "Allow overwriting an existing encrypted provider key (deliberate replacement)")
+	verifyAuditLog = flag.Bool("verify-audit-log", false, "Offline: verify the existing tamper-evident audit log, then exit")
 )
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to config file")
 	port := flag.Int("port", 0, "Port to listen on (overrides API port from config)")
 	flag.Parse()
+
+	if *verifyAuditLog {
+		os.Exit(runVerifyAuditLog(*configPath, os.Stdout, os.Stderr))
+	}
 
 	printBanner()
 
@@ -131,8 +137,8 @@ func main() {
 	if err := autoMigrate(db); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
-	if err := audit.MigrateIntegrity(db); err != nil {
-		log.Fatalf("AUDIT_INTEGRITY_CHECK_FAILED: %v", err)
+	if err := runAuditPreflightThen(db, func() error { return nil }); err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	// P1-04D 启动 preflight：legacy prompt/error 正文残留 → 拒绝启动（须离线 scrub）
@@ -200,6 +206,61 @@ func main() {
 		log.Printf("Shutdown completed with error: %v", err)
 	}
 	log.Println("Server exited")
+}
+
+func runAuditStartupPreflight(db *gorm.DB) error {
+	if err := audit.MigrateIntegrity(db); err != nil {
+		return errors.New("AUDIT_INTEGRITY_CHECK_FAILED")
+	}
+	return nil
+}
+
+func runAuditPreflightThen(db *gorm.DB, next func() error) error {
+	if err := runAuditStartupPreflight(db); err != nil {
+		return err
+	}
+	return next()
+}
+
+func runVerifyAuditLog(configPath string, stdout, stderr io.Writer) int {
+	cfg, err := config.LoadExistingForMigration(configPath)
+	if err != nil || cfg.Database.Path == "" {
+		fmt.Fprintln(stderr, "AUDIT_VERIFY_FAILED")
+		return 1
+	}
+	db, err := database.OpenReadOnly(cfg.Database.Path)
+	if err != nil {
+		fmt.Fprintln(stderr, "AUDIT_VERIFY_FAILED")
+		return 1
+	}
+	summary, verifyErr := audit.VerifyIntegrityReadOnly(db)
+	closeErr := error(nil)
+	if sqlDB, dbErr := db.DB(); dbErr != nil {
+		closeErr = dbErr
+	} else {
+		closeErr = sqlDB.Close()
+	}
+	if closeErr != nil && verifyErr == nil {
+		verifyErr = closeErr
+	}
+	if errors.Is(verifyErr, audit.ErrAuditMigrationRequired) {
+		fmt.Fprintln(stderr, "AUDIT_SCHEMA_MIGRATION_REQUIRED")
+		return 2
+	}
+	if errors.Is(verifyErr, audit.ErrAuditIntegrity) {
+		fmt.Fprintln(stderr, "AUDIT_INTEGRITY_CHECK_FAILED")
+		return 1
+	}
+	if verifyErr != nil {
+		fmt.Fprintln(stderr, "AUDIT_VERIFY_FAILED")
+		return 1
+	}
+	head := summary.HeadHash
+	if head == "" {
+		head = "GENESIS"
+	}
+	fmt.Fprintf(stdout, "AUDIT_VERIFY_OK\nevents=%d\nhead_sha256=%s\n", summary.EventCount, head)
+	return 0
 }
 
 // runRequestLogScrub: 显式离线 scrub 入口（P1-04D）。

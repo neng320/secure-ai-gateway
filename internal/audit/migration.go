@@ -554,6 +554,16 @@ func validateExistingTriggerDefinitions(existing map[string]string) error {
 	return nil
 }
 
+func verifyExactMutationTriggers(existing map[string]string) error {
+	if err := validateExistingTriggerDefinitions(existing); err != nil {
+		return err
+	}
+	if len(existing) != 2 {
+		return auditIntegrityError("audit trigger set incomplete")
+	}
+	return nil
+}
+
 func ensureExactMutationTriggers(tx *gorm.DB, existing map[string]string) error {
 	if err := validateExistingTriggerDefinitions(existing); err != nil {
 		return err

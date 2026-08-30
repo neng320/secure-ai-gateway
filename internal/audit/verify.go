@@ -10,6 +10,13 @@ import (
 	"gorm.io/gorm"
 )
 
+// VerificationSummary is the bounded output of offline audit verification.
+// It intentionally contains no event fields or operational configuration.
+type VerificationSummary struct {
+	EventCount int64
+	HeadHash   string
+}
+
 func auditIntegrityError(reason string) error {
 	return fmt.Errorf("%w: %s", ErrAuditIntegrity, reason)
 }
@@ -63,4 +70,44 @@ func verifyAuditChainDB(db *gorm.DB) error {
 		return auditIntegrityError("chain state head mismatch")
 	}
 	return nil
+}
+
+// VerifyIntegrityReadOnly verifies an already-migrated audit database in one
+// read transaction. It never calls migration or performs repair DDL/DML.
+func VerifyIntegrityReadOnly(db *gorm.DB) (VerificationSummary, error) {
+	if db == nil {
+		return VerificationSummary{}, ErrAuditIntegrity
+	}
+	var summary VerificationSummary
+	err := db.Transaction(func(tx *gorm.DB) error {
+		schema, err := inspectAuditSchema(tx)
+		if err != nil {
+			return err
+		}
+		if schema.family == auditSchemaFreshNoTable || schema.family == auditSchemaLegacyP105C {
+			return ErrAuditMigrationRequired
+		}
+		if schema.family != auditSchemaCurrentChain {
+			return ErrAuditIntegrity
+		}
+		if err := verifyExpectedAuditIndexes(tx, auditIndexSpecs); err != nil {
+			return err
+		}
+		if err := verifyExactMutationTriggers(schema.triggers); err != nil {
+			return err
+		}
+		if err := verifyAuditChainDB(tx); err != nil {
+			return err
+		}
+		if err := tx.Model(&models.AuditEvent{}).Count(&summary.EventCount).Error; err != nil {
+			return auditIntegrityError("audit history unavailable")
+		}
+		var state models.AuditChainState
+		if err := tx.Where("id = ?", 1).First(&state).Error; err != nil {
+			return auditIntegrityError("chain state unavailable")
+		}
+		summary.HeadHash = state.HeadHash
+		return nil
+	})
+	return summary, err
 }
