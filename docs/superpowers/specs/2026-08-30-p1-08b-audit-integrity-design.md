@@ -29,6 +29,26 @@ It does not claim protection from a root/database owner who can replace the data
 
 No second audit subsystem or lifecycle event table will be introduced.
 
+## Frozen Implementation Clarifications
+
+The following rules are binding for Slice 1 and all later slices:
+
+A. Migration accepts only `LEGACY_ALL_UNCHAINED` or `FULLY_CHAINED_VALID`. Mixed or partial chain data, missing state for chained events, or state without a fully chained event history is corruption and must fail closed. Migration must never silently repair those states.
+
+B. Generic `autoMigrate` owns ordinary business tables only. It must not add `AuditEvent` chain columns outside the dedicated audit migration transaction, which owns `AuditEvent`, `AuditChainState`, deterministic backfill, verification, and trigger installation.
+
+C. `RecordTx` requires a real active SQL transaction and returns `ErrAuditTransactionRequired` otherwise. A separate `Record` entry point opens and commits its own transaction; `RecordTx` never opens a nested transaction.
+
+D. After the SQLite writer lock is acquired, append validates the singleton state against the current tail before creating an event. A state/tail mismatch aborts the append and cannot be overwritten by a new event.
+
+E. `VerifyAuditChain` validates exactly one `AuditChainState` row with `id=1`, supported version `v1`, valid head format, and head equality with the final event hash (or empty head for empty history).
+
+F. Existing trigger names with definitions that do not exactly match the expected mutation guards are integrity failures. Migration must not silently accept or repair a suspected tampered trigger.
+
+G. The v1 canonical timestamp is `CreatedAt.UTC().UnixNano()`. A test must prove that generating, inserting, closing, reopening, and reloading SQLite preserves the same UnixNano and EventHash; a precision mismatch stops the stage rather than changing the protocol.
+
+H. Legacy backfill establishes the initial cryptographic baseline for accepted pre-P1-08B rows. It does not provide retroactive proof that those rows were never modified before the chain existed.
+
 ## Data model
 
 `AuditEvent` keeps all existing fields and adds:
@@ -96,12 +116,13 @@ Startup migration uses an explicit transaction for the audit upgrade:
 BEGIN
 → additive schema migration for chain columns and chain-state table
 → ensure singleton state row exists with v1 / empty head
-→ read legacy events in deterministic id ASC order
-→ preserve every existing field and timestamp
-→ fill only missing chain fields using the canonical v1 encoding
-→ set chain-state head to the final event hash
-→ verify the newly built chain and chain-state head
-→ install idempotent UPDATE and DELETE reject triggers
+→ classify history as LEGACY_ALL_UNCHAINED or FULLY_CHAINED_VALID
+→ reject mixed/partial history or incomplete state as corruption
+→ for LEGACY_ALL_UNCHAINED, read events in deterministic id ASC order
+  and preserve every existing field and timestamp while building the full v1 chain
+→ for FULLY_CHAINED_VALID, do not backfill; verify the existing chain and state
+→ establish or verify chain-state head against the final event hash
+→ install missing UPDATE and DELETE reject triggers; validate existing definitions exactly
 → COMMIT
 ```
 
