@@ -211,6 +211,13 @@ func (h *AdminHandler) RegisterRoutes(r *chi.Mux) {
 	})
 
 	r.Group(func(r chi.Router) {
+		r.Use(h.auditNoStore)
+		r.Use(middleware.Timeout(60 * time.Second))
+		r.Use(h.RequireAuth)
+		r.Get("/admin/audit", h.ShowAuditLog)
+	})
+
+	r.Group(func(r chi.Router) {
 		r.Use(middleware.Timeout(60 * time.Second))
 		r.Use(h.RequireAuth)
 		// SEC-004（P1-02B）：受保护组所有 POST 必须携带会话绑定 CSRF token
@@ -1422,6 +1429,7 @@ var adminTemplates = []byte(`
                     <a href="/admin/clients" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Clients</a>
                     <a href="/admin/stats" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Stats</a>
                     <a href="/admin/server-tools" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Server Tools</a>
+                    <a href="/admin/audit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Audit Log</a>
                     <a href="https://github.com/DatanoiseTV/aigateway" target="_blank" class="px-3 py-2 rounded-lg text-gray-300 hover:text-white hover:bg-gray-700">
                         <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                             <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.17 6.839 9.49.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.604-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.167 22 16.418 22 12c0-5.523-4.477-10-10-10z"/>
@@ -1747,6 +1755,7 @@ var adminTemplates = []byte(`
                     <a href="/admin/clients" class="px-3 py-2 rounded-lg text-sm font-medium text-white bg-gray-700">Clients</a>
                     <a href="/admin/stats" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Stats</a>
                     <a href="/admin/server-tools" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Server Tools</a>
+                    <a href="/admin/audit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Audit Log</a>
                     <a href="https://github.com/DatanoiseTV/aigateway" target="_blank" class="px-3 py-2 rounded-lg text-gray-300 hover:text-white hover:bg-gray-700">
                         <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                             <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.17 6.839 9.49.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.604-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.167 22 16.418 22 12c0-5.523-4.477-10-10-10z"/>
@@ -1997,6 +2006,7 @@ var adminTemplates = []byte(`
                     <a href="/admin/dashboard" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Dashboard</a>
                     <a href="/admin/clients" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Clients</a>
                     <a href="/admin/stats" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Stats</a>
+                    <a href="/admin/audit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Audit Log</a>
                     <a href="https://github.com/DatanoiseTV/aigateway" target="_blank" class="px-3 py-2 rounded-lg text-gray-300 hover:text-white hover:bg-gray-700">
                         <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                             <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.17 6.839 9.49.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.604-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.167 22 16.418 22 12c0-5.523-4.477-10-10-10z"/>
@@ -2537,6 +2547,54 @@ var adminTemplates = []byte(`
 {{end}}
 
 
+{{define "audit.html"}}
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Audit Log - AI Gateway</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; }</style>
+</head>
+<body class="bg-gray-900 min-h-screen">
+    <nav class="bg-gray-800/80 backdrop-blur-md border-b border-gray-700 sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center space-x-3"><span class="text-xl font-bold text-white">AI Gateway</span></div>
+                <div class="flex items-center space-x-1">
+                    <a href="/admin/dashboard" class="px-3 py-2 rounded-lg text-sm text-gray-300 hover:text-white hover:bg-gray-700">Dashboard</a>
+                    <a href="/admin/clients" class="px-3 py-2 rounded-lg text-sm text-gray-300 hover:text-white hover:bg-gray-700">Clients</a>
+                    <a href="/admin/stats" class="px-3 py-2 rounded-lg text-sm text-gray-300 hover:text-white hover:bg-gray-700">Stats</a>
+                    <a href="/admin/server-tools" class="px-3 py-2 rounded-lg text-sm text-gray-300 hover:text-white hover:bg-gray-700">Server Tools</a>
+                    <a href="/admin/audit" class="px-3 py-2 rounded-lg text-sm text-white bg-gray-700">Audit Log</a>
+                    <form method="POST" action="/admin/logout" class="ml-2"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button type="submit" class="px-3 py-2 rounded-lg text-sm text-gray-300 hover:text-white hover:bg-gray-700">Sign out</button></form>
+                </div>
+            </div>
+        </div>
+    </nav>
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="flex items-center justify-between mb-8"><div><h1 class="text-3xl font-bold text-white">Audit Log</h1><p class="text-gray-400 mt-1">Read-only security and administration history</p></div><span class="text-sm text-gray-500">Signed in as {{.User}}</span></div>
+        {{with .Data}}{{ $page := . }}
+        <form method="GET" action="/admin/audit" class="bg-gray-800 rounded-2xl border border-gray-700 p-5 mb-8 grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
+            <label class="text-sm text-gray-300">Action<select name="action" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg"><option value="">All actions</option>{{range .ActionOptions}}<option value="{{.}}" {{if eq . $page.Action}}selected{{end}}>{{.}}</option>{{end}}</select></label>
+            <label class="text-sm text-gray-300">Actor type<select name="actor_type" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg"><option value="">All actor types</option>{{range .ActorTypes}}<option value="{{.}}" {{if eq . $page.ActorType}}selected{{end}}>{{.}}</option>{{end}}</select></label>
+            <label class="text-sm text-gray-300">Actor ID<input name="actor_id" value="{{.ActorID}}" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg"></label>
+            <label class="text-sm text-gray-300">Target type<select name="target_type" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg"><option value="">All target types</option>{{range .TargetTypes}}<option value="{{.}}" {{if eq . $page.TargetType}}selected{{end}}>{{.}}</option>{{end}}</select></label>
+            <label class="text-sm text-gray-300">Target ID<input name="target_id" value="{{.TargetID}}" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg"></label>
+            <label class="text-sm text-gray-300">Rows<input type="number" name="limit" min="1" max="100" value="{{.Limit}}" class="mt-1 w-full px-3 py-2 bg-gray-900 border border-gray-600 text-white rounded-lg"></label>
+            <div class="md:col-span-3 lg:col-span-6"><button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Apply filters</button></div>
+        </form>
+        <div class="bg-gray-800 rounded-2xl border border-gray-700 overflow-x-auto"><table class="w-full min-w-[980px]"><thead class="bg-gray-900/50"><tr><th class="px-4 py-3 text-left text-xs text-gray-400 uppercase">Time</th><th class="px-4 py-3 text-left text-xs text-gray-400 uppercase">Action</th><th class="px-4 py-3 text-left text-xs text-gray-400 uppercase">Actor</th><th class="px-4 py-3 text-left text-xs text-gray-400 uppercase">Target</th><th class="px-4 py-3 text-left text-xs text-gray-400 uppercase">Reason</th><th class="px-4 py-3 text-left text-xs text-gray-400 uppercase">Event ID</th></tr></thead><tbody class="divide-y divide-gray-700">
+            {{range .Events}}<tr class="hover:bg-gray-700/50"><td class="px-4 py-3 text-sm text-gray-300 whitespace-nowrap">{{.CreatedAt.Format "2006-01-02 15:04:05 UTC"}}</td><td class="px-4 py-3 text-sm text-white font-medium">{{.Action}}</td><td class="px-4 py-3 text-sm text-gray-300">{{.ActorType}} / {{.ActorID}}</td><td class="px-4 py-3 text-sm text-gray-300">{{.TargetType}} / {{.TargetID}}</td><td class="px-4 py-3 text-sm text-gray-300">{{.Reason}}</td><td class="px-4 py-3 text-xs text-gray-500 font-mono">{{.EventID}}</td></tr>{{else}}<tr><td colspan="6" class="px-4 py-8 text-center text-gray-500">No audit events match these filters.</td></tr>{{end}}
+        </tbody></table></div>
+        {{if .HasMore}}<div class="mt-6 text-right"><a href="{{.NextURL}}" class="px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600">Next older events</a></div>{{end}}
+        {{end}}
+    </main>
+</body>
+</html>
+{{end}}
+
 {{define "stats.html"}}
 <!DOCTYPE html>
 <html>
@@ -2565,6 +2623,7 @@ var adminTemplates = []byte(`
                     <a href="/admin/dashboard" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Dashboard</a>
                     <a href="/admin/clients" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Clients</a>
                     <a href="/admin/stats" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Stats</a>
+                    <a href="/admin/audit" class="px-3 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700">Audit Log</a>
                     <a href="https://github.com/DatanoiseTV/aigateway" target="_blank" class="px-3 py-2 rounded-lg text-gray-300 hover:text-white hover:bg-gray-700">
                         <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                             <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.17 6.839 9.49.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.604-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.167 22 16.418 22 12c0-5.523-4.477-10-10-10z"/>
