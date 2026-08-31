@@ -30,6 +30,7 @@ import (
 	"ai-gateway/internal/audit"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/configaudit"
+	"ai-gateway/internal/configstore"
 	"ai-gateway/internal/database"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/secrets"
@@ -50,6 +51,13 @@ type provisionResult struct {
 // （生产：TTY no-echo / stdin 模式；测试：注入固定值）。任何失败路径都不得
 // 修改磁盘上的 config。
 func runSetProviderKey(configPath, providerName string, allowReplace bool, readSecret func() ([]byte, error), stdout io.Writer) (*provisionResult, error) {
+	return runSetProviderKeyWithAuditDBOpener(configPath, providerName, allowReplace, readSecret, openProviderAuditDB, stdout)
+}
+
+// runSetProviderKeyWithAuditDBOpener keeps the production flow testable at the
+// audit-write boundary without adding a production fault-injection switch.
+// Production callers always pass openProviderAuditDB.
+func runSetProviderKeyWithAuditDBOpener(configPath, providerName string, allowReplace bool, readSecret func() ([]byte, error), openAuditDB func(string) (*gorm.DB, error), stdout io.Writer) (*provisionResult, error) {
 	providerName = strings.TrimSpace(providerName)
 	if providerName == "" || !utf8.ValidString(providerName) || len([]rune(providerName)) > 64 {
 		return nil, errors.New("invalid provider name")
@@ -73,7 +81,9 @@ func runSetProviderKey(configPath, providerName string, allowReplace bool, readS
 		return nil, fmt.Errorf("config %s is not a regular file", configPath)
 	}
 
-	// 纯读取加载（无 ensureDefaults 写回、无默认值生成）
+	// Cheap pre-lock validation avoids prompting for an obviously unknown or
+	// already-provisioned provider. The authoritative copy is re-read below
+	// under the cross-process mutation lock.
 	cfg, err := config.LoadExistingForMigration(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -96,15 +106,6 @@ func runSetProviderKey(configPath, providerName string, allowReplace bool, readS
 			return nil, fmt.Errorf("provider %q already has an encrypted key — pass -replace-provider-key to overwrite it deliberately", providerName)
 		}
 	}
-	auditDB, err := openProviderAuditDB(cfg.Database.Path)
-	if err != nil {
-		return nil, fmt.Errorf("audit preflight: %w", err)
-	}
-	defer func() {
-		if sqlDB, dbErr := auditDB.DB(); dbErr == nil {
-			_ = sqlDB.Close()
-		}
-	}()
 
 	secret, err := readSecret()
 	if err != nil {
@@ -123,33 +124,69 @@ func runSetProviderKey(configPath, providerName string, allowReplace bool, readS
 		return nil, err
 	}
 	mgr := secrets.NewManager(cipher)
-
-	envelope, err := mgr.EncryptGlobalProviderKey(providerName, secret)
-	if err != nil {
-		return nil, fmt.Errorf("encrypt provider key: %w", err)
+	var replaced bool
+	if openAuditDB == nil {
+		return nil, errors.New("audit database opener is required")
 	}
-
-	// candidate 模式：只在副本上改，原子替换成功前磁盘内容不变
-	candidate := *cfg
-	candidate.Providers = make(map[string]config.ProviderConfig, len(cfg.Providers))
-	for name, provider := range cfg.Providers {
-		candidate.Providers[name] = provider
-	}
-	pc := candidate.Providers[providerName]
-	pc.APIKey = "" // 持久化视图绝不持有明文
-	pc.APIKeyEncrypted = envelope
-	candidate.Providers[providerName] = pc
-
-	candidateBytes, err := config.MarshalYAML(&candidate)
-	if err != nil {
-		return nil, fmt.Errorf("marshal config: %w", err)
-	}
-	if err := configaudit.New(audit.NewService(auditDB)).Run(configaudit.Mutation{
+	if err := configaudit.New(nil).RunLocked(configaudit.Mutation{
 		ConfigPath: configPath,
-		Candidate:  candidateBytes,
-		Event: models.AuditEvent{
-			Action: audit.ActionGlobalProviderSecretChanged, ActorType: "cli", ActorID: "set-provider-key",
-			TargetType: "provider", TargetID: providerName,
+		Build: func(snapshot configstore.Snapshot) (configaudit.BuildResult, error) {
+			authoritative, err := config.ParseExistingForMigration(snapshot.Bytes)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("parse authoritative config: %w", err)
+			}
+			provider, ok := authoritative.Providers[providerName]
+			if !ok {
+				return configaudit.BuildResult{}, fmt.Errorf("provider %q not found in config", providerName)
+			}
+			switch state := secrets.ClassifySecret(provider.APIKey, provider.APIKeyEncrypted); state {
+			case secrets.SecretLegacyOnly, secrets.SecretMixed:
+				return configaudit.BuildResult{}, fmt.Errorf("provider %q holds a legacy plaintext key — run -migrate-provider-secrets instead (plaintext provisioning is not allowed)", providerName)
+			case secrets.SecretInvalidEncrypted:
+				return configaudit.BuildResult{}, fmt.Errorf("provider %q holds an invalid/corrupt encrypted key — manual intervention required", providerName)
+			case secrets.SecretEncryptedOnly:
+				if !allowReplace {
+					return configaudit.BuildResult{}, fmt.Errorf("provider %q already has an encrypted key — pass -replace-provider-key to overwrite it deliberately", providerName)
+				}
+			}
+			auditDB, err := openAuditDB(authoritative.Database.Path)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("audit preflight: %w", err)
+			}
+			cleanup := func() {
+				if sqlDB, dbErr := auditDB.DB(); dbErr == nil {
+					_ = sqlDB.Close()
+				}
+			}
+			envelope, err := mgr.EncryptGlobalProviderKey(providerName, secret)
+			if err != nil {
+				cleanup()
+				return configaudit.BuildResult{}, fmt.Errorf("encrypt provider key: %w", err)
+			}
+			candidate := *authoritative
+			candidate.Providers = make(map[string]config.ProviderConfig, len(authoritative.Providers))
+			for name, configuredProvider := range authoritative.Providers {
+				candidate.Providers[name] = configuredProvider
+			}
+			candidateProvider := candidate.Providers[providerName]
+			candidateProvider.APIKey = "" // 持久化视图绝不持有明文
+			candidateProvider.APIKeyEncrypted = envelope
+			candidate.Providers[providerName] = candidateProvider
+			candidateBytes, err := config.MarshalYAML(&candidate)
+			if err != nil {
+				cleanup()
+				return configaudit.BuildResult{}, fmt.Errorf("marshal config: %w", err)
+			}
+			replaced = provider.APIKeyEncrypted != ""
+			return configaudit.BuildResult{
+				Candidate: candidateBytes,
+				Audit:     audit.NewService(auditDB),
+				Cleanup:   cleanup,
+				Event: models.AuditEvent{
+					Action: audit.ActionGlobalProviderSecretChanged, ActorType: "cli", ActorID: "set-provider-key",
+					TargetType: "provider", TargetID: providerName,
+				},
+			}, nil
 		},
 	}); err != nil {
 		return nil, err
@@ -159,7 +196,7 @@ func runSetProviderKey(configPath, providerName string, allowReplace bool, readS
 		Provider:   providerName,
 		KeyID:      mgr.KeyID(),
 		ConfigPath: configPath,
-		Replaced:   p.APIKeyEncrypted != "",
+		Replaced:   replaced,
 	}
 	fmt.Fprintf(stdout, "provider %q key provisioned (encrypted at rest, key_id=%s, config=%s)\n",
 		res.Provider, res.KeyID, res.ConfigPath)

@@ -666,8 +666,10 @@ func TestP108B_S1_SQLiteBusyTimeoutConfigured(t *testing.T) {
 
 func TestP108B_S1_ConcurrentAppendNoFork(t *testing.T) {
 	// Keep the 32 goroutines and four independent SQLite handles genuinely
-	// concurrent while avoiding host-level package-runner oversubscription that
-	// can starve a writer past the fixed 5s SQLite busy timeout.
+	// concurrent while avoiding host-level package-runner oversubscription. The
+	// stress fixture gives each handle a longer SQLite wait budget so race
+	// instrumentation measures chain serialization rather than timing out a
+	// legal writer queue; production code still has no application retry.
 	previousProcs := runtime.GOMAXPROCS(1)
 	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
 
@@ -696,6 +698,9 @@ func TestP108B_S1_ConcurrentAppendNoFork(t *testing.T) {
 		if sqlDB, err := dbs[i].DB(); err == nil {
 			sqlDB.SetMaxOpenConns(1)
 			sqlDB.SetMaxIdleConns(1)
+		}
+		if err := dbs[i].Exec("PRAGMA busy_timeout = 30000").Error; err != nil {
+			t.Fatal(err)
 		}
 		services[i] = NewService(dbs[i])
 		dbForCleanup := dbs[i]

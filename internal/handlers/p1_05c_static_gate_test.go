@@ -311,7 +311,7 @@ func TestP108B_S4_StaticConfigAuditMutationGates(t *testing.T) {
 	if end := strings.Index(block, "\nfunc "); end >= 0 {
 		block = block[:end]
 	}
-	for _, marker := range []string{"adminActorFromContext", "configAudit.Run", "configaudit.Mutation", "audit.ActionServerToolsUpdated"} {
+	for _, marker := range []string{"adminActorFromContext", "configAudit.RunLocked", "configaudit.Mutation", "configstore.Snapshot", "config.ParseExistingForMigration", "audit.ActionServerToolsUpdated"} {
 		if !strings.Contains(block, marker) {
 			t.Fatalf("server-tools coordinator boundary missing %q", marker)
 		}
@@ -322,7 +322,7 @@ func TestP108B_S4_StaticConfigAuditMutationGates(t *testing.T) {
 		}
 	}
 	provisionSrc := p105bRead(t, root, "cmd/server/provision.go")
-	for _, marker := range []string{"openProviderAuditDB", "audit.MigrateIntegrity", "configaudit.New", "audit.ActionGlobalProviderSecretChanged", "ActorID: \"set-provider-key\""} {
+	for _, marker := range []string{"openProviderAuditDB", "audit.MigrateIntegrity", "configaudit.New", "RunLocked", "configstore.Snapshot", "config.ParseExistingForMigration", "audit.ActionGlobalProviderSecretChanged", "ActorID: \"set-provider-key\""} {
 		if !strings.Contains(provisionSrc, marker) {
 			t.Fatalf("provider provisioning audit boundary missing %q", marker)
 		}

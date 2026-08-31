@@ -32,6 +32,8 @@ func ReadSnapshot(path string) (Snapshot, error) {
 
 // AtomicReplace writes a fully materialized candidate through a same-directory
 // temporary file and replaces the target without widening its prior mode.
+// S4-NB1: the temporary file is fsynced, but directory-entry durability after
+// rename is intentionally left for the final filesystem/operations review.
 func AtomicReplace(path string, data []byte, mode fs.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")

@@ -18,6 +18,7 @@ import (
 	"ai-gateway/internal/database"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/secrets"
+	"gorm.io/gorm"
 )
 
 const provCanary = "P103D1A_CANARY_GLOBAL_PROVISION_SECRET"
@@ -54,6 +55,18 @@ func writeProvConfig(t *testing.T, providerLines string) string {
 	return path
 }
 
+func writeProvConfigWithMissingDB(t *testing.T, providerLines string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "nested", "gateway.db")
+	content := "server:\n  host: 127.0.0.1\n  port: 8090\nadmin:\n  username: admin\ndatabase:\n  path: \"" + filepath.ToSlash(dbPath) + "\"\nproviders:\n  openai:\n" + providerLines
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path, dbPath
+}
+
 func runProv(t *testing.T, configPath, provider string, allowReplace bool, secret string) (string, error) {
 	t.Helper()
 	t.Setenv("AIGATEWAY_MASTER_KEY", testMasterKeyB64)
@@ -69,7 +82,12 @@ func provisionAuditEvents(t *testing.T, configPath string) []models.AuditEvent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db, err := database.Open(cfg.Database.Path)
+	return provisionAuditEventsAtPath(t, cfg.Database.Path)
+}
+
+func provisionAuditEventsAtPath(t *testing.T, dbPath string) []models.AuditEvent {
+	t.Helper()
+	db, err := database.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +101,32 @@ func provisionAuditEvents(t *testing.T, configPath string) []models.AuditEvent {
 		t.Fatal(err)
 	}
 	return events
+}
+
+func provisionAuditState(t *testing.T, configPath string) (int64, string) {
+	t.Helper()
+	cfg, err := config.LoadExistingForMigration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(cfg.Database.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+	var count int64
+	if err := db.Model(&models.AuditEvent{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	var state models.AuditChainState
+	if err := db.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	return count, state.HeadHash
 }
 
 // Happy path：EMPTY provider → 表单 canary 经隐藏输入加密落盘；明文/信封绝不进 stdout
@@ -132,6 +176,181 @@ func TestProvision_SetProviderKey_HappyPath(t *testing.T) {
 	raw, _ := os.ReadFile(path)
 	if strings.Contains(string(raw), "\n    api_key: "+provCanary) {
 		t.Fatal("[安全回归失败] YAML 出现明文 api_key")
+	}
+}
+
+func TestP108B_S41_FreshDBSuccessfulProvisionIsAudited(t *testing.T) {
+	path, dbPath := writeProvConfigWithMissingDB(t, "    type: openai\n")
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("fixture database unexpectedly exists before provisioning: %v", err)
+	}
+	if _, err := runProv(t, path, "openai", false, provCanary); err != nil {
+		t.Fatalf("fresh database provisioning failed: %v", err)
+	}
+	if st, err := os.Stat(dbPath); err != nil || !st.Mode().IsRegular() {
+		t.Fatalf("successful provisioning did not bootstrap audit database: %v", err)
+	}
+	events := provisionAuditEvents(t, path)
+	if len(events) != 1 || events[0].Action != audit.ActionGlobalProviderSecretChanged || events[0].ActorType != "cli" || events[0].ActorID != "set-provider-key" {
+		t.Fatalf("fresh database provisioning must have exactly one audited mutation: %+v", events)
+	}
+}
+
+func TestP108B_S41_InvalidInputDoesNotBootstrapFreshDB(t *testing.T) {
+	path, dbPath := writeProvConfigWithMissingDB(t, "    type: openai\n")
+	if _, err := runProv(t, path, "openai", false, "   "); err == nil {
+		t.Fatal("empty provider input must fail")
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("invalid input bootstrapped audit database: %v", err)
+	}
+}
+
+func TestP108B_S41_ProviderAuditFailureRestoresExactConfig(t *testing.T) {
+	oldEnv, err := mustProvCipher(t).Encrypt([]byte("old-provider-secret"), secrets.GlobalProviderAADPrefix+"openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writeProvConfig(t, "    type: openai\n    api_key_encrypted: "+oldEnv+"\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countBefore, headBefore := provisionAuditState(t, path)
+	t.Setenv("AIGATEWAY_MASTER_KEY", testMasterKeyB64)
+	reader := newProviderKeyReader(strings.NewReader(provCanary+"\n"), true)
+	openAuditDB := func(dbPath string) (*gorm.DB, error) {
+		db, err := openProviderAuditDB(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.Exec("CREATE TRIGGER s41_reject_global BEFORE INSERT ON audit_events WHEN NEW.action = 'GLOBAL_PROVIDER_SECRET_CHANGED' BEGIN SELECT RAISE(ABORT, 'TEST_AUDIT_INSERT_FAILED'); END").Error; err != nil {
+			if sqlDB, dbErr := db.DB(); dbErr == nil {
+				_ = sqlDB.Close()
+			}
+			return nil, err
+		}
+		return db, nil
+	}
+	var out bytes.Buffer
+	if _, err := runSetProviderKeyWithAuditDBOpener(path, "openai", true, reader, openAuditDB, &out); err == nil {
+		t.Fatal("provider audit failure must reject the provisioning mutation")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("provider audit failure did not restore exact config bytes")
+	}
+	cfg, err := config.LoadExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Providers["openai"].APIKeyEncrypted; got != oldEnv {
+		t.Fatalf("provider audit failure did not restore old encrypted value: got=%q want=%q", got, oldEnv)
+	}
+	if events := provisionAuditEvents(t, path); len(events) != 0 {
+		t.Fatalf("provider audit failure left audit events: %+v", events)
+	}
+	countAfter, headAfter := provisionAuditState(t, path)
+	if countAfter != countBefore || headAfter != headBefore {
+		t.Fatalf("provider audit failure changed audit chain state: before=(%d,%q) after=(%d,%q)", countBefore, headBefore, countAfter, headAfter)
+	}
+}
+
+func TestP108B_S41_SetProviderKeyRevalidatesLockedSnapshot(t *testing.T) {
+	path := writeProvConfig(t, "    type: openai\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalEnv, err := mustProvCipher(t).Encrypt([]byte("external-provider-secret"), secrets.GlobalProviderAADPrefix+"openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := func() ([]byte, error) {
+		cfg, err := config.LoadExistingForMigration(path)
+		if err != nil {
+			return nil, err
+		}
+		provider := cfg.Providers["openai"]
+		provider.APIKeyEncrypted = externalEnv
+		cfg.Providers["openai"] = provider
+		data, err := config.MarshalYAML(cfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			return nil, err
+		}
+		return []byte(provCanary), nil
+	}
+	t.Setenv("AIGATEWAY_MASTER_KEY", testMasterKeyB64)
+	var out bytes.Buffer
+	if _, err := runSetProviderKey(path, "openai", false, reader, &out); err == nil || !strings.Contains(err.Error(), "-replace-provider-key") {
+		t.Fatalf("locked snapshot must reject a newly encrypted provider without replace flag: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(after, before) || !bytes.Contains(after, []byte(externalEnv)) {
+		t.Fatalf("locked revalidation did not preserve external provider mutation: %q", after)
+	}
+	if events := provisionAuditEvents(t, path); len(events) != 0 {
+		t.Fatalf("locked revalidation unexpectedly appended audit event: %+v", events)
+	}
+}
+
+func TestP108B_S41_SetProviderKeyUsesLockedDatabasePath(t *testing.T) {
+	path := writeProvConfig(t, "    type: openai\n")
+	cfg, err := config.LoadExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialDBPath := cfg.Database.Path
+	lockedDBPath := filepath.Join(filepath.Dir(path), "alternate", "gateway.db")
+	if err := os.MkdirAll(filepath.Dir(lockedDBPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	lockedDB, err := database.Open(lockedDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.MigrateIntegrity(lockedDB); err != nil {
+		t.Fatal(err)
+	}
+	if sqlDB, err := lockedDB.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+
+	reader := func() ([]byte, error) {
+		current, err := config.LoadExistingForMigration(path)
+		if err != nil {
+			return nil, err
+		}
+		current.Database.Path = lockedDBPath
+		data, err := config.MarshalYAML(current)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			return nil, err
+		}
+		return []byte(provCanary), nil
+	}
+	t.Setenv("AIGATEWAY_MASTER_KEY", testMasterKeyB64)
+	var out bytes.Buffer
+	if _, err := runSetProviderKey(path, "openai", false, reader, &out); err != nil {
+		t.Fatalf("provisioning with locked database path failed: %v", err)
+	}
+	if events := provisionAuditEventsAtPath(t, initialDBPath); len(events) != 0 {
+		t.Fatalf("stale pre-lock database received the provider audit event: %+v", events)
+	}
+	events := provisionAuditEventsAtPath(t, lockedDBPath)
+	if len(events) != 1 || events[0].Action != audit.ActionGlobalProviderSecretChanged || events[0].TargetID != "openai" {
+		t.Fatalf("locked database path did not receive the provider audit event: %+v", events)
 	}
 }
 

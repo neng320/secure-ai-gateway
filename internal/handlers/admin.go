@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"ai-gateway/internal/capture"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/configaudit"
+	"ai-gateway/internal/configstore"
 	mw "ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/providers"
@@ -132,6 +134,8 @@ type AdminHandler struct {
 	// ResetClient(clientID) 清理运行时 bucket；ROTATE/SUSPEND/RESUME 不重置。
 	rateLimiter *mw.RateLimiter
 }
+
+var errUnknownServerTool = errors.New("unknown server tool")
 
 type PageData struct {
 	Title     string
@@ -895,54 +899,75 @@ func (h *AdminHandler) UpdateServerTools(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	r.ParseForm()
-
-	knownTools := make(map[string]bool)
-	for _, name := range h.toolService.ToolNames() {
-		knownTools[name] = true
-	}
-	selected := make(map[string]bool)
-	for _, name := range r.Form["tool"] {
-		if !knownTools[name] {
-			http.Error(w, "Unknown server tool", http.StatusBadRequest)
-			return
-		}
-		selected[name] = true
-	}
-	enabledTools := make([]string, 0, len(selected))
-	for name := range selected {
-		enabledTools = append(enabledTools, name)
-	}
-	sort.Strings(enabledTools)
-
-	candidate := *h.cfg
-	candidate.ServerTools.Tools = enabledTools
-	candidate.ServerTools.Enabled = len(enabledTools) > 0
-	candidateBytes, err := config.MarshalYAML(&candidate)
-	if err != nil {
-		http.Error(w, "Failed to serialize config", http.StatusInternalServerError)
-		return
-	}
 	if h.configAudit == nil {
 		http.Error(w, "Config audit unavailable", http.StatusInternalServerError)
 		return
 	}
-	if err := h.configAudit.Run(configaudit.Mutation{
+	if err := h.configAudit.RunLocked(configaudit.Mutation{
 		ConfigPath: h.configPath,
-		Candidate:  candidateBytes,
-		Event: models.AuditEvent{
-			Action: audit.ActionServerToolsUpdated, ActorType: "admin", ActorID: actor,
-			TargetType: "server", TargetID: "server-tools",
-		},
-		Apply: func() {
-			h.cfg.ServerTools = candidate.ServerTools
+		Build: func(snapshot configstore.Snapshot) (configaudit.BuildResult, error) {
+			diskCfg, err := config.ParseExistingForMigration(snapshot.Bytes)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("parse authoritative config: %w", err)
+			}
+			if !sameDatabasePath(diskCfg.Database.Path, h.cfg.Database.Path) {
+				return configaudit.BuildResult{}, errors.New("runtime database path does not match authoritative config")
+			}
+			knownTools := make(map[string]bool)
+			for _, name := range h.toolService.ToolNames() {
+				knownTools[name] = true
+			}
+			selected := make(map[string]bool)
+			for _, name := range r.Form["tool"] {
+				if !knownTools[name] {
+					return configaudit.BuildResult{}, errUnknownServerTool
+				}
+				selected[name] = true
+			}
+			enabledTools := make([]string, 0, len(selected))
+			for name := range selected {
+				enabledTools = append(enabledTools, name)
+			}
+			sort.Strings(enabledTools)
+			candidate := *diskCfg
+			candidate.ServerTools.Tools = enabledTools
+			candidate.ServerTools.Enabled = len(enabledTools) > 0
+			candidateBytes, err := config.MarshalYAML(&candidate)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("serialize authoritative config: %w", err)
+			}
+			return configaudit.BuildResult{
+				Candidate: candidateBytes,
+				Event: models.AuditEvent{
+					Action: audit.ActionServerToolsUpdated, ActorType: "admin", ActorID: actor,
+					TargetType: "server", TargetID: "server-tools",
+				},
+				Apply: func() { h.cfg.ServerTools = candidate.ServerTools },
+			}, nil
 		},
 	}); err != nil {
+		if errors.Is(err, errUnknownServerTool) {
+			http.Error(w, "Unknown server tool", http.StatusBadRequest)
+			return
+		}
 		log.Printf("[ADMIN] server tools update failed: %v", err)
 		http.Error(w, "Failed to update server tools", http.StatusInternalServerError)
 		return
 	}
 
 	http.Redirect(w, r, "/admin/server-tools", http.StatusFound)
+}
+
+func sameDatabasePath(a, b string) bool {
+	if a == "" || b == "" {
+		return a == b
+	}
+	aAbs, errA := filepath.Abs(a)
+	bAbs, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return filepath.Clean(aAbs) == filepath.Clean(bAbs)
 }
 
 func (h *AdminHandler) ShowStats(w http.ResponseWriter, r *http.Request) {

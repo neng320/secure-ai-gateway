@@ -36,6 +36,7 @@ type s4AdminEnv struct {
 func newS4AdminEnv(t *testing.T) *s4AdminEnv {
 	t.Helper()
 	base := newP105Env(t)
+	base.cfg.Database.Path = base.dbPath
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	data, err := config.MarshalYAML(base.cfg)
 	if err != nil {
@@ -179,5 +180,87 @@ func TestP108B_S4_ServerToolsAuditFailureRestoresConfigAndLiveState(t *testing.T
 	}
 	if leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(env.configPath), ".config.yaml.tmp-*")); err != nil || len(leftovers) != 0 {
 		t.Fatalf("audit failure left temporary files: %v err=%v", leftovers, err)
+	}
+}
+
+func TestP108B_S41_StaleRuntimeDoesNotOverwriteProviderSecret(t *testing.T) {
+	env := newS4AdminEnv(t)
+	diskCfg, err := config.LoadExistingForMigration(env.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskCfg.Providers["openai"] = config.ProviderConfig{
+		Type:            "openai",
+		APIKeyEncrypted: "enc:v1:EXTERNAL_PROVIDER_ENVELOPE_CANARY",
+		BaseURL:         "https://provider.example.invalid/v1",
+	}
+	diskBefore, err := config.MarshalYAML(diskCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.configPath, diskBefore, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	token := s4Session(t, env)
+	w := s4Post(t, env, token, "/admin/server-tools", "tool=get_time")
+	if w.Result().StatusCode != http.StatusFound {
+		t.Fatalf("server tools status=%d body=%s", w.Result().StatusCode, w.Body.String())
+	}
+	persisted, err := config.LoadExistingForMigration(env.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := persisted.Providers["openai"]
+	if provider.APIKeyEncrypted != "enc:v1:EXTERNAL_PROVIDER_ENVELOPE_CANARY" || provider.BaseURL != "https://provider.example.invalid/v1" {
+		t.Fatalf("locked disk snapshot did not preserve external provider mutation: %+v", provider)
+	}
+	if !persisted.ServerTools.Enabled || len(persisted.ServerTools.Tools) != 1 || persisted.ServerTools.Tools[0] != "get_time" {
+		t.Fatalf("server-tools mutation was not applied to locked snapshot: %+v", persisted.ServerTools)
+	}
+	var events []models.AuditEvent
+	if err := env.base.db.Order("id ASC").Find(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Action != audit.ActionServerToolsUpdated {
+		t.Fatalf("stale runtime update produced unexpected audit history: %+v", events)
+	}
+}
+
+func TestP108B_S41_RuntimeDatabasePathMismatchFailsClosed(t *testing.T) {
+	env := newS4AdminEnv(t)
+	diskCfg, err := config.LoadExistingForMigration(env.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskCfg.Database.Path = filepath.Join(t.TempDir(), "different.db")
+	diskBefore, err := config.MarshalYAML(diskCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.configPath, diskBefore, 0600); err != nil {
+		t.Fatal(err)
+	}
+	liveBefore := env.base.cfg.ServerTools
+	countBefore, headBefore := s4AuditState(t, env.base.db)
+
+	token := s4Session(t, env)
+	w := s4Post(t, env, token, "/admin/server-tools", "tool=get_time")
+	if w.Result().StatusCode != http.StatusInternalServerError {
+		t.Fatalf("database path mismatch status=%d body=%s", w.Result().StatusCode, w.Body.String())
+	}
+	diskAfter, err := os.ReadFile(env.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(diskAfter, diskBefore) {
+		t.Fatal("runtime database path mismatch changed authoritative config")
+	}
+	if !reflect.DeepEqual(env.base.cfg.ServerTools, liveBefore) {
+		t.Fatalf("runtime database path mismatch changed live config: before=%+v after=%+v", liveBefore, env.base.cfg.ServerTools)
+	}
+	countAfter, headAfter := s4AuditState(t, env.base.db)
+	if countAfter != countBefore || headAfter != headBefore {
+		t.Fatal("runtime database path mismatch changed audit state")
 	}
 }

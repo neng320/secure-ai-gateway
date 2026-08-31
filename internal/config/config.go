@@ -323,9 +323,19 @@ func LoadExistingForMigration(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
+	cfg, err := ParseExistingForMigration(data)
+	if err != nil {
+		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// ParseExistingForMigration parses a config snapshot without filesystem
+// access, default generation, or package-level source-path mutation.
+func ParseExistingForMigration(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		return nil, err
 	}
 
 	if cfg.Providers == nil {
