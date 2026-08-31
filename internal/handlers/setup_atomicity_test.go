@@ -85,21 +85,22 @@ func newSetupHandlerForTest(t *testing.T, cfg *config.Config, configPath string)
 			_ = sqlDB.Close()
 		}
 	})
-	if raw, err := os.ReadFile(configPath); err == nil {
-		diskCfg, parseErr := config.ParseExistingForMigration(raw)
-		if parseErr != nil {
-			t.Fatal(parseErr)
-		}
-		diskCfg.Database.Path = cfg.Database.Path
-		data, marshalErr := config.MarshalYAML(diskCfg)
-		if marshalErr != nil {
-			t.Fatal(marshalErr)
-		}
-		if writeErr := os.WriteFile(configPath, data, 0600); writeErr != nil {
-			t.Fatal(writeErr)
-		}
-	} else if os.IsNotExist(err) {
-		if parent, statErr := os.Stat(filepath.Dir(configPath)); statErr == nil && parent.IsDir() {
+	if parent, statErr := os.Stat(filepath.Dir(configPath)); statErr == nil && parent.IsDir() {
+		raw, readErr := os.ReadFile(configPath)
+		if readErr == nil {
+			diskCfg, parseErr := config.ParseExistingForMigration(raw)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			diskCfg.Database.Path = cfg.Database.Path
+			data, marshalErr := config.MarshalYAML(diskCfg)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			if writeErr := os.WriteFile(configPath, data, 0600); writeErr != nil {
+				t.Fatal(writeErr)
+			}
+		} else if os.IsNotExist(readErr) {
 			data, marshalErr := config.MarshalYAML(cfg)
 			if marshalErr != nil {
 				t.Fatal(marshalErr)
@@ -107,9 +108,9 @@ func newSetupHandlerForTest(t *testing.T, cfg *config.Config, configPath string)
 			if writeErr := os.WriteFile(configPath, data, 0600); writeErr != nil {
 				t.Fatal(writeErr)
 			}
+		} else {
+			t.Fatal(readErr)
 		}
-	} else {
-		t.Fatal(err)
 	}
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15, cfg.Admin.Username)
