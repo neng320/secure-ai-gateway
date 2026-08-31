@@ -10,16 +10,26 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/config"
 )
 
 func TestP1_022_Setup_SyncsLimiterProtectedUser(t *testing.T) {
 	env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-	setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	data, err := config.MarshalYAML(env.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	setupH := NewSetupHandler(env.cfg, false, env.limiter, configPath, env.db)
 	r := setupEnvRouter(env)
 	setupH.RegisterRoutes(r)
 

@@ -47,6 +47,11 @@ const (
 	ActionClientModelsUpdated         = "CLIENT_MODELS_UPDATED"
 	ActionServerToolsUpdated          = "SERVER_TOOLS_UPDATED"
 	ActionGlobalProviderSecretChanged = "GLOBAL_PROVIDER_SECRET_CHANGED"
+	ActionAdminLoginSucceeded         = "ADMIN_LOGIN_SUCCEEDED"
+	ActionAdminLogout                 = "ADMIN_LOGOUT"
+	ActionSetupCompleted              = "SETUP_COMPLETED"
+	ActionRequestBodyCaptureRead      = "REQUEST_BODY_CAPTURE_READ"
+	ActionAdminPasswordReset          = "ADMIN_PASSWORD_RESET"
 )
 
 // allowedActions: 审计写入白名单（静态 Gate 断言生产 action 只能来自常量）。
@@ -62,6 +67,11 @@ var allowedActions = map[string]bool{
 	ActionClientModelsUpdated:         true,
 	ActionServerToolsUpdated:          true,
 	ActionGlobalProviderSecretChanged: true,
+	ActionAdminLoginSucceeded:         true,
+	ActionAdminLogout:                 true,
+	ActionSetupCompleted:              true,
+	ActionRequestBodyCaptureRead:      true,
+	ActionAdminPasswordReset:          true,
 }
 
 func IsKnownAction(action string) bool {

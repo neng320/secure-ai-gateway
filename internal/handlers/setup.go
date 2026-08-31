@@ -3,16 +3,24 @@ package handlers
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/configaudit"
+	"ai-gateway/internal/configstore"
+	"ai-gateway/internal/models"
 
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 type SetupHandler struct {
@@ -20,13 +28,14 @@ type SetupHandler struct {
 	setupMode    bool
 	loginLimiter *auth.LoginRateLimiter
 	configPath   string
+	db           *gorm.DB
 }
 
 // NewSetupHandler: loginLimiter 必须与 AdminHandler 共享同一实例（P1-02.2），
 // 以便 Setup 修改管理员用户名后同步 limiter 的受保护身份。
 // configPath: 实际加载的配置文件路径（P1-02.3）——禁止再硬编码 "config.yaml"。
-func NewSetupHandler(cfg *config.Config, setupMode bool, loginLimiter *auth.LoginRateLimiter, configPath string) *SetupHandler {
-	return &SetupHandler{cfg: cfg, setupMode: setupMode, loginLimiter: loginLimiter, configPath: configPath}
+func NewSetupHandler(cfg *config.Config, setupMode bool, loginLimiter *auth.LoginRateLimiter, configPath string, db *gorm.DB) *SetupHandler {
+	return &SetupHandler{cfg: cfg, setupMode: setupMode, loginLimiter: loginLimiter, configPath: configPath, db: db}
 }
 
 func (h *SetupHandler) IsSetupRequired() bool {
@@ -115,39 +124,66 @@ func (h *SetupHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		h.showError(w, "Failed to hash password")
-		return
-	}
-
 	// P1-02.3：配置文件路径未知时 fail-closed，绝不猜测 cwd 下的 config.yaml
 	if h.configPath == "" {
 		h.showError(w, "Config source path unknown; refusing to persist credentials")
 		return
 	}
 
-	// P1-02.3：candidate 配置——先在副本上修改并持久化，成功后才切换运行态。
-	// 保存失败时：运行态 Admin/Prometheus 与 limiter 受保护身份全部保持原值。
-	// （浅拷贝共享 Providers map；Setup 仅修改值字段，不触碰 map，安全。）
-	candidate := *h.cfg
-	candidate.Admin.Username = username
-	candidate.Admin.PasswordHash = string(hash)
-	if candidate.Admin.SessionSecret == "" {
-		candidate.Admin.SessionSecret = generateRandomString(32)
-	}
-	candidate.Prometheus.Enabled = true
-	candidate.Prometheus.Username = "prometheus"
-	candidate.Prometheus.Password = generateRandomString(20)
-
-	if err := config.SaveConfig(&candidate, h.configPath); err != nil {
-		h.showError(w, "Failed to save config: "+err.Error())
+	if h.db == nil {
+		log.Printf("[SETUP] audited database unavailable")
+		h.showError(w, "Failed to complete setup")
 		return
 	}
 
-	// 持久化成功 → 原子切换运行态
-	h.cfg.Admin = candidate.Admin
-	h.cfg.Prometheus = candidate.Prometheus
+	// The authoritative disk snapshot is locked before candidate construction.
+	err := configaudit.New(audit.NewService(h.db)).RunLockedTransactional(configaudit.Mutation{
+		ConfigPath: h.configPath,
+		Build: func(snapshot configstore.Snapshot) (configaudit.BuildResult, error) {
+			diskCfg, err := config.ParseExistingForMigration(snapshot.Bytes)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("parse authoritative config: %w", err)
+			}
+			if !sameDatabasePath(diskCfg.Database.Path, h.cfg.Database.Path) {
+				return configaudit.BuildResult{}, errors.New("runtime database path does not match authoritative config")
+			}
+			hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("hash setup password: %w", err)
+			}
+			candidate := *diskCfg
+			candidate.Admin.Username = username
+			candidate.Admin.PasswordHash = string(hash)
+			if candidate.Admin.SessionSecret == "" {
+				candidate.Admin.SessionSecret = generateRandomString(32)
+			}
+			candidate.Prometheus.Enabled = true
+			candidate.Prometheus.Username = "prometheus"
+			candidate.Prometheus.Password = generateRandomString(20)
+			candidateBytes, err := config.MarshalYAML(&candidate)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("serialize authoritative config: %w", err)
+			}
+			return configaudit.BuildResult{
+				Candidate: candidateBytes,
+				Event: models.AuditEvent{
+					Action: audit.ActionSetupCompleted, ActorType: "setup", ActorID: "setup-wizard",
+					TargetType: "admin", TargetID: "admin",
+				},
+				Apply: func() {
+					h.cfg.Admin = candidate.Admin
+					h.cfg.Prometheus = candidate.Prometheus
+				},
+			}, nil
+		},
+	}, h.db, func(tx *gorm.DB) error {
+		return tx.Model(&models.AdminSession{}).Where("revoked_at IS NULL").Update("revoked_at", time.Now().UTC()).Error
+	})
+	if err != nil {
+		log.Printf("[SETUP] audited setup failed: %v", err)
+		h.showError(w, "Failed to complete setup")
+		return
+	}
 
 	// P1-02.2：配置成功保存后才同步 limiter 的受保护身份（避免保存失败但内存已变）。
 	// 同时清除新用户名的失败记录，让成功的 Setup 从干净登录状态开始。

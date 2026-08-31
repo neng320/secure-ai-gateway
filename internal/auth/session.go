@@ -18,6 +18,7 @@ import (
 	"errors"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/models"
 
 	"gorm.io/gorm"
@@ -65,6 +66,15 @@ type Store interface {
 	RevokeAllForUser(ctx context.Context, username string) error
 }
 
+// AuditedStore owns the session mutation and its audit append in one SQLite
+// transaction. Handlers must not fall back to the unaudited Store methods for
+// successful login/logout paths.
+type AuditedStore interface {
+	Store
+	CreateAudited(ctx context.Context, username string, expiresAt time.Time) (rawToken string, err error)
+	RevokeAudited(ctx context.Context, rawToken string) error
+}
+
 // SQLiteStore 基于 gorm + models.AdminSession 的 Store 实现。
 type SQLiteStore struct {
 	db *gorm.DB
@@ -75,6 +85,7 @@ func NewSQLiteStore(db *gorm.DB) *SQLiteStore {
 }
 
 var _ Store = (*SQLiteStore)(nil)
+var _ AuditedStore = (*SQLiteStore)(nil)
 
 func (s *SQLiteStore) Create(ctx context.Context, username string, expiresAt time.Time) (string, error) {
 	rawToken, err := GenerateToken()
@@ -88,6 +99,39 @@ func (s *SQLiteStore) Create(ctx context.Context, username string, expiresAt tim
 		ExpiresAt: expiresAt.UTC(),
 	}
 	if err := s.db.WithContext(ctx).Create(&sess).Error; err != nil {
+		return "", err
+	}
+	return rawToken, nil
+}
+
+// CreateAudited creates a session and records ADMIN_LOGIN_SUCCEEDED in the
+// same transaction. The raw token is returned only after commit.
+func (s *SQLiteStore) CreateAudited(ctx context.Context, username string, expiresAt time.Time) (string, error) {
+	rawToken, err := GenerateToken()
+	if err != nil {
+		return "", err
+	}
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return "", tx.Error
+	}
+	defer tx.Rollback()
+	sess := models.AdminSession{
+		Username:  username,
+		TokenHash: HashToken(rawToken),
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: expiresAt.UTC(),
+	}
+	if err := tx.Create(&sess).Error; err != nil {
+		return "", err
+	}
+	if err := audit.NewService(s.db).RecordTx(tx, models.AuditEvent{
+		Action: audit.ActionAdminLoginSucceeded, ActorType: "admin", ActorID: username,
+		TargetType: "admin", TargetID: "admin",
+	}); err != nil {
+		return "", err
+	}
+	if err := tx.Commit().Error; err != nil {
 		return "", err
 	}
 	return rawToken, nil
@@ -125,6 +169,51 @@ func (s *SQLiteStore) Revoke(ctx context.Context, rawToken string) error {
 		return ErrSessionNotFound
 	}
 	return nil
+}
+
+// RevokeAudited resolves the authoritative session row, revokes it, and
+// records ADMIN_LOGOUT in the same transaction. Non-active sessions are
+// idempotent no-ops from the handler's perspective and never create audit
+// events.
+func (s *SQLiteStore) RevokeAudited(ctx context.Context, rawToken string) error {
+	if rawToken == "" {
+		return ErrSessionNotFound
+	}
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer tx.Rollback()
+	var sess models.AdminSession
+	if err := tx.Where("token_hash = ?", HashToken(rawToken)).First(&sess).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrSessionNotFound
+		}
+		return err
+	}
+	if sess.RevokedAt != nil {
+		return ErrSessionRevoked
+	}
+	if time.Now().UTC().After(sess.ExpiresAt.UTC()) {
+		return ErrSessionExpired
+	}
+	revokedAt := time.Now().UTC()
+	result := tx.Model(&models.AdminSession{}).
+		Where("id = ? AND revoked_at IS NULL", sess.ID).
+		Update("revoked_at", revokedAt)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrSessionNotFound
+	}
+	if err := audit.NewService(s.db).RecordTx(tx, models.AuditEvent{
+		Action: audit.ActionAdminLogout, ActorType: "admin", ActorID: sess.Username,
+		TargetType: "admin", TargetID: "admin",
+	}); err != nil {
+		return err
+	}
+	return tx.Commit().Error
 }
 
 func (s *SQLiteStore) RevokeAllForUser(ctx context.Context, username string) error {

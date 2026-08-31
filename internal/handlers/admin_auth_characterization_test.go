@@ -61,6 +61,7 @@ type authEnv struct {
 	cfg     *config.Config
 	router  http.Handler
 	db      *gorm.DB
+	dbPath  string
 	store   *auth.SQLiteStore
 	limiter *auth.LoginRateLimiter
 }
@@ -72,7 +73,8 @@ func newAuthEnv(t *testing.T) *authEnv {
 
 func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "gw.db")), &gorm.Config{})
+	dbPath := filepath.Join(t.TempDir(), "gw.db")
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -87,7 +89,8 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 		}
 	})
 	cfg := &config.Config{
-		Server: config.ServerConfig{Host: "127.0.0.1", Port: 8090},
+		Server:   config.ServerConfig{Host: "127.0.0.1", Port: 8090},
+		Database: config.DatabaseConfig{Path: dbPath},
 		Admin: config.AdminConfig{
 			Username:      testAdminUser,
 			PasswordHash:  passwordHash,
@@ -110,7 +113,7 @@ func newAuthEnvWithHash(t *testing.T, passwordHash string) *authEnv {
 	}
 	r := chi.NewRouter()
 	adminH.RegisterRoutes(r)
-	return &authEnv{cfg: cfg, router: r, db: db, store: store, limiter: limiter}
+	return &authEnv{cfg: cfg, router: r, db: db, dbPath: dbPath, store: store, limiter: limiter}
 }
 
 func doReq(r http.Handler, method, target string, cookies []*http.Cookie) *http.Response {
@@ -441,7 +444,7 @@ func withTempWorkingDir(t *testing.T, fn func()) {
 func TestSetupChar_UnsetPassword_SetupReachableWithoutAuth(t *testing.T) {
 	withTempWorkingDir(t, func() {
 		env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-		setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
+		setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"), env.db)
 		r := setupEnvRouter(env)
 		setupH.RegisterRoutes(r)
 
@@ -455,7 +458,7 @@ func TestSetupChar_UnsetPassword_SetupReachableWithoutAuth(t *testing.T) {
 // [NORMAL] 已设密码后 setup 必须关闭。
 func TestSetupChar_PasswordSet_SetupRedirectsAway(t *testing.T) {
 	env := newAuthEnv(t)
-	setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
+	setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"), env.db)
 	r := setupEnvRouter(env)
 	setupH.RegisterRoutes(r)
 	resp := doReq(r, "GET", "/setup", nil)
@@ -464,11 +467,19 @@ func TestSetupChar_PasswordSet_SetupRedirectsAway(t *testing.T) {
 	}
 }
 
-// [NORMAL] setup 完成后可用新凭据登录（并再次验证会话仍为静态值）。
+// [NORMAL] setup 完成后可用新凭据登录，并获得随机服务端会话。
 func TestSetupChar_CompletesAndThenLoginWorks(t *testing.T) {
 	withTempWorkingDir(t, func() {
 		env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
-		setupH := NewSetupHandler(env.cfg, false, env.limiter, filepath.Join(t.TempDir(), "config.yaml"))
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		data, err := config.MarshalYAML(env.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		setupH := NewSetupHandler(env.cfg, false, env.limiter, configPath, env.db)
 		r := setupEnvRouter(env)
 		setupH.RegisterRoutes(r)
 

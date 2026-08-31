@@ -386,18 +386,24 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.loginLimiter.RecordSuccess(username)
-
 	// SEC-001 修复（P1-01C）：凭据验证通过后签发真实服务端会话。
 	// 原始 256-bit 随机 token 仅此一次可见并放入 Cookie；库中只存 SHA-256。
 	expiresAt := time.Now().Add(auth.SessionDuration)
-	rawToken, err := h.sessionStore.Create(r.Context(), username, expiresAt)
-	if err != nil {
-		// 会话创建失败时绝不能让登录"静默成功"（否则会退回无法验证的状态）
-		log.Printf("[ADMIN] session create failed: %v", err)
+	auditedStore, ok := h.sessionStore.(auth.AuditedStore)
+	if !ok {
+		log.Printf("[ADMIN] audited session store unavailable")
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	rawToken, err := auditedStore.CreateAudited(r.Context(), username, expiresAt)
+	if err != nil {
+		// session insert and ADMIN_LOGIN_SUCCEEDED audit are one transaction;
+		// failure must not issue a cookie or record limiter success.
+		log.Printf("[ADMIN] audited session create failed: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	h.loginLimiter.RecordSuccess(username)
 
 	cookie := &http.Cookie{
 		Name:     auth.SessionCookieName,
@@ -416,9 +422,18 @@ func (h *AdminHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 func (h *AdminHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	// SEC-001 修复（P1-01E）：登出必须在服务端吊销会话，仅清浏览器 Cookie 不够。
 	// 未知/伪造 token 静默忽略（幂等），不让登出端点成为探测/500 源。
+	auditedStore, ok := h.sessionStore.(auth.AuditedStore)
+	if !ok {
+		log.Printf("[ADMIN] audited session store unavailable")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil && cookie.Value != "" {
-		if err := h.sessionStore.Revoke(r.Context(), cookie.Value); err != nil && !errors.Is(err, auth.ErrSessionNotFound) {
-			log.Printf("[ADMIN] session revoke failed: %v", err)
+		if err := auditedStore.RevokeAudited(r.Context(), cookie.Value); err != nil &&
+			!errors.Is(err, auth.ErrSessionNotFound) &&
+			!errors.Is(err, auth.ErrSessionRevoked) &&
+			!errors.Is(err, auth.ErrSessionExpired) {
+			log.Printf("[ADMIN] audited session revoke failed: %v", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
@@ -1167,6 +1182,24 @@ func (h *AdminHandler) GetCapturedRequestBody(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Pragma", "no-cache")
 	if entry.Truncated {
 		w.Header().Set("X-Body-Truncated", "true")
+	}
+	actor, ok := adminActorFromContext(r.Context())
+	if !ok || h.clientService == nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	if err := h.clientService.AuditService().Record(models.AuditEvent{
+		Action: audit.ActionRequestBodyCaptureRead, ActorType: "admin", ActorID: actor,
+		TargetType: "request-capture", TargetID: id,
+	}); err != nil {
+		log.Printf("[ADMIN] capture audit failed: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	entry, ok = h.capture.Get(id)
+	if !ok {
+		http.Error(w, "captured request body not available", http.StatusNotFound)
+		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write(entry.Body)

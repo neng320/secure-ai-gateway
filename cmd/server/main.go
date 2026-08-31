@@ -45,12 +45,13 @@ import (
 )
 
 var (
-	version    = "dev"
-	commit     = "unknown"
-	buildTime  = "unknown"
-	setupMode  = flag.Bool("setup", false, "Run setup wizard")
-	resetPw    = flag.String("reset-password", "", "Reset admin password to the specified value")
-	migrateSec = flag.Bool("migrate-provider-secrets", false, "Offline migration: encrypt provider secrets (PREPARE/VERIFY/FINALIZE), then exit")
+	version      = "dev"
+	commit       = "unknown"
+	buildTime    = "unknown"
+	setupMode    = flag.Bool("setup", false, "Run setup wizard")
+	resetPw      = flag.Bool("reset-password", false, "Reset admin password using hidden TTY input or explicit stdin mode")
+	resetPwStdin = flag.Bool("reset-password-stdin", false, "Read the reset password from stdin (requires -reset-password)")
+	migrateSec   = flag.Bool("migrate-provider-secrets", false, "Offline migration: encrypt provider secrets (PREPARE/VERIFY/FINALIZE), then exit")
 	// P1-04D：显式离线 scrub——清除 request_logs legacy 正文/错误文本（不可逆，需二次确认）
 	scrubReqLog  = flag.Bool("scrub-request-log-content", false, "Offline scrub: clear legacy request_body/error_message in request_logs, then exit (IRREVERSIBLE)")
 	confirmScrub = flag.Bool("confirm-destructive-scrub", false, "Required second confirmation flag for -scrub-request-log-content")
@@ -72,23 +73,25 @@ func main() {
 		os.Exit(runVerifyAuditLog(*configPath, os.Stdout, os.Stderr))
 	}
 
-	printBanner()
-
 	// Handle password reset flag
-	if *resetPw != "" {
-		cfg, err := config.Load(*configPath)
-		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
+	if *resetPw || *resetPwStdin {
+		if flag.NArg() != 0 {
+			fmt.Fprintln(os.Stderr, "error: -reset-password does not accept a password argument")
+			os.Exit(2)
 		}
-		if err := config.ResetAdminPassword(cfg, *resetPw); err != nil {
-			log.Fatalf("Failed to reset password: %v", err)
+		if !*resetPw {
+			fmt.Fprintln(os.Stderr, "error: -reset-password-stdin requires -reset-password")
+			os.Exit(2)
 		}
-		if err := config.SaveConfig(cfg, *configPath); err != nil {
-			log.Fatalf("Failed to save config: %v", err)
+		reader := newAdminPasswordReader(os.Stdin, *resetPwStdin)
+		if err := runResetAdminPassword(*configPath, reader, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
 		}
-		fmt.Printf("Admin password has been reset\n")
 		return
 	}
+
+	printBanner()
 
 	// P1-03C2：显式离线迁移模式——不启动任何 HTTP listener
 	if *migrateSec {

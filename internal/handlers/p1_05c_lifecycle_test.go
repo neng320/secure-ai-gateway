@@ -179,6 +179,7 @@ func TestP105C_B_RevokeActive_Success(t *testing.T) {
 func TestP105C_AdminCreateFailure_RollsBackClientAndAudit(t *testing.T) {
 	env := newP105Env(t)
 	token := p105AdminSessionOf(t, env)
+	eventsBefore := env.countAll(t, "audit_events")
 	w := env.adminPost(t, token, "/admin/clients", url.Values{
 		"name":            {"p105c-create-fail"},
 		"backend_api_key": {p105cProviderSec},
@@ -186,7 +187,7 @@ func TestP105C_AdminCreateFailure_RollsBackClientAndAudit(t *testing.T) {
 	if w.Result().StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("[Create] missing master key should fail closed, actual %d", w.Result().StatusCode)
 	}
-	if clients, events := env.countAll(t, "clients"), env.countAll(t, "audit_events"); clients != 0 || events != 0 {
+	if clients, events := env.countAll(t, "clients"), env.countAll(t, "audit_events"); clients != 0 || events != eventsBefore {
 		t.Fatalf("[Create] failed create must rollback client and audit, clients=%d events=%d", clients, events)
 	}
 	t.Log("[Create PASS] provider-key encryption failure rolls back client/settings/audit atomically")

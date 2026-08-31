@@ -9,6 +9,7 @@ import (
 	"ai-gateway/internal/configlock"
 	"ai-gateway/internal/configstore"
 	"ai-gateway/internal/models"
+	"gorm.io/gorm"
 )
 
 var ErrConfigAuditRollbackFailed = errors.New("config audit rollback failed")
@@ -32,6 +33,7 @@ type BuildResult struct {
 	Candidate []byte
 	Event     models.AuditEvent
 	Audit     *audit.Service
+	DB        *gorm.DB
 	Apply     func()
 	Cleanup   func()
 }
@@ -60,6 +62,47 @@ func (c *Coordinator) RunLocked(m Mutation) (err error) {
 	if c == nil || c.files == nil || m.ConfigPath == "" || m.Build == nil {
 		return fmt.Errorf("config audit mutation is invalid")
 	}
+	return c.runLocked(m, func(result BuildResult) error {
+		auditService, err := c.auditService(result)
+		if err != nil {
+			return err
+		}
+		return auditService.Record(result.Event)
+	})
+}
+
+// RunLockedTransactional extends the same lock/compensation protocol with a
+// required SQLite mutation. The callback cannot omit the audit append because
+// RecordTx is unconditionally executed in the same transaction afterward.
+func (c *Coordinator) RunLockedTransactional(m Mutation, db *gorm.DB, mutate func(*gorm.DB) error) error {
+	if mutate == nil {
+		return fmt.Errorf("config audit transaction is invalid")
+	}
+	return c.runLocked(m, func(result BuildResult) error {
+		auditService, err := c.auditService(result)
+		if err != nil {
+			return err
+		}
+		transactionDB := result.DB
+		if transactionDB == nil {
+			transactionDB = db
+		}
+		if transactionDB == nil {
+			return fmt.Errorf("config audit database is unavailable")
+		}
+		return transactionDB.Transaction(func(tx *gorm.DB) error {
+			if err := mutate(tx); err != nil {
+				return err
+			}
+			return auditService.RecordTx(tx, result.Event)
+		})
+	})
+}
+
+func (c *Coordinator) runLocked(m Mutation, afterPersist func(BuildResult) error) (err error) {
+	if c == nil || c.files == nil || m.ConfigPath == "" || m.Build == nil || afterPersist == nil {
+		return fmt.Errorf("config audit mutation is invalid")
+	}
 	lock, err := configlock.Acquire(m.ConfigPath)
 	if err != nil {
 		return err
@@ -84,17 +127,10 @@ func (c *Coordinator) RunLocked(m Mutation) (err error) {
 	if len(result.Candidate) == 0 {
 		return fmt.Errorf("config audit candidate is empty")
 	}
-	auditService := result.Audit
-	if auditService == nil {
-		auditService = c.audit
-	}
-	if auditService == nil {
-		return fmt.Errorf("config audit service is unavailable")
-	}
 	if err := c.files.AtomicReplace(lock.CanonicalConfigPath(), result.Candidate, snapshot.Mode); err != nil {
 		return err
 	}
-	if err := auditService.Record(result.Event); err != nil {
+	if err := afterPersist(result); err != nil {
 		if restoreErr := c.files.AtomicReplace(lock.CanonicalConfigPath(), snapshot.Bytes, snapshot.Mode); restoreErr != nil {
 			return fmt.Errorf("%w: %v", ErrConfigAuditRollbackFailed, restoreErr)
 		}
@@ -104,4 +140,15 @@ func (c *Coordinator) RunLocked(m Mutation) (err error) {
 		result.Apply()
 	}
 	return nil
+}
+
+func (c *Coordinator) auditService(result BuildResult) (*audit.Service, error) {
+	auditService := result.Audit
+	if auditService == nil {
+		auditService = c.audit
+	}
+	if auditService == nil {
+		return nil, fmt.Errorf("config audit service is unavailable")
+	}
+	return auditService, nil
 }

@@ -16,8 +16,11 @@ import (
 	"strings"
 	"testing"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/database"
+	"ai-gateway/internal/models"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -64,9 +67,53 @@ func minimalSetupCfg() *config.Config {
 // newSetupHandlerForTest: 构造 SetupHandler 并为 limiter 配置受保护账号
 func newSetupHandlerForTest(t *testing.T, cfg *config.Config, configPath string) (*SetupHandler, *auth.LoginRateLimiter) {
 	t.Helper()
+	if cfg.Database.Path == "" {
+		cfg.Database.Path = filepath.Join(t.TempDir(), "setup.db")
+	}
+	db, err := database.Open(cfg.Database.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.AdminSession{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.MigrateIntegrity(db); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	if raw, err := os.ReadFile(configPath); err == nil {
+		diskCfg, parseErr := config.ParseExistingForMigration(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		diskCfg.Database.Path = cfg.Database.Path
+		data, marshalErr := config.MarshalYAML(diskCfg)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if writeErr := os.WriteFile(configPath, data, 0600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	} else if os.IsNotExist(err) {
+		if parent, statErr := os.Stat(filepath.Dir(configPath)); statErr == nil && parent.IsDir() {
+			data, marshalErr := config.MarshalYAML(cfg)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			if writeErr := os.WriteFile(configPath, data, 0600); writeErr != nil {
+				t.Fatal(writeErr)
+			}
+		}
+	} else {
+		t.Fatal(err)
+	}
 	limiter := auth.NewLoginRateLimiter()
 	limiter.Configure(5, 15, cfg.Admin.Username)
-	return NewSetupHandler(cfg, false, limiter, configPath), limiter
+	return NewSetupHandler(cfg, false, limiter, configPath, db), limiter
 }
 
 func newSetupTestRouter(t *testing.T, setupH *SetupHandler) http.Handler {

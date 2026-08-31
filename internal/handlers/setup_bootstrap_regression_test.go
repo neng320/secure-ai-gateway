@@ -75,13 +75,21 @@ func TestP1044_FreshBootstrap_SetupFlowRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	migrateHandlerAudit(t, db)
+	cfg.Database.Path = filepath.Join(dir, "gw.db")
+	configData, err := config.MarshalYAML(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, configData, 0600); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		if sqlDB, e := db.DB(); e == nil {
 			_ = sqlDB.Close()
 		}
 	})
 	limiter := auth.NewLoginRateLimiter()
-	setupHandler := NewSetupHandler(cfg, false, limiter, cfgPath)
+	setupHandler := NewSetupHandler(cfg, false, limiter, cfgPath, db)
 	if !setupHandler.IsSetupRequired() {
 		t.Fatal("[安全回归失败] fresh config 应判定 setup required")
 	}
@@ -140,7 +148,7 @@ func TestP1044_FreshBootstrap_SetupFlowRegression(t *testing.T) {
 	if err := bcrypt.CompareHashAndPassword([]byte(cfg2.Admin.PasswordHash), []byte(p1044UserPassword)); err != nil {
 		t.Fatalf("[功能回归失败] 落盘哈希应与用户密码匹配: %v", err)
 	}
-	if NewSetupHandler(cfg2, false, limiter, cfgPath).IsSetupRequired() {
+	if NewSetupHandler(cfg2, false, limiter, cfgPath, db).IsSetupRequired() {
 		t.Fatal("[安全回归失败] setup 完成后仍判定 setup required")
 	}
 
