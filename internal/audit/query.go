@@ -16,9 +16,10 @@ const (
 var ErrInvalidAuditQuery = errors.New("invalid audit query")
 
 // Query is the bounded, exact-match query contract used by the Admin viewer.
-// BeforeID is an opaque keyset cursor: zero means the first page.
+// BeforeID uses the same signed domain as AuditEvent.ID; zero means the first
+// page and negative values are invalid.
 type Query struct {
-	BeforeID   uint
+	BeforeID   int64
 	Limit      int
 	Action     string
 	ActorType  string
@@ -29,7 +30,7 @@ type Query struct {
 
 type Page struct {
 	Events       []models.AuditEvent
-	NextBeforeID uint
+	NextBeforeID int64
 	HasMore      bool
 }
 
@@ -71,6 +72,9 @@ func normalizeAuditQuery(query Query) (Query, error) {
 		query.Limit = DefaultAuditQueryLimit
 	}
 	if query.Limit < 1 || query.Limit > MaxAuditQueryLimit {
+		return Query{}, ErrInvalidAuditQuery
+	}
+	if query.BeforeID < 0 {
 		return Query{}, ErrInvalidAuditQuery
 	}
 	if query.Action != "" && !IsKnownAction(query.Action) {
@@ -139,7 +143,7 @@ func (s *Service) QueryPage(query Query) (Page, error) {
 	if len(page.Events) > query.Limit {
 		page.HasMore = true
 		page.Events = page.Events[:query.Limit]
-		page.NextBeforeID = uint(page.Events[len(page.Events)-1].ID)
+		page.NextBeforeID = page.Events[len(page.Events)-1].ID
 	}
 	return page, nil
 }

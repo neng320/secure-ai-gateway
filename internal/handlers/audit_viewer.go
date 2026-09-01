@@ -81,11 +81,11 @@ func parseAuditQuery(values url.Values) (audit.Query, error) {
 	if raw, present, err := readSingle("before_id"); err != nil {
 		return audit.Query{}, err
 	} else if present {
-		beforeID, parseErr := strconv.ParseUint(raw, 10, 64)
-		if parseErr != nil || beforeID == 0 || uint64(uint(beforeID)) != beforeID {
+		beforeID, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil || beforeID <= 0 {
 			return audit.Query{}, audit.ErrInvalidAuditQuery
 		}
-		query.BeforeID = uint(beforeID)
+		query.BeforeID = beforeID
 	}
 	for _, field := range []struct {
 		name  string
@@ -156,7 +156,7 @@ func auditViewPageFromQuery(page audit.Page, query audit.Query) AuditViewPage {
 	}
 	if page.HasMore {
 		params := url.Values{}
-		params.Set("before_id", strconv.FormatUint(uint64(page.NextBeforeID), 10))
+		params.Set("before_id", strconv.FormatInt(page.NextBeforeID, 10))
 		params.Set("limit", strconv.Itoa(query.Limit))
 		if query.Action != "" {
 			params.Set("action", query.Action)
