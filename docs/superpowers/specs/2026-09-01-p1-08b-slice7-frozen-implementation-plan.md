@@ -107,9 +107,11 @@ Within it, a real SQLite transaction obtains the audit-chain writer lock before
 pending lookup. Lookup, decision, UUID generation, and STARTED append stay in that
 transaction.
 
-Request scrub uses one pinned offline SQLite connection. `BEGIN EXCLUSIVE`
-occurs before pending lookup. Lookup, decision, STARTED, and logical clearing stay
-in that exclusive transaction.
+Request scrub uses one pinned offline SQLite connection and establishes its
+offline-exclusive ownership before the audit prerequisite. `audit.MigrateIntegrity`
+and current-integrity verification use that same authoritative offline DB and
+connection path. `BEGIN EXCLUSIVE` then occurs before pending lookup. Lookup,
+decision, STARTED, and logical clearing stay in that exclusive transaction.
 
 The maintenance module exposes the minimum interface needed to begin/resume and
 complete a fixed maintenance kind inside a caller-owned active transaction. It
@@ -238,7 +240,9 @@ No plaintext recovery backup is created.
 
 ```text
 pinned offline SQLite connection
-→ exclusive mode
+→ configure/obtain offline exclusive ownership
+→ audit.MigrateIntegrity using the same authoritative offline DB/connection path
+→ verify current audit integrity
 → BEGIN EXCLUSIVE
 
 same transaction:
@@ -264,6 +268,22 @@ same transaction:
 SUCCESS appears only after VACUUM plus physical and logical verification. UPDATE,
 VACUUM, and SUCCESS are not one transaction.
 
+The audit prerequisite is part of the same pinned offline-exclusive ownership
+model; it must not mutate audit schema through an unlocked DB path and acquire
+scrub exclusivity only afterward. Legacy or fresh audit schema may be upgraded to
+the current P1-08B audit schema before STARTED. Current-valid audit state is
+verified and continues. Current-corrupt event history, state head, or trigger
+definitions fail closed without repair: STARTED count remains zero, request-log
+UPDATE count remains zero, VACUUM count remains zero, and SUCCESS count remains
+zero. Audit migration or verification failure leaves request-log content
+logically and byte-for-byte unchanged.
+
+If the current GORM/SQLite interfaces cannot preserve the same pinned
+offline-exclusive ownership across `audit.MigrateIntegrity`, integrity
+verification, the logical `BEGIN EXCLUSIVE` transaction, COMMIT, VACUUM, and the
+completion transaction, implementation stops with `ARCHITECTURE_CONFLICT`; it
+must not weaken the P1-04 offline exclusivity gate.
+
 ### 5.3 Resume semantics
 
 `dirty rows = 0` plus exactly one pending STARTED is not a new no-op. It may mean
@@ -283,6 +303,14 @@ in the logical transaction rolls back the request-log UPDATE.
 
 Prove:
 
+- legacy audit schema migration succeeds before STARTED and the scrub completes;
+- current event corruption fails with no STARTED, request-log mutation, or VACUUM;
+- current state-head corruption has the same fail-closed result;
+- current trigger corruption has the same fail-closed result;
+- audit migration/preflight failure leaves request-log rows byte-for-byte and
+  logically unchanged;
+- exclusive ownership remains valid across the audit prerequisite, logical
+  transaction, COMMIT, VACUUM, and completion transaction;
 - BEGIN EXCLUSIVE precedes lookup;
 - STARTED and logical clear rollback together;
 - no unlocked lookup gap;
