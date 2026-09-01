@@ -36,42 +36,50 @@ var (
 
 // 固定 action 常量（§10）——禁止自由字符串拼接；审计写入按白名单校验。
 const (
-	ActionClientCreated               = "CLIENT_CREATED"
-	ActionClientKeyRotated            = "CLIENT_KEY_ROTATED"
-	ActionClientSuspended             = "CLIENT_SUSPENDED"
-	ActionClientResumed               = "CLIENT_RESUMED"
-	ActionClientRevoked               = "CLIENT_REVOKED"
-	ActionClientDeleted               = "CLIENT_DELETED"
-	ActionClientSettingsUpdated       = "CLIENT_SETTINGS_UPDATED"
-	ActionClientProviderSecretChanged = "CLIENT_PROVIDER_SECRET_CHANGED"
-	ActionClientModelsUpdated         = "CLIENT_MODELS_UPDATED"
-	ActionServerToolsUpdated          = "SERVER_TOOLS_UPDATED"
-	ActionGlobalProviderSecretChanged = "GLOBAL_PROVIDER_SECRET_CHANGED"
-	ActionAdminLoginSucceeded         = "ADMIN_LOGIN_SUCCEEDED"
-	ActionAdminLogout                 = "ADMIN_LOGOUT"
-	ActionSetupCompleted              = "SETUP_COMPLETED"
-	ActionRequestBodyCaptureRead      = "REQUEST_BODY_CAPTURE_READ"
-	ActionAdminPasswordReset          = "ADMIN_PASSWORD_RESET"
+	ActionClientCreated                  = "CLIENT_CREATED"
+	ActionClientKeyRotated               = "CLIENT_KEY_ROTATED"
+	ActionClientSuspended                = "CLIENT_SUSPENDED"
+	ActionClientResumed                  = "CLIENT_RESUMED"
+	ActionClientRevoked                  = "CLIENT_REVOKED"
+	ActionClientDeleted                  = "CLIENT_DELETED"
+	ActionClientSettingsUpdated          = "CLIENT_SETTINGS_UPDATED"
+	ActionClientProviderSecretChanged    = "CLIENT_PROVIDER_SECRET_CHANGED"
+	ActionClientModelsUpdated            = "CLIENT_MODELS_UPDATED"
+	ActionServerToolsUpdated             = "SERVER_TOOLS_UPDATED"
+	ActionGlobalProviderSecretChanged    = "GLOBAL_PROVIDER_SECRET_CHANGED"
+	ActionAdminLoginSucceeded            = "ADMIN_LOGIN_SUCCEEDED"
+	ActionAdminLogout                    = "ADMIN_LOGOUT"
+	ActionSetupCompleted                 = "SETUP_COMPLETED"
+	ActionRequestBodyCaptureRead         = "REQUEST_BODY_CAPTURE_READ"
+	ActionAdminPasswordReset             = "ADMIN_PASSWORD_RESET"
+	ActionProviderSecretMigrationStarted = "PROVIDER_SECRET_MIGRATION_STARTED"
+	ActionProviderSecretMigration        = "PROVIDER_SECRET_MIGRATION"
+	ActionRequestLogScrubStarted         = "REQUEST_LOG_SCRUB_STARTED"
+	ActionRequestLogScrub                = "REQUEST_LOG_SCRUB"
 )
 
 // allowedActions: 审计写入白名单（静态 Gate 断言生产 action 只能来自常量）。
 var allowedActions = map[string]bool{
-	ActionClientCreated:               true,
-	ActionClientKeyRotated:            true,
-	ActionClientSuspended:             true,
-	ActionClientResumed:               true,
-	ActionClientRevoked:               true,
-	ActionClientDeleted:               true,
-	ActionClientSettingsUpdated:       true,
-	ActionClientProviderSecretChanged: true,
-	ActionClientModelsUpdated:         true,
-	ActionServerToolsUpdated:          true,
-	ActionGlobalProviderSecretChanged: true,
-	ActionAdminLoginSucceeded:         true,
-	ActionAdminLogout:                 true,
-	ActionSetupCompleted:              true,
-	ActionRequestBodyCaptureRead:      true,
-	ActionAdminPasswordReset:          true,
+	ActionClientCreated:                  true,
+	ActionClientKeyRotated:               true,
+	ActionClientSuspended:                true,
+	ActionClientResumed:                  true,
+	ActionClientRevoked:                  true,
+	ActionClientDeleted:                  true,
+	ActionClientSettingsUpdated:          true,
+	ActionClientProviderSecretChanged:    true,
+	ActionClientModelsUpdated:            true,
+	ActionServerToolsUpdated:             true,
+	ActionGlobalProviderSecretChanged:    true,
+	ActionAdminLoginSucceeded:            true,
+	ActionAdminLogout:                    true,
+	ActionSetupCompleted:                 true,
+	ActionRequestBodyCaptureRead:         true,
+	ActionAdminPasswordReset:             true,
+	ActionProviderSecretMigrationStarted: true,
+	ActionProviderSecretMigration:        true,
+	ActionRequestLogScrubStarted:         true,
+	ActionRequestLogScrub:                true,
 }
 
 func IsKnownAction(action string) bool {

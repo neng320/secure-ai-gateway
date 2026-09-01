@@ -147,22 +147,26 @@ func TestP108A_RecordTxParticipatesInCallerTransaction(t *testing.T) {
 
 func TestP108B_ActionWhitelistIncludesApprovedManagementActions(t *testing.T) {
 	expected := map[string]bool{
-		"CLIENT_CREATED":                 true,
-		"CLIENT_KEY_ROTATED":             true,
-		"CLIENT_SUSPENDED":               true,
-		"CLIENT_RESUMED":                 true,
-		"CLIENT_REVOKED":                 true,
-		"CLIENT_DELETED":                 true,
-		"CLIENT_SETTINGS_UPDATED":        true,
-		"CLIENT_PROVIDER_SECRET_CHANGED": true,
-		"CLIENT_MODELS_UPDATED":          true,
-		"SERVER_TOOLS_UPDATED":           true,
-		"GLOBAL_PROVIDER_SECRET_CHANGED": true,
-		"ADMIN_LOGIN_SUCCEEDED":          true,
-		"ADMIN_LOGOUT":                   true,
-		"SETUP_COMPLETED":                true,
-		"REQUEST_BODY_CAPTURE_READ":      true,
-		"ADMIN_PASSWORD_RESET":           true,
+		"CLIENT_CREATED":                    true,
+		"CLIENT_KEY_ROTATED":                true,
+		"CLIENT_SUSPENDED":                  true,
+		"CLIENT_RESUMED":                    true,
+		"CLIENT_REVOKED":                    true,
+		"CLIENT_DELETED":                    true,
+		"CLIENT_SETTINGS_UPDATED":           true,
+		"CLIENT_PROVIDER_SECRET_CHANGED":    true,
+		"CLIENT_MODELS_UPDATED":             true,
+		"SERVER_TOOLS_UPDATED":              true,
+		"GLOBAL_PROVIDER_SECRET_CHANGED":    true,
+		"ADMIN_LOGIN_SUCCEEDED":             true,
+		"ADMIN_LOGOUT":                      true,
+		"SETUP_COMPLETED":                   true,
+		"REQUEST_BODY_CAPTURE_READ":         true,
+		"ADMIN_PASSWORD_RESET":              true,
+		"PROVIDER_SECRET_MIGRATION_STARTED": true,
+		"PROVIDER_SECRET_MIGRATION":         true,
+		"REQUEST_LOG_SCRUB_STARTED":         true,
+		"REQUEST_LOG_SCRUB":                 true,
 	}
 	if len(allowedActions) != len(expected) {
 		t.Fatalf("audit action whitelist must contain exactly the approved lifecycle/management actions, got %d", len(allowedActions))
@@ -175,14 +179,6 @@ func TestP108B_ActionWhitelistIncludesApprovedManagementActions(t *testing.T) {
 	for action := range allowedActions {
 		if !expected[action] {
 			t.Fatalf("unexpected action in P1-08A baseline whitelist: %q", action)
-		}
-	}
-	for _, action := range []string{
-		"REQUEST_LOG_SCRUB",
-		"PROVIDER_SECRET_MIGRATION",
-	} {
-		if IsKnownAction(action) {
-			t.Fatalf("audit whitelist must not claim unsupported action %q", action)
 		}
 	}
 }
