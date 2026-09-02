@@ -539,7 +539,14 @@ func TestP108B_S7_MaintenanceNewKindAllowedAfterCompletion(t *testing.T) {
 	if err := completeMaintenanceForTest(t, db, provider); err != nil {
 		t.Fatal(err)
 	}
-	db = newAuditTestDB(t)
+	providerEvents := maintenanceEventsForKindForTest(t, db, MaintenanceKindProviderSecretMigration)
+	if len(providerEvents) != 2 ||
+		providerEvents[0].Action != ActionProviderSecretMigrationStarted ||
+		providerEvents[1].Action != ActionProviderSecretMigration ||
+		providerEvents[0].TargetID != providerEvents[1].TargetID ||
+		providerEvents[0].TargetID != provider.TargetID {
+		t.Fatalf("provider STARTED/SUCCESS must be complete in the same audit history: %+v", providerEvents)
+	}
 	scrub, err := beginMaintenanceForTest(t, db, MaintenanceKindRequestLogScrub)
 	if err != nil {
 		t.Fatal(err)
@@ -549,6 +556,14 @@ func TestP108B_S7_MaintenanceNewKindAllowedAfterCompletion(t *testing.T) {
 	}
 	if got := countMaintenanceActionForTest(t, db, ActionRequestLogScrubStarted); got != 1 {
 		t.Fatalf("expected one new scrub STARTED after provider completion, got %d", got)
+	}
+	allEvents := maintenanceEventsForTest(t, db)
+	if len(allEvents) != 3 ||
+		allEvents[0].Action != ActionProviderSecretMigrationStarted ||
+		allEvents[1].Action != ActionProviderSecretMigration ||
+		allEvents[2].Action != ActionRequestLogScrubStarted ||
+		allEvents[2].TargetID != scrub.TargetID {
+		t.Fatalf("expected one same-history provider pair followed by new scrub STARTED: %+v", allEvents)
 	}
 }
 
