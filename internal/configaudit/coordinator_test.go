@@ -31,11 +31,52 @@ type rollbackBlockingFileStore struct {
 	writes          int32
 }
 
+type scriptedFileStore struct {
+	candidatePostRename bool
+	candidatePreRename  bool
+	restorePreRename    bool
+	restoreDirSync      bool
+	candidateErr        error
+	restoreErr          error
+	calls               int
+}
+
+func (f *scriptedFileStore) ReadSnapshot(path string) (configstore.Snapshot, error) {
+	return configstore.ReadSnapshot(path)
+}
+
+func (f *scriptedFileStore) AtomicReplace(path string, data []byte, mode fs.FileMode) (configstore.ReplaceResult, error) {
+	f.calls++
+	switch f.calls {
+	case 1:
+		if f.candidatePreRename {
+			return configstore.ReplaceResult{}, f.candidateErr
+		}
+		if f.candidatePostRename {
+			if _, err := configstore.AtomicReplace(path, data, mode); err != nil {
+				return configstore.ReplaceResult{}, err
+			}
+			return configstore.ReplaceResult{Renamed: true}, f.candidateErr
+		}
+	case 2:
+		if f.restorePreRename {
+			return configstore.ReplaceResult{}, f.restoreErr
+		}
+		if f.restoreDirSync {
+			if _, err := configstore.AtomicReplace(path, data, mode); err != nil {
+				return configstore.ReplaceResult{}, err
+			}
+			return configstore.ReplaceResult{Renamed: true}, f.restoreErr
+		}
+	}
+	return configstore.AtomicReplace(path, data, mode)
+}
+
 func (f *rollbackBlockingFileStore) ReadSnapshot(path string) (configstore.Snapshot, error) {
 	return configstore.ReadSnapshot(path)
 }
 
-func (f *rollbackBlockingFileStore) AtomicReplace(path string, data []byte, mode fs.FileMode) error {
+func (f *rollbackBlockingFileStore) AtomicReplace(path string, data []byte, mode fs.FileMode) (configstore.ReplaceResult, error) {
 	if atomic.AddInt32(&f.writes, 1) == 2 {
 		close(f.rollbackStarted)
 		<-f.releaseRollback
@@ -47,12 +88,12 @@ func (f *fakeFileStore) ReadSnapshot(string) (configstore.Snapshot, error) {
 	return f.snapshot, nil
 }
 
-func (f *fakeFileStore) AtomicReplace(_ string, _ []byte, _ fs.FileMode) error {
+func (f *fakeFileStore) AtomicReplace(_ string, _ []byte, _ fs.FileMode) (configstore.ReplaceResult, error) {
 	f.writeCall++
 	if f.writeCall == f.failOn {
-		return errors.New("injected config replace failure")
+		return configstore.ReplaceResult{}, errors.New("injected config replace failure")
 	}
-	return nil
+	return configstore.ReplaceResult{Renamed: true, DirectorySynced: true}, nil
 }
 
 func newCoordinatorTest(t *testing.T) (*gorm.DB, *audit.Service, string, []byte) {
@@ -117,6 +158,26 @@ func TestP108B_S4_CoordinatorSuccessAppliesAfterAudit(t *testing.T) {
 	}
 }
 
+func TestP108B_S4_CoordinatorAppliesOnlyAfterAuditSuccess(t *testing.T) {
+	db, service, path, _ := newCoordinatorTest(t)
+	var observedAuditCount int64
+	applied := 0
+	if err := New(service).RunLocked(Mutation{
+		ConfigPath: path,
+		Build: fixedBuild([]byte("candidate-after-audit"), coordinatorTestEvent(), func() {
+			applied++
+			if err := db.Model(&models.AuditEvent{}).Count(&observedAuditCount).Error; err != nil {
+				t.Errorf("count audit events from Apply: %v", err)
+			}
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 || observedAuditCount != 1 {
+		t.Fatalf("Apply ordering mismatch: applied=%d observedAuditCount=%d", applied, observedAuditCount)
+	}
+}
+
 func TestP108B_S4_AuditFailureRestoresExactBytes(t *testing.T) {
 	db, service, path, before := newCoordinatorTest(t)
 	if err := db.Exec("CREATE TRIGGER s4_reject_audit BEFORE INSERT ON audit_events WHEN NEW.action = 'SERVER_TOOLS_UPDATED' BEGIN SELECT RAISE(ABORT, 'TEST_AUDIT_INSERT_FAILED'); END").Error; err != nil {
@@ -175,6 +236,163 @@ func TestP108B_S4_CoordinatorWriteFailureHasNoAudit(t *testing.T) {
 	}
 	if store.writeCall != 1 {
 		t.Fatalf("unexpected write calls=%d", store.writeCall)
+	}
+}
+
+func TestP108B_S4_CandidatePostRenameDirectorySyncFailureCompensates(t *testing.T) {
+	db, service, path, before := newCoordinatorTest(t)
+	originalStat, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateErr := errors.New("candidate directory durability failure")
+	store := &scriptedFileStore{
+		candidatePostRename: true,
+		candidateErr:        candidateErr,
+	}
+	applied := false
+	err = NewWithFileStore(service, store).RunLocked(Mutation{
+		ConfigPath: path,
+		Build: fixedBuild([]byte("candidate-post-rename"), coordinatorTestEvent(), func() {
+			applied = true
+		}),
+	})
+	if !errors.Is(err, candidateErr) {
+		t.Fatalf("expected original candidate persistence error, got %v", err)
+	}
+	if applied || store.calls != 2 {
+		t.Fatalf("post-rename failure must compensate before apply: applied=%v calls=%d", applied, store.calls)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("post-rename failure did not restore exact bytes: %q", after)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != originalStat.Mode().Perm() {
+		t.Fatalf("post-rename failure did not restore exact mode: info=%v err=%v", info, err)
+	}
+	var count int64
+	if err := db.Model(&models.AuditEvent{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("post-rename failure left %d audit event(s)", count)
+	}
+}
+
+func TestP108B_S4_CandidatePreRenameFailureDoesNotCompensate(t *testing.T) {
+	db, service, path, before := newCoordinatorTest(t)
+	candidateErr := errors.New("candidate pre-rename failure")
+	store := &scriptedFileStore{
+		candidatePreRename: true,
+		candidateErr:       candidateErr,
+	}
+	applied := false
+	err := NewWithFileStore(service, store).RunLocked(Mutation{
+		ConfigPath: path,
+		Build: fixedBuild([]byte("candidate-pre-rename"), coordinatorTestEvent(), func() {
+			applied = true
+		}),
+	})
+	if !errors.Is(err, candidateErr) {
+		t.Fatalf("expected original pre-rename error, got %v", err)
+	}
+	if applied || store.calls != 1 {
+		t.Fatalf("pre-rename failure must not trigger compensation: applied=%v calls=%d", applied, store.calls)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("pre-rename failure changed exact bytes: %q", after)
+	}
+	var count int64
+	if err := db.Model(&models.AuditEvent{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("pre-rename failure left %d audit event(s)", count)
+	}
+}
+
+func TestP108B_S4_RestoreDirectorySyncFailureReturnsStableError(t *testing.T) {
+	db, service, path, before := newCoordinatorTest(t)
+	store := &scriptedFileStore{
+		candidatePostRename: true,
+		candidateErr:        errors.New("candidate persistence failed"),
+		restoreDirSync:      true,
+		restoreErr:          errors.New("restore failed snapshot-secret-marker"),
+	}
+	err := NewWithFileStore(service, store).RunLocked(Mutation{
+		ConfigPath: path,
+		Build:      fixedBuild([]byte("candidate-secret-marker"), coordinatorTestEvent(), nil),
+	})
+	if !errors.Is(err, ErrConfigAuditRollbackFailed) {
+		t.Fatalf("restore directory sync failure must be stable, got %v", err)
+	}
+	if bytes.Contains([]byte(err.Error()), []byte("snapshot-secret-marker")) || bytes.Contains([]byte(err.Error()), []byte("candidate-secret-marker")) {
+		t.Fatalf("rollback error exposed config data: %v", err)
+	}
+	var count int64
+	if err := db.Model(&models.AuditEvent{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("uncertain restore left %d audit event(s)", count)
+	}
+	_ = before
+}
+
+func TestP108B_S4_TransactionalFailureRestoresConfigAndRollsBackDatabase(t *testing.T) {
+	db, service, path, before := newCoordinatorTest(t)
+	if err := db.Exec("CREATE TABLE transaction_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("CREATE TRIGGER s4_reject_transaction BEFORE INSERT ON audit_events WHEN NEW.action = 'SERVER_TOOLS_UPDATED' BEGIN SELECT RAISE(ABORT, 'TEST_AUDIT_INSERT_FAILED'); END").Error; err != nil {
+		t.Fatal(err)
+	}
+	originalStat, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := false
+	err = New(service).RunLockedTransactional(Mutation{
+		ConfigPath: path,
+		Build: fixedBuild([]byte("candidate-transaction"), coordinatorTestEvent(), func() {
+			applied = true
+		}),
+	}, db, func(tx *gorm.DB) error {
+		return tx.Exec("INSERT INTO transaction_probe(value) VALUES (?)", "must-rollback").Error
+	})
+	if err == nil || applied {
+		t.Fatalf("transactional audit failure must fail before apply: err=%v applied=%v", err, applied)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("transactional audit failure did not restore exact bytes: %q", after)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != originalStat.Mode().Perm() {
+		t.Fatalf("transactional audit failure did not restore exact mode: info=%v err=%v", info, err)
+	}
+	var rows int64
+	if err := db.Table("transaction_probe").Count(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("transaction mutation was not rolled back: rows=%d", rows)
+	}
+	var events int64
+	if err := db.Model(&models.AuditEvent{}).Count(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("failed audit transaction left %d event(s)", events)
 	}
 }
 

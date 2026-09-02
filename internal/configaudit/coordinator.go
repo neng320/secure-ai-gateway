@@ -13,10 +13,11 @@ import (
 )
 
 var ErrConfigAuditRollbackFailed = errors.New("config audit rollback failed")
+var errConfigReplaceIncomplete = errors.New("config replacement durability incomplete")
 
 type FileStore interface {
 	ReadSnapshot(path string) (configstore.Snapshot, error)
-	AtomicReplace(path string, data []byte, mode fs.FileMode) error
+	AtomicReplace(path string, data []byte, mode fs.FileMode) (configstore.ReplaceResult, error)
 }
 
 type osFileStore struct{}
@@ -25,7 +26,7 @@ func (osFileStore) ReadSnapshot(path string) (configstore.Snapshot, error) {
 	return configstore.ReadSnapshot(path)
 }
 
-func (osFileStore) AtomicReplace(path string, data []byte, mode fs.FileMode) error {
+func (osFileStore) AtomicReplace(path string, data []byte, mode fs.FileMode) (configstore.ReplaceResult, error) {
 	return configstore.AtomicReplace(path, data, mode)
 }
 
@@ -127,17 +128,34 @@ func (c *Coordinator) runLocked(m Mutation, afterPersist func(BuildResult) error
 	if len(result.Candidate) == 0 {
 		return fmt.Errorf("config audit candidate is empty")
 	}
-	if err := c.files.AtomicReplace(lock.CanonicalConfigPath(), result.Candidate, snapshot.Mode); err != nil {
-		return err
+	candidateResult, candidateErr := c.files.AtomicReplace(lock.CanonicalConfigPath(), result.Candidate, snapshot.Mode)
+	if candidateErr == nil && (!candidateResult.Renamed || !candidateResult.DirectorySynced) {
+		candidateErr = errConfigReplaceIncomplete
+	}
+	if candidateErr != nil {
+		if candidateResult.Renamed {
+			if restoreErr := c.restoreSnapshot(lock.CanonicalConfigPath(), snapshot); restoreErr != nil {
+				return restoreErr
+			}
+		}
+		return candidateErr
 	}
 	if err := afterPersist(result); err != nil {
-		if restoreErr := c.files.AtomicReplace(lock.CanonicalConfigPath(), snapshot.Bytes, snapshot.Mode); restoreErr != nil {
-			return fmt.Errorf("%w: %v", ErrConfigAuditRollbackFailed, restoreErr)
+		if restoreErr := c.restoreSnapshot(lock.CanonicalConfigPath(), snapshot); restoreErr != nil {
+			return restoreErr
 		}
 		return err
 	}
 	if result.Apply != nil {
 		result.Apply()
+	}
+	return nil
+}
+
+func (c *Coordinator) restoreSnapshot(path string, snapshot configstore.Snapshot) error {
+	result, err := c.files.AtomicReplace(path, snapshot.Bytes, snapshot.Mode)
+	if err != nil || !result.Renamed || !result.DirectorySynced {
+		return ErrConfigAuditRollbackFailed
 	}
 	return nil
 }
