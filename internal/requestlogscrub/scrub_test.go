@@ -11,16 +11,21 @@ package requestlogscrub
 // Canary：P104_LEGACY_PROMPT_ERADICATION_CANARY / P104_LEGACY_ERRORTEXT_ERADICATION_CANARY
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ai-gateway/internal/audit"
+	gatewaydb "ai-gateway/internal/database"
 	"ai-gateway/internal/models"
 
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -49,6 +54,530 @@ func newScrubFixture(t *testing.T) *scrubFixture {
 		t.Fatal(err)
 	}
 	return f
+}
+
+func (f *scrubFixture) migrateAudit(t *testing.T) {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.MigrateIntegrity(db); err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func closeGormTestDB(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if sqlDB, err := db.DB(); err == nil {
+		if err := sqlDB.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func (f *scrubFixture) maintenanceEvents(t *testing.T) []models.AuditEvent {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []models.AuditEvent
+	if err := db.Where("action IN ?", []string{audit.ActionRequestLogScrubStarted, audit.ActionRequestLogScrub}).Order("id ASC").Find(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+	return events
+}
+
+func (f *scrubFixture) requestLogBytes(t *testing.T) []byte {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []models.RequestLog
+	if err := db.Select("request_body", "error_message").Order("id ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+	var result []byte
+	for _, row := range rows {
+		result = append(result, row.RequestBody...)
+		result = append(result, 0)
+		result = append(result, row.ErrorMessage...)
+		result = append(result, 0)
+	}
+	return result
+}
+
+func (f *scrubFixture) seedCurrentAudit(t *testing.T) {
+	t.Helper()
+	f.migrateAudit(t)
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.NewService(db).Record(models.AuditEvent{
+		Action:     audit.ActionServerToolsUpdated,
+		ActorType:  "admin",
+		ActorID:    "test-admin",
+		TargetType: "server",
+		TargetID:   "server-tools",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func (f *scrubFixture) seedLegacyAudit(t *testing.T) {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(f.dbPath), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`CREATE TABLE audit_events (
+                id integer PRIMARY KEY AUTOINCREMENT,
+                event_id varchar(64),
+                action varchar(64),
+                actor_type varchar(32),
+                actor_id varchar(255),
+                target_type varchar(32),
+                target_id varchar(36),
+                reason varchar(256),
+                created_at datetime
+        )`).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"CREATE UNIQUE INDEX idx_audit_events_event_id ON audit_events(event_id)",
+		"CREATE INDEX idx_audit_events_action ON audit_events(action)",
+		"CREATE INDEX idx_audit_events_actor_id ON audit_events(actor_id)",
+		"CREATE INDEX idx_audit_events_target_type ON audit_events(target_type)",
+		"CREATE INDEX idx_audit_events_target_id ON audit_events(target_id)",
+		"CREATE INDEX idx_audit_events_created_at ON audit_events(created_at)",
+	} {
+		if err := db.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Exec(`INSERT INTO audit_events
+                (id, event_id, action, actor_type, actor_id, target_type, target_id, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		1, "legacy-event-1", audit.ActionServerToolsUpdated, "admin", "legacy-admin", "server", "server-tools", "", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func (f *scrubFixture) corruptAuditEventHash(t *testing.T) {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("UPDATE audit_events SET event_hash = ? WHERE id = 1", strings.Repeat("a", 64)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'AUDIT_EVENT_IMMUTABLE'); END").Error; err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func (f *scrubFixture) corruptAuditHead(t *testing.T) {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("UPDATE audit_chain_states SET head_hash = ? WHERE id = 1", strings.Repeat("b", 64)).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func (f *scrubFixture) corruptAuditTrigger(t *testing.T) {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func (f *scrubFixture) appendPending(t *testing.T, kind audit.MaintenanceKind) audit.MaintenanceOperation {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var operation audit.MaintenanceOperation
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var beginErr error
+		operation, beginErr = audit.NewService(db).BeginMaintenanceTx(tx, kind)
+		return beginErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+	return operation
+}
+
+func (f *scrubFixture) appendMultiplePending(t *testing.T) {
+	t.Helper()
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		svc := audit.NewService(db)
+		if err := svc.RecordTx(tx, models.AuditEvent{
+			Action:     audit.ActionProviderSecretMigrationStarted,
+			ActorType:  "cli",
+			ActorID:    "migrate-provider-secrets",
+			TargetType: "maintenance-operation",
+			TargetID:   uuid.NewString(),
+		}); err != nil {
+			return err
+		}
+		return svc.RecordTx(tx, models.AuditEvent{
+			Action:     audit.ActionRequestLogScrubStarted,
+			ActorType:  "cli",
+			ActorID:    "scrub-request-log-content",
+			TargetType: "maintenance-operation",
+			TargetID:   uuid.NewString(),
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func assertAuditCount(t *testing.T, f *scrubFixture, want int) {
+	t.Helper()
+	events := f.maintenanceEvents(t)
+	if len(events) != want {
+		t.Fatalf("maintenance event count=%d want=%d events=%+v", len(events), want, events)
+	}
+}
+
+func assertRequestLogBytes(t *testing.T, f *scrubFixture, want []byte) {
+	t.Helper()
+	if got := f.requestLogBytes(t); !bytes.Equal(got, want) {
+		t.Fatalf("request-log bytes changed: got=%q want=%q", got, want)
+	}
+}
+
+func TestP108B_S7_LegacyAuditPrerequisiteAndCompletion(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.seedLegacyAudit(t)
+	res, err := Run(Options{ConfigPath: f.cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RemainNonEmpty != 0 {
+		t.Fatalf("scrub left non-empty rows: %+v", res)
+	}
+	events := f.maintenanceEvents(t)
+	if len(events) != 2 || events[0].Action != audit.ActionRequestLogScrubStarted || events[1].Action != audit.ActionRequestLogScrub {
+		t.Fatalf("unexpected maintenance audit pair: %+v", events)
+	}
+	if events[0].TargetID == "" || events[0].TargetID != events[1].TargetID {
+		t.Fatalf("maintenance pair correlation mismatch: %+v", events)
+	}
+	for _, event := range events {
+		if event.ActorType != "cli" || event.ActorID != "scrub-request-log-content" || event.TargetType != "maintenance-operation" || event.Reason != "" {
+			t.Fatalf("unexpected trusted maintenance identity: %+v", event)
+		}
+		if strings.Contains(event.TargetID, legacyPromptCanary) || strings.Contains(event.TargetID, legacyErrorCanary) {
+			t.Fatalf("request-log canary entered audit target: %+v", event)
+		}
+	}
+
+	db, err := gatewaydb.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.NewService(db).VerifyAuditChain(); err != nil {
+		t.Fatalf("completed scrub left invalid audit chain: %v", err)
+	}
+	closeGormTestDB(t, db)
+}
+
+func TestP108B_S7_CurrentAuditEventCorruptionFailsBeforeScrub(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.seedCurrentAudit(t)
+	f.corruptAuditEventHash(t)
+	before := f.requestLogBytes(t)
+	vacuumCalled := false
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		vacuum: func(*sql.Conn) error {
+			vacuumCalled = true
+			return nil
+		},
+	})
+	if !errors.Is(err, audit.ErrAuditIntegrity) {
+		t.Fatalf("event corruption must fail closed, got %v", err)
+	}
+	if vacuumCalled {
+		t.Fatal("event corruption reached VACUUM")
+	}
+	assertRequestLogBytes(t, f, before)
+	assertAuditCount(t, f, 0)
+}
+
+func TestP108B_S7_CurrentAuditHeadCorruptionFailsBeforeScrub(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.seedCurrentAudit(t)
+	f.corruptAuditHead(t)
+	before := f.requestLogBytes(t)
+	vacuumCalled := false
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		vacuum: func(*sql.Conn) error {
+			vacuumCalled = true
+			return nil
+		},
+	})
+	if !errors.Is(err, audit.ErrAuditIntegrity) {
+		t.Fatalf("audit head corruption must fail closed, got %v", err)
+	}
+	if vacuumCalled {
+		t.Fatal("audit head corruption reached VACUUM")
+	}
+	assertRequestLogBytes(t, f, before)
+	assertAuditCount(t, f, 0)
+}
+
+func TestP108B_S7_CurrentAuditTriggerCorruptionFailsBeforeScrub(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.seedCurrentAudit(t)
+	f.corruptAuditTrigger(t)
+	before := f.requestLogBytes(t)
+	vacuumCalled := false
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		vacuum: func(*sql.Conn) error {
+			vacuumCalled = true
+			return nil
+		},
+	})
+	if !errors.Is(err, audit.ErrAuditIntegrity) {
+		t.Fatalf("audit trigger corruption must fail closed, got %v", err)
+	}
+	if vacuumCalled {
+		t.Fatal("audit trigger corruption reached VACUUM")
+	}
+	assertRequestLogBytes(t, f, before)
+	assertAuditCount(t, f, 0)
+}
+
+func TestP108B_S7_StartedFailureRollsBackLogicalClear(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.seedCurrentAudit(t)
+	before := f.requestLogBytes(t)
+	vacuumCalled := false
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		beforeMaintenance: func(conn *sql.Conn) error {
+			_, err := conn.ExecContext(context.Background(), "CREATE TRIGGER reject_scrub_started BEFORE INSERT ON audit_events WHEN NEW.action = 'REQUEST_LOG_SCRUB_STARTED' BEGIN SELECT RAISE(ABORT, 'TEST_STARTED_INSERT_FAILED'); END")
+			return err
+		},
+		vacuum: func(*sql.Conn) error {
+			vacuumCalled = true
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatal("STARTED failure must fail")
+	}
+	if vacuumCalled {
+		t.Fatal("STARTED failure reached VACUUM")
+	}
+	assertRequestLogBytes(t, f, before)
+	assertAuditCount(t, f, 0)
+}
+
+func TestP108B_S7_UpdateFailureRollsBackStartedAndClear(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.seedCurrentAudit(t)
+	before := f.requestLogBytes(t)
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		beforeMaintenance: func(conn *sql.Conn) error {
+			_, err := conn.ExecContext(context.Background(), "CREATE TRIGGER reject_scrub_update BEFORE UPDATE OF request_body, error_message ON request_logs BEGIN SELECT RAISE(ABORT, 'TEST_UPDATE_FAILED'); END")
+			return err
+		},
+	})
+	if err == nil {
+		t.Fatal("logical update failure must fail")
+	}
+	assertRequestLogBytes(t, f, before)
+	assertAuditCount(t, f, 0)
+}
+
+func TestP108B_S7_VacuumFailureLeavesPendingStarted(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	vacuumErr := errors.New("injected vacuum failure")
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		vacuum: func(*sql.Conn) error { return vacuumErr },
+	})
+	if !errors.Is(err, vacuumErr) {
+		t.Fatalf("expected vacuum failure, got %v", err)
+	}
+	events := f.maintenanceEvents(t)
+	if len(events) != 1 || events[0].Action != audit.ActionRequestLogScrubStarted {
+		t.Fatalf("vacuum failure must leave exactly one pending STARTED: %+v", events)
+	}
+	if got := f.requestLogBytes(t); len(got) == 0 {
+		t.Fatal("request-log fixture unexpectedly disappeared")
+	}
+	res, err := Run(Options{ConfigPath: f.cfgPath})
+	if err != nil {
+		t.Fatalf("pending scrub rerun failed: %v", err)
+	}
+	if res.RemainNonEmpty != 0 {
+		t.Fatalf("pending scrub rerun left rows: %+v", res)
+	}
+	events = f.maintenanceEvents(t)
+	if len(events) != 2 || events[0].TargetID != events[1].TargetID {
+		t.Fatalf("rerun did not reuse pending target: %+v", events)
+	}
+}
+
+func TestP108B_S7_VerificationFailureLeavesPendingStarted(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	verifyErr := errors.New("injected physical verification failure")
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		verify: func(*sql.Conn) error { return verifyErr },
+	})
+	if !errors.Is(err, verifyErr) {
+		t.Fatalf("expected verification failure, got %v", err)
+	}
+	events := f.maintenanceEvents(t)
+	if len(events) != 1 || events[0].Action != audit.ActionRequestLogScrubStarted {
+		t.Fatalf("verification failure must leave pending STARTED: %+v", events)
+	}
+}
+
+func TestP108B_S7_CompletionFailureLeavesPendingStarted(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		beforeCompletion: func(conn *sql.Conn) error {
+			_, err := conn.ExecContext(context.Background(), "CREATE TRIGGER reject_scrub_success BEFORE INSERT ON audit_events WHEN NEW.action = 'REQUEST_LOG_SCRUB' BEGIN SELECT RAISE(ABORT, 'TEST_COMPLETION_FAILED'); END")
+			return err
+		},
+	})
+	if err == nil {
+		t.Fatal("completion failure must fail")
+	}
+	events := f.maintenanceEvents(t)
+	if len(events) != 1 || events[0].Action != audit.ActionRequestLogScrubStarted {
+		t.Fatalf("completion failure must leave exactly one pending STARTED: %+v", events)
+	}
+}
+
+func TestP108B_S7_GlobalProviderPendingFailsBeforeScrub(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.migrateAudit(t)
+	f.appendPending(t, audit.MaintenanceKindProviderSecretMigration)
+	before := f.requestLogBytes(t)
+	vacuumCalled := false
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		vacuum: func(*sql.Conn) error {
+			vacuumCalled = true
+			return nil
+		},
+	})
+	if !errors.Is(err, audit.ErrAuditIntegrity) {
+		t.Fatalf("provider pending must fail closed, got %v", err)
+	}
+	if vacuumCalled {
+		t.Fatal("provider pending reached VACUUM")
+	}
+	assertRequestLogBytes(t, f, before)
+	providerEvents := f.maintenanceEvents(t)
+	if len(providerEvents) != 0 {
+		t.Fatalf("request scrub event filter unexpectedly included provider event: %+v", providerEvents)
+	}
+}
+
+func TestP108B_S7_MultiplePendingFailsBeforeScrub(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	f.migrateAudit(t)
+	f.appendMultiplePending(t)
+	before := f.requestLogBytes(t)
+	vacuumCalled := false
+	_, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		vacuum: func(*sql.Conn) error {
+			vacuumCalled = true
+			return nil
+		},
+	})
+	if !errors.Is(err, audit.ErrAuditIntegrity) {
+		t.Fatalf("multiple pending operations must fail closed, got %v", err)
+	}
+	if vacuumCalled {
+		t.Fatal("multiple pending operations reached VACUUM")
+	}
+	assertRequestLogBytes(t, f, before)
+}
+
+func TestP108B_S7_PinnedOwnershipContinuousAcrossScrubPhases(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	competitor, err := sql.Open("sqlite3", f.dbPath+"?_busy_timeout=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer competitor.Close()
+
+	assertBlocked := func() error {
+		conn, err := competitor.Conn(context.Background())
+		if err != nil {
+			return nil
+		}
+		defer conn.Close()
+		if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err == nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			return errors.New("competitor acquired scrub ownership")
+		}
+		return nil
+	}
+	check := func(*sql.Conn) error { return assertBlocked() }
+	res, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		beforeMaintenance: check,
+		vacuum: func(conn *sql.Conn) error {
+			if err := assertBlocked(); err != nil {
+				return err
+			}
+			_, err := conn.ExecContext(context.Background(), "VACUUM")
+			return err
+		},
+		verify:           check,
+		beforeCompletion: check,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RemainNonEmpty != 0 {
+		t.Fatalf("continuous ownership test left rows: %+v", res)
+	}
 }
 
 // seedLegacyRows: 用完整 schema 建库并写入 legacy 正文/错误文本行

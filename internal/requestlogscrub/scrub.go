@@ -23,11 +23,11 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/config"
+	gatewaydb "ai-gateway/internal/database"
 
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // Options: scrub 输入
@@ -45,8 +45,19 @@ type Result struct {
 	Phases         []string
 }
 
+type scrubHooks struct {
+	beforeMaintenance func(*sql.Conn) error
+	vacuum            func(*sql.Conn) error
+	verify            func(*sql.Conn) error
+	beforeCompletion  func(*sql.Conn) error
+}
+
 // Run: 执行离线 scrub。任何前置失败 → 错误返回，文件零改动。
 func Run(opts Options) (*Result, error) {
+	return runWithHooks(opts, scrubHooks{})
+}
+
+func runWithHooks(opts Options, hooks scrubHooks) (*Result, error) {
 	if opts.ConfigPath == "" {
 		return nil, fmt.Errorf("scrub: config path is required")
 	}
@@ -75,113 +86,112 @@ func Run(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("scrub: database %s is not a regular file — stop", dbPath)
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	pinned, err := gatewaydb.OpenPinned(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("scrub: open db %s: %w", dbPath, err)
 	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = sqlDB.Close() }()
-
-	// 显式 schema 检查
-	if !tableExists(db, "request_logs") {
-		return nil, fmt.Errorf("scrub: schema check failed: table 'request_logs' not found in %s — stop", dbPath)
-	}
-	for _, col := range []string{"request_body", "error_message"} {
-		if !columnExists(db, "request_logs", col) {
-			return nil, fmt.Errorf("scrub: schema check failed: column 'request_logs.%s' not found — stop", col)
+	closed := false
+	defer func() {
+		if !closed {
+			_ = pinned.Close()
 		}
-	}
+	}()
 
 	res := &Result{DBPath: dbPath, Phases: []string{}}
 
-	// 独占/offline 预检（P1-04.1）：WAL 模式先做 TRUNCATE checkpoint——
-	// 首列 Busy!=0 即有其他连接（含活跃 reader）→ 任何 mutation 之前 STOP。
+	// 独占/offline 预检（P1-04.1）必须使用将承载整个 invocation 的 pinned conn。
 	var journalMode string
-	if err := db.Raw("PRAGMA journal_mode").Scan(&journalMode).Error; err != nil {
+	if err := pinned.Conn.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		return nil, fmt.Errorf("scrub: read journal_mode: %w", err)
 	}
 	isWAL := strings.EqualFold(journalMode, "wal")
 	if isWAL {
-		if err := walCheckpointTruncate(db); err != nil {
+		if err := walCheckpointTruncate(pinned.Conn); err != nil {
 			return nil, err // 含 OFFLINE_REQUIRED 语义
 		}
 		res.Phases = append(res.Phases, "WAL-CHECKPOINT")
 	}
 
-	// P1-04.2：持有式独占（消除 probe→mutation 的 TOCTOU）。
-	// 单一 dedicated connection：
-	//   busy_timeout=0 → locking_mode=EXCLUSIVE → BEGIN EXCLUSIVE
-	// locking_mode=EXCLUSIVE 使独占锁在 COMMIT 之后仍由本连接持有，
-	// 之后的 checkpoint/VACUUM/verify 期间任何并发连接都被 SQLITE_BUSY 拒绝，
-	// 直到全部完成、conn.Close() 释放。杜绝“UPDATE 已提交但 VACUUM 被新并发者打断”。
-	ctx := context.Background()
-	conn, err := sqlDB.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("scrub: acquire dedicated connection: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-	// 关闭 gorm 连接池（本进程内的其他连接同样不得干扰独占期）
-	if err := sqlDB.Close(); err != nil {
-		return nil, fmt.Errorf("scrub: close pool: %w", err)
-	}
-
-	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
-		return nil, fmt.Errorf("scrub: busy_timeout: %w", err)
-	}
-	if _, err := conn.ExecContext(ctx, "PRAGMA locking_mode = EXCLUSIVE"); err != nil {
-		return nil, fmt.Errorf("scrub: locking_mode: %w", err)
-	}
-	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+	if err := pinned.AcquireExclusive(); err != nil {
 		return nil, fmt.Errorf("scrub: database is in use (exclusive lock unavailable) — "+
 			"stop the gateway / close other connections and retry: %w (REQUEST_LOG_SCRUB_OFFLINE_REQUIRED)", err)
 	}
 	res.Phases = append(res.Phases, "EXCLUSIVE")
 
-	exec := func(q string) error {
-		if _, err := conn.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("scrub: %s: %w", strings.Fields(q)[0], err)
+	// schema checks are read-only, but happen after ownership is established so
+	// no unlocked DB handle exists in the maintenance path.
+	if exists, err := tableExistsConn(pinned.Conn, "request_logs"); err != nil || !exists {
+		if err != nil {
+			return nil, fmt.Errorf("scrub: schema check failed: %w", err)
 		}
-		return nil
+		return nil, fmt.Errorf("scrub: schema check failed: table 'request_logs' not found in %s — stop", dbPath)
 	}
-	queryCount := func(q string) (int64, error) {
-		var n int64
-		if err := conn.QueryRowContext(ctx, q).Scan(&n); err != nil {
-			return 0, err
+	for _, col := range []string{"request_body", "error_message"} {
+		exists, err := columnExistsConn(pinned.Conn, "request_logs", col)
+		if err != nil || !exists {
+			if err != nil {
+				return nil, fmt.Errorf("scrub: schema check failed: %w", err)
+			}
+			return nil, fmt.Errorf("scrub: schema check failed: column 'request_logs.%s' not found — stop", col)
 		}
-		return n, nil
 	}
 
+	// The audit prerequisite is bound to the same pinned connection. Its own
+	// GORM transactions therefore cannot open a competing pool connection.
+	if err := audit.MigrateIntegrity(pinned.DB); err != nil {
+		return nil, fmt.Errorf("scrub: audit prerequisite migration: %w", err)
+	}
+	res.Phases = append(res.Phases, "AUDIT-MIGRATION")
+	if _, err := audit.VerifyIntegrityReadOnly(pinned.DB); err != nil {
+		return nil, fmt.Errorf("scrub: audit prerequisite verification: %w", err)
+	}
+	res.Phases = append(res.Phases, "AUDIT-VERIFIED")
+
 	// secure_delete=ON（best-effort：driver 不支持时跳过，VACUUM 仍会重写整库）
-	if _, err := conn.ExecContext(ctx, "PRAGMA secure_delete = ON"); err == nil {
+	if _, err := pinned.Conn.ExecContext(context.Background(), "PRAGMA secure_delete = ON"); err == nil {
 		res.Phases = append(res.Phases, "SECURE-DELETE-ON")
 	}
 
-	// 清点（只输出数量）
-	dirty, err := queryCount("SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''")
+	if hooks.beforeMaintenance != nil {
+		if err := hooks.beforeMaintenance(pinned.Conn); err != nil {
+			return nil, fmt.Errorf("scrub: test maintenance setup: %w", err)
+		}
+	}
+
+	maintenanceTx, err := pinned.BeginExclusive()
 	if err != nil {
+		return nil, fmt.Errorf("scrub: begin exclusive maintenance transaction: %w", err)
+	}
+	rollbackMaintenance := func() {
+		_ = maintenanceTx.Rollback().Error
+	}
+	auditService := audit.NewService(pinned.DB)
+	operation, err := auditService.BeginMaintenanceTx(maintenanceTx, audit.MaintenanceKindRequestLogScrub)
+	if err != nil {
+		rollbackMaintenance()
+		return nil, fmt.Errorf("scrub: begin maintenance audit: %w", err)
+	}
+	dirty, err := queryCountTx(maintenanceTx, "SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''")
+	if err != nil {
+		rollbackMaintenance()
 		return nil, fmt.Errorf("scrub: count legacy rows: %w", err)
 	}
-
-	// UPDATE 置空（在持有式独占事务内；保留 metadata 行）
-	if err := exec("UPDATE request_logs SET request_body = '', error_message = '' WHERE request_body != '' OR error_message != ''"); err != nil {
-		return nil, err
+	if err := maintenanceTx.Exec("UPDATE request_logs SET request_body = '', error_message = '' WHERE request_body != '' OR error_message != ''").Error; err != nil {
+		rollbackMaintenance()
+		return nil, fmt.Errorf("scrub: update: %w", err)
 	}
 	res.ScrubbedRows = int(dirty)
-	res.Phases = append(res.Phases, "UPDATE")
-
-	// COMMIT——locking_mode=EXCLUSIVE 使锁继续由本连接持有
-	if err := exec("COMMIT"); err != nil {
-		return nil, err
+	res.Phases = append(res.Phases, "STARTED", "UPDATE")
+	if err := maintenanceTx.Commit().Error; err != nil {
+		rollbackMaintenance()
+		return nil, fmt.Errorf("scrub: commit logical scrub: %w", err)
 	}
 
 	// WAL → DELETE 切换（持有独占时执行：把 WAL 拍平回主库并消除 -wal 旧帧；
 	// 切换后 VACUUM 在 rollback-journal 模式下重写整库）。已在 DELETE 模式则跳过。
 	if isWAL {
 		var newMode string
-		if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode = DELETE").Scan(&newMode); err != nil {
+		if err := pinned.Conn.QueryRowContext(context.Background(), "PRAGMA journal_mode = DELETE").Scan(&newMode); err != nil {
 			return nil, fmt.Errorf("scrub: journal switch: %w", err)
 		}
 		if !strings.EqualFold(newMode, "delete") {
@@ -191,13 +201,22 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	// VACUUM 重写整库（仍持有独占锁：并发者无法使其失败）
-	if err := exec("VACUUM"); err != nil {
+	if hooks.vacuum != nil {
+		err = hooks.vacuum(pinned.Conn)
+	} else {
+		_, err = pinned.Conn.ExecContext(context.Background(), "VACUUM")
+	}
+	if err != nil {
 		return nil, err
 	}
 	res.Phases = append(res.Phases, "VACUUM")
 
-	// 逻辑复核
-	remain, err := queryCount("SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''")
+	if hooks.verify != nil {
+		if err := hooks.verify(pinned.Conn); err != nil {
+			return nil, err
+		}
+	}
+	remain, err := queryCountConn(pinned.Conn, "SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''")
 	if err != nil {
 		return nil, fmt.Errorf("scrub: verify: %w", err)
 	}
@@ -206,8 +225,30 @@ func Run(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("scrub: verification failed: %d rows still non-empty — stop", remain)
 	}
 
-	// 释放独占（conn.Close）
-	_ = conn.Close()
+	if hooks.beforeCompletion != nil {
+		if err := hooks.beforeCompletion(pinned.Conn); err != nil {
+			return nil, fmt.Errorf("scrub: test completion setup: %w", err)
+		}
+	}
+	completionTx, err := pinned.BeginExclusive()
+	if err != nil {
+		return nil, fmt.Errorf("scrub: begin completion transaction: %w", err)
+	}
+	if err := auditService.CompleteMaintenanceTx(completionTx, operation); err != nil {
+		_ = completionTx.Rollback().Error
+		return nil, fmt.Errorf("scrub: complete maintenance audit: %w", err)
+	}
+	if err := completionTx.Commit().Error; err != nil {
+		_ = completionTx.Rollback().Error
+		return nil, fmt.Errorf("scrub: commit completion audit: %w", err)
+	}
+	res.Phases = append(res.Phases, "SUCCESS")
+
+	if err := pinned.Close(); err != nil {
+		closed = true
+		return nil, fmt.Errorf("scrub: close pinned database: %w", err)
+	}
+	closed = true
 	res.Phases = append(res.Phases, "CLOSE")
 
 	// sidecar 清点（仅文件名；内容 raw-scan 由 fixture gate 以 canary 验证）
@@ -221,8 +262,8 @@ func Run(opts Options) (*Result, error) {
 
 // walCheckpointTruncate: TRUNCATE checkpoint 并遵守 SQLite 契约——
 // 首列 Busy!=0 表示 checkpoint 被其他连接阻塞、未完成 → 显式 STOP（fail-closed）。
-func walCheckpointTruncate(db *gorm.DB) error {
-	rows, err := db.Raw("PRAGMA wal_checkpoint(TRUNCATE)").Rows()
+func walCheckpointTruncate(conn *sql.Conn) error {
+	rows, err := conn.QueryContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)")
 	if err != nil {
 		return fmt.Errorf("scrub: wal checkpoint: %w", err)
 	}
@@ -243,41 +284,35 @@ func walCheckpointTruncate(db *gorm.DB) error {
 	return nil
 }
 
-// acquireExclusiveProbe: 以 busy_timeout=0 的独立连接尝试 BEGIN EXCLUSIVE。
-// 任何并发占用（journal 模式下的读/写锁）都会立即 SQLITE_BUSY → STOP。
-// 成功后立即 ROLLBACK（探测不持有锁、不做任何修改）。
-func acquireExclusiveProbe(sqlDB *sql.DB) error {
-	ctx := context.Background()
-	conn, err := sqlDB.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("scrub: acquire connection: %w", err)
+func queryCountConn(conn *sql.Conn, query string) (int64, error) {
+	var count int64
+	if err := conn.QueryRowContext(context.Background(), query).Scan(&count); err != nil {
+		return 0, err
 	}
-	defer func() { _ = conn.Close() }()
-	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 0"); err != nil {
-		return fmt.Errorf("scrub: busy_timeout: %w", err)
-	}
-	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
-		return fmt.Errorf("scrub: database is in use (exclusive lock unavailable) — "+
-			"stop the gateway / close other connections and retry: %w (REQUEST_LOG_SCRUB_OFFLINE_REQUIRED)", err)
-	}
-	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
-		return fmt.Errorf("scrub: exclusive probe rollback: %w", err)
-	}
-	return nil
+	return count, nil
 }
 
-func tableExists(db *gorm.DB, table string) bool {
-	var n int64
-	if err := db.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '" + table + "'").Scan(&n).Error; err != nil {
-		return false
+func queryCountTx(tx *gorm.DB, query string) (int64, error) {
+	var count int64
+	if err := tx.Raw(query).Scan(&count).Error; err != nil {
+		return 0, err
 	}
-	return n > 0
+	return count, nil
 }
 
-func columnExists(db *gorm.DB, table, column string) bool {
-	var n int64
-	if err := db.Raw("SELECT count(*) FROM pragma_table_info('" + table + "') WHERE name = '" + column + "'").Scan(&n).Error; err != nil {
-		return false
+func tableExistsConn(conn *sql.Conn, table string) (bool, error) {
+	var count int64
+	if err := conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&count); err != nil {
+		return false, err
 	}
-	return n > 0
+	return count == 1, nil
+}
+
+func columnExistsConn(conn *sql.Conn, table, column string) (bool, error) {
+	var count int64
+	query := "SELECT count(*) FROM pragma_table_info(?) WHERE name = ?"
+	if err := conn.QueryRowContext(context.Background(), query, table, column).Scan(&count); err != nil {
+		return false, err
+	}
+	return count == 1, nil
 }
