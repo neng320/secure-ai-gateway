@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/models"
@@ -317,6 +318,83 @@ func TestGateListener_BindFailureFailsFast(t *testing.T) {
 		t.Fatalf("[安全回归失败] 失败后 API 端口未释放: %v", err)
 	}
 	rebind.Close()
+}
+
+func TestP108B_S7_CorruptAuditBlocksRealListenerBinding(t *testing.T) {
+	env := newTestGateway(t, true, false)
+	if err := audit.NewService(env.deps.db).Record(models.AuditEvent{
+		Action:     audit.ActionClientCreated,
+		ActorType:  "test",
+		ActorID:    "s7-listener",
+		TargetType: "client",
+		TargetID:   "s7-listener-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.deps.db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := env.deps.db.Exec("UPDATE audit_events SET event_hash = ? WHERE id = (SELECT max(id) FROM audit_events)", strings.Repeat("a", 64)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := env.deps.db.Exec("CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'AUDIT_EVENT_IMMUTABLE'); END").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := *env.cfg
+	cfg.Server.Host = "127.0.0.1"
+	cfg.Server.Admin.Host = "127.0.0.1"
+	cfg.Server.Metrics.Host = "127.0.0.1"
+	cfg.Server.Port = freeListenerGatePort(t)
+	cfg.Server.Admin.Port = freeListenerGatePort(t)
+	cfg.Server.Metrics.Port = freeListenerGatePort(t)
+	addresses := []string{
+		net.JoinHostPort(cfg.Server.Host, strconv.Itoa(cfg.Server.Port)),
+		net.JoinHostPort(cfg.Server.Admin.Host, strconv.Itoa(cfg.Server.Admin.Port)),
+		net.JoinHostPort(cfg.Server.Metrics.Host, strconv.Itoa(cfg.Server.Metrics.Port)),
+	}
+
+	apiMux := buildAPIRouter(env.deps)
+	adminMux, err := buildAdminRouter(env.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsMux := buildMetricsRouter(env.deps)
+	callbackCount := 0
+	preflightErr := runAuditPreflightThen(env.deps.db, func() error {
+		callbackCount++
+		servers, err := startListeners(&cfg, apiMux, adminMux, metricsMux)
+		if err != nil {
+			return err
+		}
+		return shutdownAll(servers, time.Second)
+	})
+	if preflightErr == nil || !strings.Contains(preflightErr.Error(), "AUDIT_INTEGRITY_CHECK_FAILED") {
+		t.Fatalf("corrupt audit must fail preflight with stable error, got %v", preflightErr)
+	}
+	if callbackCount != 0 {
+		t.Fatalf("real listener callback was reached %d times", callbackCount)
+	}
+	for _, address := range addresses {
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			t.Fatalf("address %s was not bindable after blocked startup: %v", address, err)
+		}
+		listener.Close()
+	}
+}
+
+func freeListenerGatePort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
 
 // [P1-01F Gate] 三监听面优雅关停：全部 Serve 退出、无悬挂。
