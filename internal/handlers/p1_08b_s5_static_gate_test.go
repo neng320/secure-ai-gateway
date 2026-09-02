@@ -3,8 +3,11 @@ package handlers
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"ai-gateway/internal/audit"
 )
 
 func TestP108B_S5_StaticAuditActionAndAuthGates(t *testing.T) {
@@ -71,6 +74,61 @@ func TestP108B_S5_StaticCredentialEntropyGate(t *testing.T) {
 	for _, required := range []string{"crypto/rand", "io.ReadFull", "func Hex("} {
 		if !strings.Contains(securegenSrc, required) {
 			t.Fatalf("securegen missing required entropy implementation %q", required)
+		}
+	}
+}
+
+func TestP108B_S7_MaintenanceViewerStatic(t *testing.T) {
+	root := p105bModuleRoot(t)
+	viewerSrc := p105bRead(t, root, "internal/handlers/audit_viewer.go")
+	querySrc := p105bRead(t, root, "internal/audit/query.go")
+	adminSrc := p105bRead(t, root, "internal/handlers/admin.go")
+	wantActions := []string{
+		audit.ActionClientCreated,
+		audit.ActionClientKeyRotated,
+		audit.ActionClientSuspended,
+		audit.ActionClientResumed,
+		audit.ActionClientRevoked,
+		audit.ActionClientDeleted,
+		audit.ActionClientSettingsUpdated,
+		audit.ActionClientProviderSecretChanged,
+		audit.ActionClientModelsUpdated,
+		audit.ActionServerToolsUpdated,
+		audit.ActionGlobalProviderSecretChanged,
+		audit.ActionAdminLoginSucceeded,
+		audit.ActionAdminLogout,
+		audit.ActionSetupCompleted,
+		audit.ActionRequestBodyCaptureRead,
+		audit.ActionAdminPasswordReset,
+		audit.ActionProviderSecretMigrationStarted,
+		audit.ActionProviderSecretMigration,
+		audit.ActionRequestLogScrubStarted,
+		audit.ActionRequestLogScrub,
+	}
+	if got := auditViewerActions(); !reflect.DeepEqual(got, wantActions) {
+		t.Fatalf("viewer actions changed beyond the four maintenance actions: got=%v want=%v", got, wantActions)
+	}
+	_, targetTypes := auditViewerTypes()
+	if len(targetTypes) != 6 || targetTypes[len(targetTypes)-1] != "maintenance-operation" {
+		t.Fatalf("unexpected viewer target types: %v", targetTypes)
+	}
+	if !strings.Contains(querySrc, "\"maintenance-operation\": {}") {
+		t.Fatal("query target whitelist does not allow maintenance-operation")
+	}
+	if audit.MaxAuditQueryLimit != 100 {
+		t.Fatalf("audit query max limit changed: %d", audit.MaxAuditQueryLimit)
+	}
+	if !strings.Contains(adminSrc, "r.Get(\"/admin/audit\", h.ShowAuditLog)") {
+		t.Fatal("audit viewer GET route is missing")
+	}
+	for _, method := range []string{"Post", "Put", "Patch", "Delete"} {
+		if strings.Contains(adminSrc, "r."+method+"(\"/admin/audit") {
+			t.Fatalf("audit viewer has forbidden %s mutation route", method)
+		}
+	}
+	for _, forbidden := range []string{"prune", "clear", "truncate", "export", "DELETE FROM audit_events", "UPDATE audit_events"} {
+		if strings.Contains(viewerSrc+querySrc, forbidden) {
+			t.Fatalf("audit viewer/query contains forbidden retention or mutation marker %q", forbidden)
 		}
 	}
 }

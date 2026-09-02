@@ -3,6 +3,8 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,8 @@ import (
 	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/models"
+
+	"gorm.io/gorm"
 )
 
 func recordS6ViewerEvent(t *testing.T, env *authEnv, event models.AuditEvent) {
@@ -177,5 +181,104 @@ func TestP108B_S6_InvalidFiltersRejected(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s status=%d body=%s", target, w.Code, w.Body.String())
 		}
+	}
+}
+
+func recordS7MaintenancePair(t *testing.T, env *authEnv, kind audit.MaintenanceKind) audit.MaintenanceOperation {
+	t.Helper()
+	var operation audit.MaintenanceOperation
+	if err := env.db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		operation, err = audit.NewService(env.db).BeginMaintenanceTx(tx, kind)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.Transaction(func(tx *gorm.DB) error {
+		return audit.NewService(env.db).CompleteMaintenanceTx(tx, operation)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return operation
+}
+
+func TestP108B_S7_MaintenanceViewerRealActions(t *testing.T) {
+	env := newAuthEnv(t)
+	provider := recordS7MaintenancePair(t, env, audit.MaintenanceKindProviderSecretMigration)
+	recordS7MaintenancePair(t, env, audit.MaintenanceKindProviderSecretMigration)
+	scrub := recordS7MaintenancePair(t, env, audit.MaintenanceKindRequestLogScrub)
+	token := s6ViewerLogin(t, env)
+	countBefore, headBefore := s6ViewerState(t, env)
+	canaries := []string{
+		"P108B-S7-VIEWER-PROVIDER-PLAINTEXT",
+		"P108B-S7-VIEWER-CLIENT-PLAINTEXT",
+		"P108B-S7-VIEWER-GLOBAL-ENVELOPE",
+		"P108B-S7-VIEWER-CLIENT-ENVELOPE",
+		"P108B-S7-VIEWER-MASTER-KEY",
+		"P108B-S7-VIEWER-REQUEST-BODY",
+		filepath.Join(t.TempDir(), "config.yaml"),
+		filepath.Join(t.TempDir(), "backup"),
+	}
+	cases := []struct {
+		action  string
+		actorID string
+		target  string
+	}{
+		{audit.ActionProviderSecretMigrationStarted, "migrate-provider-secrets", provider.TargetID},
+		{audit.ActionProviderSecretMigration, "migrate-provider-secrets", provider.TargetID},
+		{audit.ActionRequestLogScrubStarted, "scrub-request-log-content", scrub.TargetID},
+		{audit.ActionRequestLogScrub, "scrub-request-log-content", scrub.TargetID},
+	}
+	for _, tc := range cases {
+		values := url.Values{
+			"action":      {tc.action},
+			"actor_type":  {"cli"},
+			"actor_id":    {tc.actorID},
+			"target_type": {"maintenance-operation"},
+			"target_id":   {tc.target},
+			"limit":       {"1"},
+		}
+		w := s6ViewerGet(t, env, "/admin/audit?"+values.Encode(), token)
+		if w.Code != http.StatusOK {
+			t.Fatalf("action %s status=%d body=%s", tc.action, w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, ">"+tc.action+"</td>") ||
+			!strings.Contains(body, ">cli / "+tc.actorID+"</td>") ||
+			!strings.Contains(body, ">maintenance-operation / "+tc.target+"</td>") {
+			t.Fatalf("action %s was not rendered as one filtered event: %s", tc.action, w.Body.String())
+		}
+		if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Pragma") != "no-cache" {
+			t.Fatalf("action %s response is cacheable", tc.action)
+		}
+		for _, canary := range canaries {
+			if strings.Contains(w.Body.String(), canary) {
+				t.Fatalf("action %s leaked canary %q", tc.action, canary)
+			}
+		}
+	}
+
+	// The target-type selector and keyset pagination must expose maintenance
+	// operations while preserving exact filters in the next URL.
+	values := url.Values{
+		"action":      {audit.ActionProviderSecretMigrationStarted},
+		"actor_type":  {"cli"},
+		"actor_id":    {"migrate-provider-secrets"},
+		"target_type": {"maintenance-operation"},
+		"limit":       {"1"},
+	}
+	w := s6ViewerGet(t, env, "/admin/audit?"+values.Encode(), token)
+	body := w.Body.String()
+	if !strings.Contains(body, `value="maintenance-operation"`) {
+		t.Fatal("maintenance-operation missing from target type selector")
+	}
+	for _, marker := range []string{"before_id=", "action=", "actor_type=", "actor_id=", "target_type="} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("NextURL missing filter marker %q: %s", marker, body)
+		}
+	}
+	countAfter, headAfter := s6ViewerState(t, env)
+	if countAfter != countBefore || headAfter != headBefore {
+		t.Fatalf("viewer changed audit state: before=(%d,%s) after=(%d,%s)", countBefore, headBefore, countAfter, headAfter)
 	}
 }

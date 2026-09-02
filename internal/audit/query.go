@@ -41,11 +41,12 @@ var allowedAuditActorTypes = map[string]struct{}{
 }
 
 var allowedAuditTargetTypes = map[string]struct{}{
-	"admin":           {},
-	"client":          {},
-	"provider":        {},
-	"request-capture": {},
-	"server":          {},
+	"admin":                 {},
+	"client":                {},
+	"provider":              {},
+	"request-capture":       {},
+	"server":                {},
+	"maintenance-operation": {},
 }
 
 const auditViewerProjection = "id, event_id, action, actor_type, actor_id, target_type, target_id, reason, created_at, chain_version, prev_hash, event_hash"

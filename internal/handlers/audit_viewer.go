@@ -129,11 +129,15 @@ func auditViewerActions() []string {
 		audit.ActionSetupCompleted,
 		audit.ActionRequestBodyCaptureRead,
 		audit.ActionAdminPasswordReset,
+		audit.ActionProviderSecretMigrationStarted,
+		audit.ActionProviderSecretMigration,
+		audit.ActionRequestLogScrubStarted,
+		audit.ActionRequestLogScrub,
 	}
 }
 
 func auditViewerTypes() ([]string, []string) {
-	return []string{"admin", "cli", "setup"}, []string{"admin", "client", "provider", "request-capture", "server"}
+	return []string{"admin", "cli", "setup"}, []string{"admin", "client", "provider", "request-capture", "server", "maintenance-operation"}
 }
 
 func auditViewPageFromQuery(page audit.Page, query audit.Query) AuditViewPage {
