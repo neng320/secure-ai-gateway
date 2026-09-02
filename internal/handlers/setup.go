@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +15,7 @@ import (
 	"ai-gateway/internal/configaudit"
 	"ai-gateway/internal/configstore"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/securegen"
 
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/crypto/bcrypt"
@@ -30,6 +29,10 @@ type SetupHandler struct {
 	configPath   string
 	db           *gorm.DB
 }
+
+// setupCredentialGenerator is a package-local dependency seam for entropy
+// failure tests; production delegates to securegen.Hex.
+var setupCredentialGenerator = securegen.Hex
 
 // NewSetupHandler: loginLimiter 必须与 AdminHandler 共享同一实例（P1-02.2），
 // 以便 Setup 修改管理员用户名后同步 limiter 的受保护身份。
@@ -147,6 +150,19 @@ func (h *SetupHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 			if !sameDatabasePath(diskCfg.Database.Path, h.cfg.Database.Path) {
 				return configaudit.BuildResult{}, errors.New("runtime database path does not match authoritative config")
 			}
+			// Generate every credential before mutating the candidate or entering
+			// the coordinator's persistence/runtime/session/audit path.
+			sessionSecret := diskCfg.Admin.SessionSecret
+			if sessionSecret == "" {
+				sessionSecret, err = setupCredentialGenerator(32)
+				if err != nil {
+					return configaudit.BuildResult{}, fmt.Errorf("generate session secret: %w", err)
+				}
+			}
+			prometheusPassword, err := setupCredentialGenerator(20)
+			if err != nil {
+				return configaudit.BuildResult{}, fmt.Errorf("generate Prometheus password: %w", err)
+			}
 			hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 			if err != nil {
 				return configaudit.BuildResult{}, fmt.Errorf("hash setup password: %w", err)
@@ -154,12 +170,10 @@ func (h *SetupHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 			candidate := *diskCfg
 			candidate.Admin.Username = username
 			candidate.Admin.PasswordHash = string(hash)
-			if candidate.Admin.SessionSecret == "" {
-				candidate.Admin.SessionSecret = generateRandomString(32)
-			}
+			candidate.Admin.SessionSecret = sessionSecret
 			candidate.Prometheus.Enabled = true
 			candidate.Prometheus.Username = "prometheus"
-			candidate.Prometheus.Password = generateRandomString(20)
+			candidate.Prometheus.Password = prometheusPassword
 			candidateBytes, err := config.MarshalYAML(&candidate)
 			if err != nil {
 				return configaudit.BuildResult{}, fmt.Errorf("serialize authoritative config: %w", err)
@@ -203,14 +217,6 @@ func (h *SetupHandler) showError(w http.ResponseWriter, msg string) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(h.renderSetupPage(token)))
-}
-
-func generateRandomString(length int) string {
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(bytes)[:length]
 }
 
 var setupHTML = `<!DOCTYPE html>

@@ -9,12 +9,25 @@ package config
 // 测试捕获 os.Stdout（fmt.Printf 直接写 os.Stdout，小输出无管道死锁风险）。
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func failConfigCredentialEntropy(t *testing.T, calls *int) {
+	t.Helper()
+	original := credentialGenerator
+	credentialGenerator = func(int) (string, error) {
+		if calls != nil {
+			(*calls)++
+		}
+		return "", errors.New("secure entropy unavailable")
+	}
+	t.Cleanup(func() { credentialGenerator = original })
+}
 
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
@@ -122,4 +135,124 @@ func TestP1044_PrometheusBootstrap_PasswordEmpty_NoPasswordStdout(t *testing.T) 
 		t.Fatalf("[安全回归失败] stdout 泄露 Prometheus 明文密码: %q", out)
 	}
 	t.Log("[SEC-003 FIXED] Prometheus bootstrap（password 空）：stdout 零材料")
+}
+
+func TestP108B_S5_FreshConfigEntropyFailureDoesNotCreateFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	failConfigCredentialEntropy(t, nil)
+
+	var loadErr error
+	out := captureStdout(t, func() {
+		_, loadErr = Load(path)
+	})
+	if loadErr == nil {
+		t.Fatal("fresh config accepted session-secret entropy failure")
+	}
+	if strings.Contains(loadErr.Error(), "Initial setup required") || strings.Contains(out, "Initial setup required") {
+		t.Fatalf("entropy failure emitted success/bootstrap output: err=%q out=%q", loadErr, out)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("fresh config was created after entropy failure: %v", err)
+	}
+}
+
+func TestP108B_S5_EnsureDefaultsSessionEntropyFailureKeepsBytes(t *testing.T) {
+	path := writeConfig(t, "admin:\n  password_hash: configured\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failConfigCredentialEntropy(t, nil)
+	_, err = Load(path)
+	if err == nil {
+		t.Fatal("missing session-secret entropy was accepted")
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(before) != string(after) {
+		t.Fatal("session-secret entropy failure changed config bytes")
+	}
+	if strings.Contains(string(after), "session_secret: \"\"") {
+		t.Fatal("empty session secret was persisted")
+	}
+}
+
+func TestP108B_S5_EnsureDefaultsPrometheusUsernameMissingEntropyFailureKeepsBytes(t *testing.T) {
+	path := writeConfig(t, "admin:\n  session_secret: existing-session\nprometheus:\n  enabled: true\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failConfigCredentialEntropy(t, nil)
+	_, err = Load(path)
+	if err == nil {
+		t.Fatal("Prometheus entropy failure with missing username was accepted")
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(before) != string(after) {
+		t.Fatal("Prometheus entropy failure changed config bytes")
+	}
+	if strings.Contains(string(after), "username: prometheus") || strings.Contains(string(after), "password:") {
+		t.Fatal("partial Prometheus credentials were persisted")
+	}
+}
+
+func TestP108B_S5_EnsureDefaultsPrometheusPasswordMissingEntropyFailureKeepsBytes(t *testing.T) {
+	path := writeConfig(t, "admin:\n  session_secret: existing-session\nprometheus:\n  enabled: true\n  username: prometheus\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failConfigCredentialEntropy(t, nil)
+	_, err = Load(path)
+	if err == nil {
+		t.Fatal("Prometheus password entropy failure was accepted")
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(before) != string(after) {
+		t.Fatal("Prometheus password entropy failure changed config bytes")
+	}
+}
+
+func TestP108B_S5_SecondCredentialEntropyFailureDoesNotPersistFirst(t *testing.T) {
+	path := writeConfig(t, "admin:\n  password_hash: configured\nprometheus:\n  enabled: true\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	original := credentialGenerator
+	credentialGenerator = func(length int) (string, error) {
+		calls++
+		if calls == 1 {
+			return strings.Repeat("a", length), nil
+		}
+		return "", errors.New("secure entropy unavailable")
+	}
+	t.Cleanup(func() { credentialGenerator = original })
+	_, err = Load(path)
+	if err == nil {
+		t.Fatal("second credential entropy failure was accepted")
+	}
+	if calls != 2 {
+		t.Fatalf("credential generation calls=%d, want 2", calls)
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(before) != string(after) {
+		t.Fatal("first generated credential was persisted after second failure")
+	}
+	if strings.Contains(err.Error(), strings.Repeat("a", 32)) || strings.Contains(err.Error(), strings.Repeat("a", 20)) {
+		t.Fatal("entropy failure error leaked generated credential")
+	}
 }

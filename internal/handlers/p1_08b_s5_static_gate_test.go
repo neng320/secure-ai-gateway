@@ -54,6 +54,27 @@ func TestP108B_S5_StaticAuditActionAndAuthGates(t *testing.T) {
 	}
 }
 
+func TestP108B_S5_StaticCredentialEntropyGate(t *testing.T) {
+	root := p105bModuleRoot(t)
+	for _, name := range []string{"internal/config/config.go", "internal/handlers/setup.go"} {
+		src := p105bRead(t, root, name)
+		if !strings.Contains(src, "internal/securegen") {
+			t.Fatalf("%s does not use shared securegen", name)
+		}
+		for _, forbidden := range []string{"crypto/rand", "rand.Read", "generateRandomString"} {
+			if strings.Contains(src, forbidden) {
+				t.Fatalf("%s retains forbidden direct entropy path %q", name, forbidden)
+			}
+		}
+	}
+	securegenSrc := p105bRead(t, root, "internal/securegen/hex.go")
+	for _, required := range []string{"crypto/rand", "io.ReadFull", "func Hex("} {
+		if !strings.Contains(securegenSrc, required) {
+			t.Fatalf("securegen missing required entropy implementation %q", required)
+		}
+	}
+}
+
 func TestP108B_S5_StaticResetPasswordGates(t *testing.T) {
 	root := p105bModuleRoot(t)
 	mainSrc, err := os.ReadFile(filepath.Join(root, "cmd", "server", "main.go"))

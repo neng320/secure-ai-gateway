@@ -1,12 +1,12 @@
 package config
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
 	"time"
+
+	"ai-gateway/internal/securegen"
 
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -28,6 +28,10 @@ type Config struct {
 	// yaml 兼容性不受影响。
 	Gemini *LegacyGeminiConfig `yaml:"gemini,omitempty" json:"-"`
 }
+
+// credentialGenerator is a dependency seam for package tests; production uses
+// securegen.Hex and no credential value is retained here.
+var credentialGenerator = securegen.Hex
 
 // ProviderConfig is the unified configuration for any upstream AI backend.
 type ProviderConfig struct {
@@ -391,7 +395,10 @@ func (c *Config) ProviderNames() []string {
 }
 
 func createDefaultConfig(path string) (*Config, error) {
-	secret := generateRandomString(32)
+	secret, err := credentialGenerator(32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate session secret: %w", err)
+	}
 
 	cfg := &Config{
 		Server: ServerConfig{
@@ -464,40 +471,61 @@ func createDefaultConfig(path string) (*Config, error) {
 }
 
 func ensureDefaults(cfg Config, path string) (Config, error) {
-	changed := false
+	// Generate every missing credential before changing the candidate. This keeps
+	// a later entropy failure from persisting an earlier generated value.
+	sessionSecret := cfg.Admin.SessionSecret
+	if sessionSecret == "" {
+		var err error
+		sessionSecret, err = credentialGenerator(32)
+		if err != nil {
+			return cfg, fmt.Errorf("failed to generate session secret: %w", err)
+		}
+	}
+	prometheusUsername := cfg.Prometheus.Username
+	prometheusPassword := cfg.Prometheus.Password
+	prometheusGenerated := false
+	if cfg.Prometheus.Enabled {
+		if prometheusUsername == "" {
+			prometheusUsername = "prometheus"
+		}
+		if prometheusPassword == "" {
+			var err error
+			prometheusPassword, err = credentialGenerator(20)
+			if err != nil {
+				return cfg, fmt.Errorf("failed to generate Prometheus password: %w", err)
+			}
+			prometheusGenerated = true
+		}
+	}
 
-	// If password hash is empty, mark for setup wizard
+	changed := false
+	// If password hash is empty, mark for setup wizard.
 	if cfg.Admin.PasswordHash == "" {
 		cfg.Admin.PasswordHash = "__SETUP_REQUIRED__"
 		changed = true
 	}
-
-	if cfg.Admin.SessionSecret == "" {
-		cfg.Admin.SessionSecret = generateRandomString(32)
+	if cfg.Admin.SessionSecret != sessionSecret {
+		cfg.Admin.SessionSecret = sessionSecret
 		changed = true
 	}
-
-	if cfg.Prometheus.Enabled && cfg.Prometheus.Username == "" {
-		cfg.Prometheus.Username = "prometheus"
-		cfg.Prometheus.Password = generateRandomString(20)
+	if cfg.Prometheus.Username != prometheusUsername {
+		cfg.Prometheus.Username = prometheusUsername
 		changed = true
-		fmt.Printf("\n===========================================\n")
-		fmt.Printf("  Prometheus credentials generated and saved to config.\n")
-		fmt.Printf("===========================================\n\n")
 	}
-
-	if cfg.Prometheus.Enabled && cfg.Prometheus.Username != "" && cfg.Prometheus.Password == "" {
-		cfg.Prometheus.Password = generateRandomString(20)
+	if cfg.Prometheus.Password != prometheusPassword {
+		cfg.Prometheus.Password = prometheusPassword
 		changed = true
-		fmt.Printf("\n===========================================\n")
-		fmt.Printf("  Prometheus password generated and saved to config.\n")
-		fmt.Printf("===========================================\n\n")
 	}
 
 	if changed {
 		if err := saveConfig(&cfg, path); err != nil {
 			return cfg, err
 		}
+	}
+	if prometheusGenerated {
+		fmt.Printf("\n===========================================\n")
+		fmt.Printf("  Prometheus credentials generated and saved to config.\n")
+		fmt.Printf("===========================================\n\n")
 	}
 
 	return cfg, nil
@@ -543,12 +571,6 @@ func ResetAdminPassword(cfg *Config, password string) error {
 	}
 	cfg.Admin.PasswordHash = string(hash)
 	return nil
-}
-
-func generateRandomString(length int) string {
-	b := make([]byte, length)
-	rand.Read(b)
-	return hex.EncodeToString(b)[:length]
 }
 
 // SourcePath: 返回当前加载的配置文件路径（Setup 等需要持久化到同一文件的组件使用）。

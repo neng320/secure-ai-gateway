@@ -201,3 +201,84 @@ func TestP108B_S5_SetupDatabasePathMismatchFailsClosed(t *testing.T) {
 		t.Fatal("database path mismatch appended audit")
 	}
 }
+
+func runS7SetupEntropyFailure(t *testing.T, failAt int) {
+	t.Helper()
+	env := newAuthEnvWithHash(t, "__SETUP_REQUIRED__")
+	env.cfg.Admin.SessionSecret = ""
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	s5WriteSetupConfig(t, env, path)
+	beforeFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAdmin := env.cfg.Admin
+	oldPrometheus := env.cfg.Prometheus
+	oldProtected := env.limiter.ProtectedUser()
+	oldSession, err := env.store.Create(context.Background(), "old-admin", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionCountBefore, auditHeadBefore := s5AuditState(t, env)
+	generatedSession := strings.Repeat("a", 32)
+	var calls int
+	original := setupCredentialGenerator
+	setupCredentialGenerator = func(length int) (string, error) {
+		calls++
+		if calls == failAt {
+			return "", errors.New("secure credential generation failed")
+		}
+		if length == 32 {
+			return generatedSession, nil
+		}
+		return strings.Repeat("b", length), nil
+	}
+	t.Cleanup(func() { setupCredentialGenerator = original })
+
+	var logOutput bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logOutput)
+	t.Cleanup(func() { log.SetOutput(previousLogWriter) })
+	setupH := NewSetupHandler(env.cfg, true, env.limiter, path, env.db)
+	resp := s5SetupPost(t, setupH, url.Values{
+		"username":         {"new-admin"},
+		"password":         {s5SetupPasswordCanary},
+		"confirm_password": {s5SetupPasswordCanary},
+	})
+	if resp.StatusCode == http.StatusFound {
+		t.Fatal("entropy failure reported setup success")
+	}
+	afterFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeFile, afterFile) {
+		t.Fatal("setup entropy failure changed config bytes")
+	}
+	if !reflect.DeepEqual(env.cfg.Admin, oldAdmin) || !reflect.DeepEqual(env.cfg.Prometheus, oldPrometheus) {
+		t.Fatal("setup entropy failure changed runtime credentials")
+	}
+	if env.limiter.ProtectedUser() != oldProtected {
+		t.Fatal("setup entropy failure changed login limiter identity")
+	}
+	if got, _ := s5AuditState(t, env); got != sessionCountBefore {
+		t.Fatalf("setup entropy failure changed audit count: before=%d after=%d", sessionCountBefore, got)
+	}
+	if _, err := env.store.Validate(context.Background(), oldSession); err != nil {
+		t.Fatalf("setup entropy failure revoked existing session: %v", err)
+	}
+	if _, headAfter := s5AuditState(t, env); headAfter != auditHeadBefore {
+		t.Fatal("setup entropy failure changed audit head")
+	}
+	if strings.Contains(readBody(resp), s5SetupPasswordCanary) || strings.Contains(logOutput.String(), s5SetupPasswordCanary) || strings.Contains(logOutput.String(), generatedSession) {
+		t.Fatal("setup entropy failure leaked credential material")
+	}
+}
+
+func TestP108B_S5_SetupSessionEntropyFailureFailClosed(t *testing.T) {
+	runS7SetupEntropyFailure(t, 1)
+}
+
+func TestP108B_S5_SetupPrometheusEntropyFailureFailClosed(t *testing.T) {
+	runS7SetupEntropyFailure(t, 2)
+}
