@@ -20,19 +20,24 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/configaudit"
+	"ai-gateway/internal/configlock"
+	"ai-gateway/internal/configstore"
+	gatewaydb "ai-gateway/internal/database"
 	"ai-gateway/internal/secrets"
 
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // Options: 迁移引擎输入
@@ -57,9 +62,24 @@ type Result struct {
 	Phases           []string
 }
 
+var errConfigReplaceIncomplete = errors.New("migration: config replacement durability incomplete")
+
+type migrationHooks struct {
+	beforeStarted func(*gorm.DB) error
+	beforePrepare func(*gorm.DB) error
+	beforeVerify  func(*gorm.DB) error
+	replaceConfig func(string, *config.Config, string, fs.FileMode) (configstore.ReplaceResult, error)
+	restoreConfig func(string, configstore.Snapshot) (configstore.ReplaceResult, error)
+	commitFinal   func(*gorm.DB) error
+}
+
 // Run: 执行完整迁移（backup → prepare → verify → finalize）。
 // 任何一步失败立即返回错误；DB 事务回滚、config 不切换（保持上次已提交状态）。
 func Run(opts Options) (*Result, error) {
+	return runWithHooks(opts, migrationHooks{})
+}
+
+func runWithHooks(opts Options, hooks migrationHooks) (*Result, error) {
 	if opts.ConfigPath == "" {
 		return nil, fmt.Errorf("migration: config path is required")
 	}
@@ -80,14 +100,21 @@ func Run(opts Options) (*Result, error) {
 	}
 	mgr := secrets.NewManager(cipher)
 
-	// ---- Phase -2: 配置纯读取 + 原始字节捕获（P1-03C2.1：任何 mutation 之前）----
+	// ---- Phase -2: 配置锁定、纯读取 + 原始字节捕获（任何 mutation 之前）----
 	// 绝不使用有副作用的 config.Load（缺失会建默认配置、ensureDefaults 会写回）：
 	// 文件缺失 / 解析失败一律 STOP，不创建、不补写、不落任何默认值。
-	rawCfg, err := os.ReadFile(opts.ConfigPath)
+	lock, err := configlock.Acquire(opts.ConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("migration: config %s: %w (refusing to continue)", opts.ConfigPath, err)
+		return nil, fmt.Errorf("migration: acquire config lock: %w", err)
 	}
-	cfg, err := config.LoadExistingForMigration(opts.ConfigPath)
+	defer func() { _ = lock.Close() }()
+	configPath := lock.CanonicalConfigPath()
+	configSnapshot, err := configstore.ReadSnapshot(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("migration: config %s: %w (refusing to continue)", configPath, err)
+	}
+	rawCfg := append([]byte(nil), configSnapshot.Bytes...)
+	cfg, err := config.LoadExistingForMigration(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("migration: load config: %w", err)
 	}
@@ -106,9 +133,7 @@ func Run(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("migration: database %s is not a regular file — stop", dbPath)
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
+	db, err := gatewaydb.Open(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("migration: open db %s: %w", dbPath, err)
 	}
@@ -140,10 +165,40 @@ func Run(opts Options) (*Result, error) {
 
 	res := &Result{Phases: []string{}}
 
+	// ---- Phase -0.5: 审计完整性前置条件 + durable STARTED ----
+	// MigrateIntegrity 是唯一的审计 schema/legacy-chain owner；完成后再做只读
+	// 校验，保证 provider migration 不会在损坏或 partial audit history 上留下
+	// recovery backup 或业务 mutation。
+	auditService := audit.NewService(db)
+	if err := audit.MigrateIntegrity(db); err != nil {
+		return nil, fmt.Errorf("migration: audit integrity migration: %w", err)
+	}
+	res.Phases = append(res.Phases, "AUDIT-MIGRATION")
+	if _, err := audit.VerifyIntegrityReadOnly(db); err != nil {
+		return nil, fmt.Errorf("migration: audit integrity preflight: %w", err)
+	}
+	res.Phases = append(res.Phases, "AUDIT-VERIFIED")
+
+	var operation audit.MaintenanceOperation
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if hooks.beforeStarted != nil {
+			if err := hooks.beforeStarted(tx); err != nil {
+				return err
+			}
+		}
+		var err error
+		operation, err = auditService.BeginMaintenanceTx(tx, audit.MaintenanceKindProviderSecretMigration)
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("migration: audit STARTED: %w", err)
+	}
+	res.Phases = append(res.Phases, "STARTED")
+
 	// ---- Phase 0: BACKUP（VACUUM INTO 一致性快照 + config 原始字节副本 + manifest）----
-	// 顺序硬约束（P1-03C2.1）：备份必须先于任何 schema/数据变更；
-	// config 备份写入的是上面捕获的原始字节，绝不重新序列化。
-	backupDir, err := takeBackup(db, sqlDB, cfg, opts.ConfigPath, rawCfg, opts.BackupDir, mgr.KeyID(), encryptedColumnReady, userVersion, now())
+	// STARTED 已经提交，所以 backup 同时保留当前 audit schema、chain-state、
+	// integrity triggers 与本次 operation 的启动证据。backup 失败时保留这个
+	// pending STARTED，后续重跑由 BeginMaintenanceTx 复用同一 TargetID。
+	backupDir, err := takeBackup(db, sqlDB, cfg, configPath, rawCfg, opts.BackupDir, mgr.KeyID(), encryptedColumnReady, userVersion, now())
 	if err != nil {
 		return nil, fmt.Errorf("migration: backup: %w", err)
 	}
@@ -223,6 +278,11 @@ func Run(opts Options) (*Result, error) {
 	// 原生 SQL 写入（P1-03C2.1）：迁移引擎承诺的最小 schema 只有 id/backend_api_key(+encrypted)，
 	// 不得依赖 gorm Update 自动维护的 updated_at 等列（旧库可能没有）。
 	err = db.Transaction(func(tx *gorm.DB) error {
+		if hooks.beforePrepare != nil {
+			if err := hooks.beforePrepare(tx); err != nil {
+				return err
+			}
+		}
 		for _, c := range clients {
 			if c.state != secrets.SecretLegacyOnly {
 				continue
@@ -255,10 +315,28 @@ func Run(opts Options) (*Result, error) {
 		pc.APIKeyEncrypted = env
 		cfgCandidate.Providers[g.name] = pc
 	}
-	if err := atomicWriteConfig(&cfgCandidate, opts.ConfigPath); err != nil {
+	prepareReplace, err := replaceMigrationConfig(hooks, "prepare", &cfgCandidate, configPath, configSnapshot.Mode)
+	if err != nil {
+		if prepareReplace.Renamed {
+			if restoreErr := restoreMigrationConfig(hooks, configPath, configSnapshot); restoreErr != nil {
+				return nil, restoreErr
+			}
+		}
 		return nil, fmt.Errorf("migration: PREPARE (config): %w", err)
 	}
+	prepareSnapshot, err := configstore.ReadSnapshot(configPath)
+	if err != nil {
+		if restoreErr := restoreMigrationConfig(hooks, configPath, configSnapshot); restoreErr != nil {
+			return nil, restoreErr
+		}
+		return nil, fmt.Errorf("migration: PREPARE (config) snapshot: %w", err)
+	}
 	res.Phases = append(res.Phases, "PREPARE")
+	if hooks.beforeVerify != nil {
+		if err := hooks.beforeVerify(db); err != nil {
+			return nil, fmt.Errorf("migration: VERIFY preflight: %w", err)
+		}
+	}
 
 	// ---- PHASE 2: VERIFY（重读 DB 与配置，逐条解密比对原明文；任一失败 → 全停，不 scrub）----
 	verifyFail := func(kind, ref string) error {
@@ -303,53 +381,101 @@ func Run(opts Options) (*Result, error) {
 	}
 	res.Phases = append(res.Phases, "VERIFY")
 
-	// ---- PHASE 3: FINALIZE（验证全通过才清 legacy；DB 事务 + config 原子写）----
-	err = db.Transaction(func(tx *gorm.DB) error {
-		for _, rr := range dbRows2 {
-			if rr.Encrypted == "" || rr.Legacy == "" {
-				continue
-			}
-			if err := tx.Exec("UPDATE clients SET backend_api_key = '' WHERE id = ?", rr.ID).Error; err != nil {
-				return fmt.Errorf("clear client:%s: %w", rr.ID, err)
-			}
-			res.FinalizedClients++
+	// ---- PHASE 3: FINALIZE（DB mutation + audit SUCCESS + config replace）----
+	// SQLite 的最终提交与配置文件 rename 不可能组成一个跨存储事务：先把
+	// SUCCESS 与 legacy 清理放入同一个 DB tx，再以 PREPARE snapshot 做配置
+	// 失败/DB commit 失败的补偿。任何不可补偿的情况都返回稳定 rollback 错误。
+	finalTx := db.Begin()
+	if finalTx.Error != nil {
+		return nil, fmt.Errorf("migration: FINALIZE (db begin): %w", finalTx.Error)
+	}
+	finalizedClients := 0
+	for _, rr := range dbRows2 {
+		if rr.Encrypted == "" || rr.Legacy == "" {
+			continue
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("migration: FINALIZE (db): %w", err)
+		if err := finalTx.Exec("UPDATE clients SET backend_api_key = '' WHERE id = ?", rr.ID).Error; err != nil {
+			_ = finalTx.Rollback()
+			return nil, fmt.Errorf("migration: FINALIZE (db): clear client:%s: %w", rr.ID, err)
+		}
+		finalizedClients++
+	}
+	if err := auditService.CompleteMaintenanceTx(finalTx, operation); err != nil {
+		_ = finalTx.Rollback()
+		return nil, fmt.Errorf("migration: FINALIZE (audit): %w", err)
 	}
 
 	cfgFinal := *cfgVerify
+	finalizedGlobal := 0
 	for name, p := range cfgFinal.Providers {
 		if p.APIKeyEncrypted != "" && p.APIKey != "" {
 			p.APIKey = "" // legacy 明文清空；encrypted 保留
 			cfgFinal.Providers[name] = p
-			res.FinalizedGlobal++
+			finalizedGlobal++
 		}
 	}
-	if err := atomicWriteConfig(&cfgFinal, opts.ConfigPath); err != nil {
+	finalReplace, err := replaceMigrationConfig(hooks, "finalize", &cfgFinal, configPath, prepareSnapshot.Mode)
+	if err != nil {
+		_ = finalTx.Rollback()
+		if finalReplace.Renamed {
+			if restoreErr := restoreMigrationConfig(hooks, configPath, prepareSnapshot); restoreErr != nil {
+				return nil, restoreErr
+			}
+		}
 		return nil, fmt.Errorf("migration: FINALIZE (config): %w", err)
 	}
+
+	commitErr := error(nil)
+	if hooks.commitFinal != nil {
+		commitErr = hooks.commitFinal(finalTx)
+	} else {
+		commitErr = finalTx.Commit().Error
+	}
+	if commitErr != nil {
+		_ = finalTx.Rollback()
+		if restoreErr := restoreMigrationConfig(hooks, configPath, prepareSnapshot); restoreErr != nil {
+			return nil, restoreErr
+		}
+		return nil, fmt.Errorf("migration: FINALIZE (db commit): %w", commitErr)
+	}
+	res.FinalizedClients = finalizedClients
+	res.FinalizedGlobal = finalizedGlobal
 	res.Phases = append(res.Phases, "FINALIZE")
 
 	return res, nil
 }
 
-// atomicWriteConfig: candidate → 同目录临时文件 → rename 原子替换。
-// （不用 fmt.Fprintf 渲染，内容含 % 不受影响；MarshalYAML 由 config 包提供。）
-func atomicWriteConfig(cfg *config.Config, path string) error {
+func replaceMigrationConfig(hooks migrationHooks, kind string, cfg *config.Config, path string, mode fs.FileMode) (configstore.ReplaceResult, error) {
 	data, err := config.MarshalYAML(cfg)
 	if err != nil {
-		return err
+		return configstore.ReplaceResult{}, err
 	}
-	tmp := path + ".migrating"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("write temp config: %w", err)
+	replace := hooks.replaceConfig
+	if replace == nil {
+		replace = func(_ string, _ *config.Config, path string, mode fs.FileMode) (configstore.ReplaceResult, error) {
+			return configstore.AtomicReplace(path, data, mode)
+		}
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename config: %w", err)
+	result, err := replace(kind, cfg, path, mode)
+	if err == nil && (!result.Renamed || !result.DirectorySynced) {
+		return result, errConfigReplaceIncomplete
+	}
+	return result, err
+}
+
+func restoreMigrationConfig(hooks migrationHooks, path string, snapshot configstore.Snapshot) error {
+	restore := hooks.restoreConfig
+	if restore == nil {
+		restore = func(path string, snapshot configstore.Snapshot) (configstore.ReplaceResult, error) {
+			return configstore.AtomicReplace(path, snapshot.Bytes, snapshot.Mode)
+		}
+	}
+	result, err := restore(path, snapshot)
+	if err != nil || !result.Renamed || !result.DirectorySynced {
+		if err != nil {
+			return fmt.Errorf("%w: %v", configaudit.ErrConfigAuditRollbackFailed, err)
+		}
+		return fmt.Errorf("%w: restore durability incomplete", configaudit.ErrConfigAuditRollbackFailed)
 	}
 	return nil
 }
@@ -368,8 +494,12 @@ func takeBackup(db *gorm.DB, sqlDB *sql.DB, cfg *config.Config, configPath strin
 	// 绝不覆盖既有备份：时间戳碰撞（同秒重跑）时追加序号
 	suffix := 1
 	for {
-		if _, err := os.Stat(backupDir); os.IsNotExist(err) {
+		_, err := os.Stat(backupDir)
+		if os.IsNotExist(err) {
 			break
+		}
+		if err != nil {
+			return "", err
 		}
 		backupDir = filepath.Join(backupRoot, fmt.Sprintf("migration-backup-%s-%d", ts, suffix))
 		suffix++

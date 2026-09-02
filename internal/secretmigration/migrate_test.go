@@ -3,14 +3,20 @@ package secretmigration
 // P1-03C2 · 迁移引擎测试（全部在 t.TempDir() fixture 上执行，绝不触碰真实数据）
 
 import (
+	"bytes"
 	"encoding/base64"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/configaudit"
+	"ai-gateway/internal/configstore"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/secrets"
 
@@ -438,4 +444,570 @@ func mustNewCipher(t *testing.T, keyB64 string) *secrets.AESGCMCipher {
 		t.Fatal(err)
 	}
 	return c
+}
+
+func s7OptionsWithKey(t *testing.T, f *fixture, backupDir string) Options {
+	t.Helper()
+	return Options{
+		ConfigPath: f.cfgPath,
+		BackupDir:  backupDir,
+		MasterKey:  testKey(t),
+		Now:        func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	}
+}
+
+func s7MaintenanceEvents(t *testing.T, db *gorm.DB) []models.AuditEvent {
+	t.Helper()
+	var events []models.AuditEvent
+	if err := db.Where("action IN ?", []string{
+		audit.ActionProviderSecretMigrationStarted,
+		audit.ActionProviderSecretMigration,
+	}).Order("id ASC").Find(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+func s7CountAction(t *testing.T, db *gorm.DB, action string) int64 {
+	t.Helper()
+	var count int64
+	if err := db.Model(&models.AuditEvent{}).Where("action = ?", action).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func s7CreateLegacyAudit(t *testing.T, f *fixture) {
+	t.Helper()
+	if err := f.db.Exec(`CREATE TABLE audit_events (
+		id integer PRIMARY KEY AUTOINCREMENT,
+		event_id varchar(64), action varchar(64), actor_type varchar(32),
+		actor_id varchar(255), target_type varchar(32), target_id varchar(36),
+		reason varchar(256), created_at datetime
+	)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"CREATE UNIQUE INDEX idx_audit_events_event_id ON audit_events(event_id)",
+		"CREATE INDEX idx_audit_events_action ON audit_events(action)",
+		"CREATE INDEX idx_audit_events_actor_id ON audit_events(actor_id)",
+		"CREATE INDEX idx_audit_events_target_type ON audit_events(target_type)",
+		"CREATE INDEX idx_audit_events_target_id ON audit_events(target_id)",
+		"CREATE INDEX idx_audit_events_created_at ON audit_events(created_at)",
+	} {
+		if err := f.db.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.db.Exec(`INSERT INTO audit_events
+		(id, event_id, action, actor_type, actor_id, target_type, target_id, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		1, "legacy-event-1", audit.ActionClientCreated, "admin", "legacy-admin",
+		"client", "legacy-client", "legacy-history", time.Unix(1699999000, 0).UTC()).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func s7SeedCurrentAudit(t *testing.T, f *fixture) {
+	t.Helper()
+	if err := audit.MigrateIntegrity(f.db); err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.NewService(f.db).Record(models.AuditEvent{
+		Action:     audit.ActionClientCreated,
+		ActorType:  "test",
+		ActorID:    "s7-test",
+		TargetType: "client",
+		TargetID:   "s7-client",
+		Reason:     "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func s7ClientSecrets(t *testing.T, f *fixture, id string) (string, string) {
+	t.Helper()
+	var row struct {
+		Legacy    string `gorm:"column:legacy"`
+		Encrypted string `gorm:"column:encrypted"`
+	}
+	if err := f.db.Raw("SELECT backend_api_key AS legacy, backend_api_key_encrypted AS encrypted FROM clients WHERE id = ?", id).Scan(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	return row.Legacy, row.Encrypted
+}
+
+func s7ProviderEvents(t *testing.T, db *gorm.DB) []models.AuditEvent {
+	t.Helper()
+	return s7MaintenanceEvents(t, db)
+}
+
+func TestP108B_S7_LegacyAuditStartedBackupCompletion(t *testing.T) {
+	f := newFixture(t)
+	s7CreateLegacyAudit(t, f)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+
+	res, err := Run(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := s7ProviderEvents(t, f.db)
+	if len(events) != 2 || events[0].Action != audit.ActionProviderSecretMigrationStarted || events[1].Action != audit.ActionProviderSecretMigration {
+		t.Fatalf("expected one STARTED/SUCCESS pair, got %+v", events)
+	}
+	if events[0].TargetID == "" || events[0].TargetID != events[1].TargetID {
+		t.Fatalf("provider maintenance correlation mismatch: %+v", events)
+	}
+	if len(res.Phases) < 3 || res.Phases[0] != "AUDIT-MIGRATION" || res.Phases[1] != "AUDIT-VERIFIED" || res.Phases[2] != "STARTED" {
+		t.Fatalf("audit phase ordering missing: %v", res.Phases)
+	}
+
+	snapshot, err := gorm.Open(sqlite.Open(filepath.Join(res.BackupDir, "gateway.db")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audit.VerifyIntegrityReadOnly(snapshot); err != nil {
+		t.Fatalf("backup audit snapshot is not verifiable: %v", err)
+	}
+	if got := s7CountAction(t, snapshot, audit.ActionProviderSecretMigrationStarted); got != 1 {
+		t.Fatalf("backup must contain committed STARTED, got %d", got)
+	}
+	var triggerCount int64
+	if err := snapshot.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'audit_events'").Scan(&triggerCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if triggerCount != 2 {
+		t.Fatalf("backup must contain both audit triggers, got %d", triggerCount)
+	}
+	if sqlDB, err := snapshot.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+}
+
+func TestP108B_S7_CurrentAuditCorruptionFailsBeforeStartedOrBackup(t *testing.T) {
+	corruptions := []struct {
+		name    string
+		corrupt func(*testing.T, *fixture)
+	}{
+		{
+			name: "event-hash",
+			corrupt: func(t *testing.T, f *fixture) {
+				if err := f.db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := f.db.Exec("UPDATE audit_events SET event_hash = ? WHERE id = 1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := f.db.Exec("CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'AUDIT_EVENT_IMMUTABLE'); END").Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "state-head",
+			corrupt: func(t *testing.T, f *fixture) {
+				if err := f.db.Exec("UPDATE audit_chain_states SET head_hash = ? WHERE id = 1", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "trigger-definition",
+			corrupt: func(t *testing.T, f *fixture) {
+				if err := f.db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.addClient(t, "client-a", canaryClientA, "")
+			s7SeedCurrentAudit(t, f)
+			tc.corrupt(t, f)
+			beforeCfg := []byte(readCfgFile(t, f.cfgPath))
+			_, err := Run(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")))
+			if err == nil {
+				t.Fatal("corrupt current audit unexpectedly accepted")
+			}
+			if _, statErr := os.Stat(filepath.Join(f.dir, "backups")); !os.IsNotExist(statErr) {
+				t.Fatalf("corrupt audit must fail before backup, stat=%v", statErr)
+			}
+			if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted); got != 0 {
+				t.Fatalf("unexpected STARTED count %d", got)
+			}
+			legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+			if legacy != canaryClientA || encrypted != "" {
+				t.Fatalf("provider mutation occurred: legacy=%q encrypted=%q", legacy, encrypted)
+			}
+			if !bytes.Equal(beforeCfg, []byte(readCfgFile(t, f.cfgPath))) {
+				t.Fatal("config changed after audit preflight failure")
+			}
+		})
+	}
+}
+
+func TestP108B_S7_StartedFailureLeavesNoBackupOrProviderMutation(t *testing.T) {
+	f := newFixture(t)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+	beforeConfig := []byte(readCfgFile(t, f.cfgPath))
+
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), migrationHooks{
+		beforeStarted: func(tx *gorm.DB) error {
+			return tx.Exec("CREATE TRIGGER reject_provider_started BEFORE INSERT ON audit_events WHEN NEW.action = 'PROVIDER_SECRET_MIGRATION_STARTED' BEGIN SELECT RAISE(ABORT, 'reject provider start'); END").Error
+		},
+	})
+	if err == nil {
+		t.Fatal("injected STARTED failure was accepted")
+	}
+	if _, statErr := os.Stat(filepath.Join(f.dir, "backups")); !os.IsNotExist(statErr) {
+		t.Fatalf("STARTED failure must precede backup, stat=%v", statErr)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted); got != 0 {
+		t.Fatalf("STARTED rollback left %d events", got)
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || encrypted != "" {
+		t.Fatalf("provider mutation occurred after STARTED failure: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+	if !bytes.Equal(beforeConfig, []byte(readCfgFile(t, f.cfgPath))) {
+		t.Fatal("config changed after STARTED failure")
+	}
+}
+
+func TestP108B_S7_BackupFailureLeavesOnePendingAndRerunReusesTarget(t *testing.T) {
+	f := newFixture(t)
+	f.addClient(t, "client-a", canaryClientA, "")
+	blocked := filepath.Join(f.dir, "backup-blocker")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(blocked, "nested")), migrationHooks{})
+	if err == nil {
+		t.Fatal("backup failure was accepted")
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted); got != 1 {
+		t.Fatalf("backup failure must leave exactly one STARTED, got %d", got)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigration); got != 0 {
+		t.Fatalf("backup failure unexpectedly completed, got %d", got)
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || encrypted != "" {
+		t.Fatalf("provider mutation occurred after backup failure: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+
+	res, err := Run(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")))
+	if err != nil {
+		t.Fatalf("rerun after backup failure: %v", err)
+	}
+	events := s7ProviderEvents(t, f.db)
+	if len(events) != 2 || events[0].Action != audit.ActionProviderSecretMigrationStarted || events[1].Action != audit.ActionProviderSecretMigration {
+		t.Fatalf("rerun did not produce one STARTED/SUCCESS pair: %+v", events)
+	}
+	if events[0].TargetID != events[1].TargetID {
+		t.Fatalf("rerun changed TargetID: %+v", events)
+	}
+	if res.BackupDir == "" {
+		t.Fatal("successful rerun did not create recovery backup")
+	}
+}
+
+func TestP108B_S7_BackupContainsStartedAndAuditIntegrityObjects(t *testing.T) {
+	f := newFixture(t)
+	f.addClient(t, "client-a", canaryClientA, "")
+	res, err := Run(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := gorm.Open(sqlite.Open(filepath.Join(res.BackupDir, "gateway.db")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s7CountAction(t, snapshot, audit.ActionProviderSecretMigrationStarted); got != 1 {
+		t.Fatalf("snapshot missing committed STARTED: %d", got)
+	}
+	var objects int64
+	if err := snapshot.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('audit_events', 'audit_chain_states')").Scan(&objects).Error; err != nil {
+		t.Fatal(err)
+	}
+	if objects != 2 {
+		t.Fatalf("snapshot missing audit tables: %d", objects)
+	}
+	var triggers int64
+	if err := snapshot.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('audit_events_no_update', 'audit_events_no_delete')").Scan(&triggers).Error; err != nil {
+		t.Fatal(err)
+	}
+	if triggers != 2 {
+		t.Fatalf("snapshot missing audit triggers: %d", triggers)
+	}
+	if sqlDB, err := snapshot.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+}
+
+func TestP108B_S7_RequestLogPendingBlocksProviderBeforeBackup(t *testing.T) {
+	f := newFixture(t)
+	f.addClient(t, "client-a", canaryClientA, "")
+	if err := audit.MigrateIntegrity(f.db); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Transaction(func(tx *gorm.DB) error {
+		_, err := audit.NewService(f.db).BeginMaintenanceTx(tx, audit.MaintenanceKindRequestLogScrub)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Run(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")))
+	if err == nil {
+		t.Fatal("cross-kind pending maintenance was accepted")
+	}
+	if _, statErr := os.Stat(filepath.Join(f.dir, "backups")); !os.IsNotExist(statErr) {
+		t.Fatalf("cross-kind pending must fail before backup, stat=%v", statErr)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted); got != 0 {
+		t.Fatalf("provider STARTED appended despite cross-kind pending: %d", got)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionRequestLogScrubStarted); got != 1 {
+		t.Fatalf("scrub pending disappeared: %d", got)
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || encrypted != "" {
+		t.Fatalf("provider mutation occurred with cross-kind pending: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+}
+
+func TestP108B_S7_MultiplePendingBlocksProviderBeforeBackup(t *testing.T) {
+	f := newFixture(t)
+	f.addClient(t, "client-a", canaryClientA, "")
+	if err := audit.MigrateIntegrity(f.db); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []models.AuditEvent{
+		{Action: audit.ActionProviderSecretMigrationStarted, ActorType: "cli", ActorID: "migrate-provider-secrets", TargetType: "maintenance-operation", TargetID: "00000000-0000-0000-0000-000000000001"},
+		{Action: audit.ActionRequestLogScrubStarted, ActorType: "cli", ActorID: "scrub-request-log-content", TargetType: "maintenance-operation", TargetID: "00000000-0000-0000-0000-000000000002"},
+	} {
+		if err := audit.NewService(f.db).Record(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := Run(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")))
+	if err == nil {
+		t.Fatal("multiple pending maintenance operations were accepted")
+	}
+	if _, statErr := os.Stat(filepath.Join(f.dir, "backups")); !os.IsNotExist(statErr) {
+		t.Fatalf("multiple pending must fail before backup, stat=%v", statErr)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted); got != 1 {
+		t.Fatalf("pending provider STARTED changed: %d", got)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionRequestLogScrubStarted); got != 1 {
+		t.Fatalf("pending scrub STARTED changed: %d", got)
+	}
+}
+
+func TestP108B_S7_PrepareFailureLeavesPendingAndNoSuccess(t *testing.T) {
+	f := newFixture(t)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+	beforeConfig := []byte(readCfgFile(t, f.cfgPath))
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), migrationHooks{
+		beforePrepare: func(*gorm.DB) error { return errors.New("injected prepare failure") },
+	})
+	if err == nil {
+		t.Fatal("injected PREPARE failure was accepted")
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted); got != 1 {
+		t.Fatalf("PREPARE failure should retain STARTED, got %d", got)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigration); got != 0 {
+		t.Fatalf("PREPARE failure unexpectedly appended SUCCESS, got %d", got)
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || encrypted != "" {
+		t.Fatalf("PREPARE failure committed provider mutation: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+	if !bytes.Equal(beforeConfig, []byte(readCfgFile(t, f.cfgPath))) {
+		t.Fatal("PREPARE failure changed config")
+	}
+}
+
+func TestP108B_S7_VerifyFailureDoesNotFinalizePlaintext(t *testing.T) {
+	f := newFixture(t)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), migrationHooks{
+		beforeVerify: func(*gorm.DB) error { return errors.New("injected verify failure") },
+	})
+	if err == nil {
+		t.Fatal("injected VERIFY failure was accepted")
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || !secrets.IsEncryptedEnvelope(encrypted) {
+		t.Fatalf("VERIFY failure did not preserve mixed state: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+	cfg := reloadConfig(t, f)
+	if cfg.Providers["openai"].APIKey != canaryGlobal || !secrets.IsEncryptedEnvelope(cfg.Providers["openai"].APIKeyEncrypted) {
+		t.Fatalf("VERIFY failure did not preserve config plaintext: %+v", cfg.Providers["openai"])
+	}
+	if s7CountAction(t, f.db, audit.ActionProviderSecretMigration) != 0 {
+		t.Fatal("VERIFY failure appended SUCCESS")
+	}
+}
+
+func s7PostRenameFinalizeFailureHook() migrationHooks {
+	return migrationHooks{
+		replaceConfig: func(kind string, cfg *config.Config, path string, mode fs.FileMode) (configstore.ReplaceResult, error) {
+			data, err := config.MarshalYAML(cfg)
+			if err != nil {
+				return configstore.ReplaceResult{}, err
+			}
+			result, err := configstore.AtomicReplace(path, data, mode)
+			if err != nil || kind != "finalize" {
+				return result, err
+			}
+			result.DirectorySynced = false
+			return result, errors.New("injected post-rename directory sync failure")
+		},
+	}
+}
+
+func TestP108B_S7_FinalizeConfigFailureCompensatesSQLiteAndConfig(t *testing.T) {
+	f := newFixture(t)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), s7PostRenameFinalizeFailureHook())
+	if err == nil {
+		t.Fatal("post-rename final config failure was accepted")
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || !secrets.IsEncryptedEnvelope(encrypted) {
+		t.Fatalf("final DB transaction was not rolled back: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+	cfg := reloadConfig(t, f)
+	if cfg.Providers["openai"].APIKey != canaryGlobal || !secrets.IsEncryptedEnvelope(cfg.Providers["openai"].APIKeyEncrypted) {
+		t.Fatalf("config was not restored to PREPARE snapshot: %+v", cfg.Providers["openai"])
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigration); got != 0 {
+		t.Fatalf("SUCCESS survived final config failure: %d", got)
+	}
+	if got := s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted); got != 1 {
+		t.Fatalf("pending STARTED lost after final config failure: %d", got)
+	}
+}
+
+func TestP108B_S7_ConfigCompensationFailureIsStable(t *testing.T) {
+	f := newFixture(t)
+	f.addClient(t, "client-a", canaryClientA, "")
+	hooks := s7PostRenameFinalizeFailureHook()
+	hooks.restoreConfig = func(string, configstore.Snapshot) (configstore.ReplaceResult, error) {
+		return configstore.ReplaceResult{}, errors.New("injected restore failure")
+	}
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), hooks)
+	if !errors.Is(err, configaudit.ErrConfigAuditRollbackFailed) {
+		t.Fatalf("expected stable compensation failure, got %v", err)
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || !secrets.IsEncryptedEnvelope(encrypted) {
+		t.Fatalf("SQLite transaction was not rolled back on compensation failure: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+}
+
+func TestP108B_S7_FinalSQLiteCommitFailureCompensatesConfig(t *testing.T) {
+	f := newFixture(t)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+	hooks := migrationHooks{commitFinal: func(*gorm.DB) error { return errors.New("injected final commit failure") }}
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), hooks)
+	if err == nil {
+		t.Fatal("injected final commit failure was accepted")
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || !secrets.IsEncryptedEnvelope(encrypted) {
+		t.Fatalf("final SQLite rollback failed: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+	cfg := reloadConfig(t, f)
+	if cfg.Providers["openai"].APIKey != canaryGlobal || !secrets.IsEncryptedEnvelope(cfg.Providers["openai"].APIKeyEncrypted) {
+		t.Fatalf("commit failure did not restore PREPARE config: %+v", cfg.Providers["openai"])
+	}
+	if s7CountAction(t, f.db, audit.ActionProviderSecretMigration) != 0 {
+		t.Fatal("SUCCESS survived final SQLite commit failure")
+	}
+}
+
+func TestP108B_S7_SuccessAuditAppendFailureRollsBackFinalize(t *testing.T) {
+	f := newFixture(t)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), migrationHooks{
+		beforeVerify: func(db *gorm.DB) error {
+			return db.Exec("CREATE TRIGGER reject_provider_success BEFORE INSERT ON audit_events WHEN NEW.action = 'PROVIDER_SECRET_MIGRATION' BEGIN SELECT RAISE(ABORT, 'reject provider success'); END").Error
+		},
+	})
+	if err == nil {
+		t.Fatal("injected SUCCESS audit failure was accepted")
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || !secrets.IsEncryptedEnvelope(encrypted) {
+		t.Fatalf("SUCCESS audit failure did not roll back client finalize: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+	cfg := reloadConfig(t, f)
+	if cfg.Providers["openai"].APIKey != canaryGlobal || !secrets.IsEncryptedEnvelope(cfg.Providers["openai"].APIKeyEncrypted) {
+		t.Fatalf("SUCCESS audit failure did not leave PREPARE config: %+v", cfg.Providers["openai"])
+	}
+	if s7CountAction(t, f.db, audit.ActionProviderSecretMigration) != 0 {
+		t.Fatal("SUCCESS audit event exists after injected append failure")
+	}
+	if s7CountAction(t, f.db, audit.ActionProviderSecretMigrationStarted) != 1 {
+		t.Fatal("pending STARTED was not preserved after audit append failure")
+	}
+}
+
+func TestP108B_S7_PreRenameFinalizeFailureLeavesPrepareState(t *testing.T) {
+	f := newFixture(t)
+	f.addClient(t, "client-a", canaryClientA, "")
+	hooks := migrationHooks{
+		replaceConfig: func(kind string, cfg *config.Config, path string, mode fs.FileMode) (configstore.ReplaceResult, error) {
+			if kind == "finalize" {
+				return configstore.ReplaceResult{}, errors.New("injected pre-rename failure")
+			}
+			data, err := config.MarshalYAML(cfg)
+			if err != nil {
+				return configstore.ReplaceResult{}, err
+			}
+			return configstore.AtomicReplace(path, data, mode)
+		},
+	}
+	_, err := runWithHooks(s7OptionsWithKey(t, f, filepath.Join(f.dir, "backups")), hooks)
+	if err == nil {
+		t.Fatal("injected pre-rename finalize failure was accepted")
+	}
+	legacy, encrypted := s7ClientSecrets(t, f, "client-a")
+	if legacy != canaryClientA || !secrets.IsEncryptedEnvelope(encrypted) {
+		t.Fatalf("pre-rename failure did not roll back DB finalize: legacy=%q encrypted=%q", legacy, encrypted)
+	}
+	if cfg := reloadConfig(t, f); len(cfg.Providers) != 0 {
+		t.Fatalf("pre-rename failure unexpectedly changed provider config: %+v", cfg.Providers)
+	}
+}
+
+func TestP108B_S7_MaintenanceAuditPrivacyCanary(t *testing.T) {
+	f := newFixture(t)
+	f.addGlobal(t, "openai", canaryGlobal, "")
+	f.addClient(t, "client-a", canaryClientA, "")
+	backupDir := filepath.Join(f.dir, "backups")
+	if _, err := Run(s7OptionsWithKey(t, f, backupDir)); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range s7ProviderEvents(t, f.db) {
+		serialized := strings.Join([]string{event.EventID, event.Action, event.ActorType, event.ActorID, event.TargetType, event.TargetID, event.Reason, event.CreatedAt.String(), event.ChainVersion, event.PrevHash, event.EventHash}, "|")
+		for _, secret := range []string{canaryGlobal, canaryClientA, testMasterKeyB64, f.cfgPath, backupDir} {
+			if strings.Contains(serialized, secret) {
+				t.Fatalf("maintenance audit event leaked sensitive value %q: %+v", secret, event)
+			}
+		}
+	}
 }
