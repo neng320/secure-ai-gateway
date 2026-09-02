@@ -65,6 +65,15 @@ func maintenanceEventsForKindForTest(t *testing.T, db *gorm.DB, kind Maintenance
 	return events
 }
 
+func countMaintenanceActionForTest(t *testing.T, db *gorm.DB, action string) int {
+	t.Helper()
+	var count int64
+	if err := db.Model(&models.AuditEvent{}).Where("action = ?", action).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	return int(count)
+}
+
 func appendMaintenanceEventForTest(t *testing.T, db *gorm.DB, event models.AuditEvent) {
 	t.Helper()
 	if err := NewService(db).Record(event); err != nil {
@@ -113,6 +122,7 @@ func TestP108B_S7_MaintenanceBeginNewAndServerUUID(t *testing.T) {
 		t.Fatalf("expected one provider STARTED event, got %+v", events)
 	}
 
+	db = newAuditTestDB(t)
 	scrub, err := beginMaintenanceForTest(t, db, MaintenanceKindRequestLogScrub)
 	if err != nil {
 		t.Fatal(err)
@@ -141,6 +151,107 @@ func TestP108B_S7_MaintenanceBeginResumesWithoutSecondStarted(t *testing.T) {
 	events := maintenanceEventsForTest(t, db)
 	if len(events) != 1 || events[0].Action != ActionRequestLogScrubStarted {
 		t.Fatalf("resume must not append another STARTED event: %+v", events)
+	}
+}
+
+func TestP108B_S7_MaintenanceCrossKindPendingFailsClosed(t *testing.T) {
+	t.Run("provider pending rejects scrub", func(t *testing.T) {
+		db := newAuditTestDB(t)
+		if _, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := beginMaintenanceForTest(t, db, MaintenanceKindRequestLogScrub); !errors.Is(err, ErrAuditIntegrity) {
+			t.Fatalf("scrub must reject a provider pending operation, got %v", err)
+		}
+		if got := countMaintenanceActionForTest(t, db, ActionRequestLogScrubStarted); got != 0 {
+			t.Fatalf("cross-kind rejection must not append scrub STARTED, got %d", got)
+		}
+		if got := countMaintenanceActionForTest(t, db, ActionProviderSecretMigrationStarted); got != 1 {
+			t.Fatalf("provider pending operation must remain exactly once, got %d", got)
+		}
+	})
+
+	t.Run("scrub pending rejects provider", func(t *testing.T) {
+		db := newAuditTestDB(t)
+		if _, err := beginMaintenanceForTest(t, db, MaintenanceKindRequestLogScrub); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration); !errors.Is(err, ErrAuditIntegrity) {
+			t.Fatalf("provider must reject a scrub pending operation, got %v", err)
+		}
+		if got := countMaintenanceActionForTest(t, db, ActionProviderSecretMigrationStarted); got != 0 {
+			t.Fatalf("cross-kind rejection must not append provider STARTED, got %d", got)
+		}
+		if got := countMaintenanceActionForTest(t, db, ActionRequestLogScrubStarted); got != 1 {
+			t.Fatalf("scrub pending operation must remain exactly once, got %d", got)
+		}
+	})
+}
+
+func TestP108B_S7_MaintenanceGlobalMultiplePendingFailsClosed(t *testing.T) {
+	db := newAuditTestDB(t)
+	providerID := uuid.NewString()
+	scrubID := uuid.NewString()
+	appendMaintenanceEventForTest(t, db, models.AuditEvent{
+		Action: ActionProviderSecretMigrationStarted, ActorType: "cli",
+		ActorID: "migrate-provider-secrets", TargetType: "maintenance-operation", TargetID: providerID,
+	})
+	appendMaintenanceEventForTest(t, db, models.AuditEvent{
+		Action: ActionRequestLogScrubStarted, ActorType: "cli",
+		ActorID: "scrub-request-log-content", TargetType: "maintenance-operation", TargetID: scrubID,
+	})
+	if _, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("provider begin must reject multiple global pending operations, got %v", err)
+	}
+	if _, err := beginMaintenanceForTest(t, db, MaintenanceKindRequestLogScrub); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("scrub begin must reject multiple global pending operations, got %v", err)
+	}
+	if got := countMaintenanceActionForTest(t, db, ActionProviderSecretMigrationStarted); got != 1 {
+		t.Fatalf("provider STARTED count changed after rejection: %d", got)
+	}
+	if got := countMaintenanceActionForTest(t, db, ActionRequestLogScrubStarted); got != 1 {
+		t.Fatalf("scrub STARTED count changed after rejection: %d", got)
+	}
+}
+
+func TestP108B_S7_MaintenanceCompletionRejectsCrossKindMultiplePending(t *testing.T) {
+	db := newAuditTestDB(t)
+	provider, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendMaintenanceEventForTest(t, db, models.AuditEvent{
+		Action: ActionRequestLogScrubStarted, ActorType: "cli",
+		ActorID: "scrub-request-log-content", TargetType: "maintenance-operation", TargetID: uuid.NewString(),
+	})
+	if err := completeMaintenanceForTest(t, db, provider); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("completion must reject cross-kind multiple pending operations, got %v", err)
+	}
+	if got := countMaintenanceActionForTest(t, db, ActionProviderSecretMigration); got != 0 {
+		t.Fatalf("rejected completion appended provider SUCCESS: %d", got)
+	}
+}
+
+func TestP108B_S7_MaintenanceCompletionRejectsForgedCrossKindTarget(t *testing.T) {
+	db := newAuditTestDB(t)
+	provider, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := MaintenanceOperation{
+		Kind:          MaintenanceKindRequestLogScrub,
+		ActorType:     "cli",
+		ActorID:       "scrub-request-log-content",
+		TargetType:    "maintenance-operation",
+		TargetID:      provider.TargetID,
+		StartedAction: ActionRequestLogScrubStarted,
+		SuccessAction: ActionRequestLogScrub,
+	}
+	if err := completeMaintenanceForTest(t, db, forged); !errors.Is(err, ErrAuditIntegrity) {
+		t.Fatalf("cross-kind forged target must fail closed, got %v", err)
+	}
+	if got := countMaintenanceActionForTest(t, db, ActionRequestLogScrub); got != 0 {
+		t.Fatalf("cross-kind forged target appended scrub SUCCESS: %d", got)
 	}
 }
 
@@ -372,12 +483,113 @@ func TestP108B_S7_MaintenanceConcurrentBeginNoFork(t *testing.T) {
 	}
 }
 
+func TestP108B_S7_MaintenanceConcurrentCrossKindBeginNoFork(t *testing.T) {
+	path := t.TempDir() + "/shared-cross-kind-maintenance.db"
+	seed := newMaintenanceHandle(t, path)
+	if err := MigrateIntegrity(seed); err != nil {
+		t.Fatal(err)
+	}
+	providerDB := newMaintenanceHandle(t, path)
+	scrubDB := newMaintenanceHandle(t, path)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := beginMaintenanceForTest(t, providerDB, MaintenanceKindProviderSecretMigration)
+		results <- err
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := beginMaintenanceForTest(t, scrubDB, MaintenanceKindRequestLogScrub)
+		results <- err
+	}()
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var successes, integrityFailures int
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrAuditIntegrity):
+			integrityFailures++
+		default:
+			t.Fatalf("unexpected concurrent cross-kind result: %v", err)
+		}
+	}
+	if successes != 1 || integrityFailures != 1 {
+		t.Fatalf("cross-kind concurrent begin must yield one success and one integrity failure: successes=%d integrityFailures=%d", successes, integrityFailures)
+	}
+	if got := countMaintenanceActionForTest(t, seed, ActionProviderSecretMigrationStarted) + countMaintenanceActionForTest(t, seed, ActionRequestLogScrubStarted); got != 1 {
+		t.Fatalf("cross-kind concurrent begin must append exactly one STARTED, got %d", got)
+	}
+}
+
+func TestP108B_S7_MaintenanceNewKindAllowedAfterCompletion(t *testing.T) {
+	db := newAuditTestDB(t)
+	provider, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := completeMaintenanceForTest(t, db, provider); err != nil {
+		t.Fatal(err)
+	}
+	db = newAuditTestDB(t)
+	scrub, err := beginMaintenanceForTest(t, db, MaintenanceKindRequestLogScrub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scrub.TargetID == provider.TargetID {
+		t.Fatal("new maintenance kind must receive a new operation UUID after prior completion")
+	}
+	if got := countMaintenanceActionForTest(t, db, ActionRequestLogScrubStarted); got != 1 {
+		t.Fatalf("expected one new scrub STARTED after provider completion, got %d", got)
+	}
+}
+
 func TestP108B_S7_MaintenancePrivacyCanaryAbsentFromEventAndRawDB(t *testing.T) {
 	db := newAuditTestDB(t)
 	canary := "P108B_MAINTENANCE_PRIVACY_CANARY"
+	if _, err := beginMaintenanceForTest(t, db, MaintenanceKind(canary)); err == nil {
+		t.Fatal("privacy canary maintenance kind must be rejected")
+	}
+	if events := maintenanceEventsForTest(t, db); len(events) != 0 {
+		t.Fatalf("rejected privacy canary kind changed audit history: %+v", events)
+	}
 	operation, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, forged := range []MaintenanceOperation{
+		func() MaintenanceOperation {
+			copy := operation
+			copy.ActorID = canary
+			return copy
+		}(),
+		func() MaintenanceOperation {
+			copy := operation
+			copy.TargetType = canary
+			return copy
+		}(),
+		func() MaintenanceOperation {
+			copy := operation
+			copy.StartedAction = canary
+			return copy
+		}(),
+		func() MaintenanceOperation {
+			copy := operation
+			copy.SuccessAction = canary
+			return copy
+		}(),
+	} {
+		if err := completeMaintenanceForTest(t, db, forged); !errors.Is(err, ErrAuditIntegrity) {
+			t.Fatalf("forged privacy correlation must be rejected: %+v got %v", forged, err)
+		}
 	}
 	if err := completeMaintenanceForTest(t, db, operation); err != nil {
 		t.Fatal(err)

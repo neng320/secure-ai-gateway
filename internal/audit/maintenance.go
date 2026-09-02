@@ -178,18 +178,16 @@ func loadMaintenanceStates(tx *gorm.DB) (map[MaintenanceKind]map[string]*mainten
 	return states, nil
 }
 
-func pendingMaintenanceOperations(states map[MaintenanceKind]map[string]*maintenanceState, kind MaintenanceKind) ([]MaintenanceOperation, error) {
-	spec, ok := maintenanceSpecForKind(kind)
-	if !ok {
-		return nil, fmt.Errorf("audit: unknown maintenance kind")
-	}
+func pendingMaintenanceOperations(states map[MaintenanceKind]map[string]*maintenanceState) ([]MaintenanceOperation, error) {
 	var pending []MaintenanceOperation
-	for targetID, state := range states[kind] {
-		if state.started != nil && !state.completed {
-			if err := validateMaintenanceEvent(*state.started, spec); err != nil {
-				return nil, err
+	for _, spec := range maintenanceSpecs {
+		for targetID, state := range states[spec.kind] {
+			if state.started != nil && !state.completed {
+				if err := validateMaintenanceEvent(*state.started, spec); err != nil {
+					return nil, err
+				}
+				pending = append(pending, maintenanceOperation(spec, targetID))
 			}
-			pending = append(pending, maintenanceOperation(spec, targetID))
 		}
 	}
 	if len(pending) > 1 {
@@ -220,11 +218,14 @@ func (s *Service) BeginMaintenanceTx(tx *gorm.DB, kind MaintenanceKind) (Mainten
 	if err != nil {
 		return MaintenanceOperation{}, err
 	}
-	pending, err := pendingMaintenanceOperations(states, kind)
+	pending, err := pendingMaintenanceOperations(states)
 	if err != nil {
 		return MaintenanceOperation{}, err
 	}
 	if len(pending) == 1 {
+		if pending[0].Kind != kind {
+			return MaintenanceOperation{}, ErrAuditIntegrity
+		}
 		return pending[0], nil
 	}
 
@@ -263,11 +264,11 @@ func (s *Service) CompleteMaintenanceTx(tx *gorm.DB, operation MaintenanceOperat
 	if err != nil {
 		return err
 	}
-	pending, err := pendingMaintenanceOperations(states, operation.Kind)
+	pending, err := pendingMaintenanceOperations(states)
 	if err != nil {
 		return err
 	}
-	if len(pending) != 1 || pending[0].TargetID != operation.TargetID {
+	if len(pending) != 1 || pending[0].Kind != operation.Kind || pending[0].TargetID != operation.TargetID {
 		return ErrAuditIntegrity
 	}
 	return s.RecordTx(tx, models.AuditEvent{
