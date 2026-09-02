@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -274,4 +275,180 @@ func TestP108B_S5_ResetPasswordAuditFailureRollsBack(t *testing.T) {
 	if leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".config.yaml.tmp-*")); err != nil || len(leftovers) != 0 {
 		t.Fatalf("reset left temporary files: %v err=%v", leftovers, err)
 	}
+}
+
+type resetAuditSnapshot struct {
+	Events []models.AuditEvent
+	Head   string
+}
+
+func newS7CorruptResetFixture(t *testing.T, corruption string) (configPath, dbPath, token, passwordHash string, beforeDB []byte, beforeAudit resetAuditSnapshot) {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath = filepath.Join(dir, "gateway.db")
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.MigrateIntegrity(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.AdminSession{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.NewService(db).Record(models.AuditEvent{
+		Action:     audit.ActionClientCreated,
+		ActorType:  "test",
+		ActorID:    "s7-reset",
+		TargetType: "client",
+		TargetID:   "s7-reset-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewSQLiteStore(db)
+	token, err = store.Create(context.Background(), "admin", time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+
+	configPath = writeS2Config(t, dir, dbPath, "")
+	cfg, err := config.LoadExistingForMigration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordHash = cfg.Admin.PasswordHash
+
+	db, err = database.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch corruption {
+	case "event":
+		if err := db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec("UPDATE audit_events SET event_hash = ? WHERE id = 1", strings.Repeat("a", 64)).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec("CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'AUDIT_EVENT_IMMUTABLE'); END").Error; err != nil {
+			t.Fatal(err)
+		}
+	case "state":
+		if err := db.Exec("UPDATE audit_chain_states SET head_hash = ? WHERE id = 1", strings.Repeat("b", 64)).Error; err != nil {
+			t.Fatal(err)
+		}
+	case "trigger":
+		if err := db.Exec("DROP TRIGGER audit_events_no_update").Error; err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unknown corruption %q", corruption)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+	beforeDB, err = os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAudit = readS7ResetAuditSnapshot(t, dbPath)
+	return configPath, dbPath, token, passwordHash, beforeDB, beforeAudit
+}
+
+func readS7ResetAuditSnapshot(t *testing.T, dbPath string) resetAuditSnapshot {
+	t.Helper()
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot resetAuditSnapshot
+	if err := db.Order("id ASC").Find(&snapshot.Events).Error; err != nil {
+		t.Fatal(err)
+	}
+	var state models.AuditChainState
+	if err := db.Where("id = ?", 1).First(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Head = state.HeadHash
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+	return snapshot
+}
+
+func assertS7ResetCorruptionFailsClosed(t *testing.T, corruption string) {
+	t.Helper()
+	configPath, dbPath, token, passwordHash, beforeDB, beforeAudit := newS7CorruptResetFixture(t, corruption)
+	canary := "P108B-S7-RESET-CORRUPTION-PASSWORD"
+	beforeConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err = runResetAdminPassword(configPath, newAdminPasswordReader(strings.NewReader(canary+"\n"), true), &out)
+	if err == nil {
+		t.Fatal("corrupt current audit was accepted")
+	}
+	if out.Len() != 0 {
+		t.Fatalf("failed reset wrote success output: %q", out.String())
+	}
+	if strings.Contains(err.Error()+out.String(), canary) {
+		t.Fatal("reset failure leaked password material")
+	}
+	afterConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterConfig, beforeConfig) {
+		t.Fatal("config changed after corrupt-audit rejection")
+	}
+	cfgAfter, err := config.LoadExistingForMigration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfgAfter.Admin.PasswordHash != passwordHash {
+		t.Fatal("password hash changed after corrupt-audit rejection")
+	}
+	afterAudit := readS7ResetAuditSnapshot(t, dbPath)
+	if !reflect.DeepEqual(afterAudit, beforeAudit) {
+		t.Fatalf("audit events/state changed after corrupt-audit rejection: before=%+v after=%+v", beforeAudit, afterAudit)
+	}
+	afterDB, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterDB, beforeDB) {
+		t.Fatal("corrupt audit was repaired or database changed")
+	}
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auth.NewSQLiteStore(db).Validate(context.Background(), token); err != nil {
+		t.Fatalf("session changed after corrupt-audit rejection: %v", err)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+	for _, pattern := range []string{".config.yaml.tmp-*", ".config.yaml.audit-mutation-lock"} {
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(configPath), pattern))
+		if err != nil || len(matches) != 0 {
+			t.Fatalf("temporary artifacts remain for %s: %v err=%v", pattern, matches, err)
+		}
+	}
+}
+
+func TestP108B_S7_ResetCurrentEventCorruptionFailsClosed(t *testing.T) {
+	assertS7ResetCorruptionFailsClosed(t, "event")
+}
+
+func TestP108B_S7_ResetCurrentStateCorruptionFailsClosed(t *testing.T) {
+	assertS7ResetCorruptionFailsClosed(t, "state")
+}
+
+func TestP108B_S7_ResetCurrentTriggerCorruptionFailsClosed(t *testing.T) {
+	assertS7ResetCorruptionFailsClosed(t, "trigger")
 }

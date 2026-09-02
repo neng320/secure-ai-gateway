@@ -49,7 +49,7 @@ var (
 	commit       = "unknown"
 	buildTime    = "unknown"
 	setupMode    = flag.Bool("setup", false, "Run setup wizard")
-	resetPw      = flag.Bool("reset-password", false, "Reset admin password using hidden TTY input or explicit stdin mode")
+	resetPw      = flag.Bool("reset-password", false, "Offline operation: gateway must be stopped; restart required after reset (hidden TTY or explicit stdin mode)")
 	resetPwStdin = flag.Bool("reset-password-stdin", false, "Read the reset password from stdin (requires -reset-password)")
 	migrateSec   = flag.Bool("migrate-provider-secrets", false, "Offline migration: encrypt provider secrets (PREPARE/VERIFY/FINALIZE), then exit")
 	// P1-04D：显式离线 scrub——清除 request_logs legacy 正文/错误文本（不可逆，需二次确认）

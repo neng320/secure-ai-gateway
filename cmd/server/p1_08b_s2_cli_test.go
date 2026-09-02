@@ -321,6 +321,36 @@ func TestP108B_S2_StartupOrderStaticGate(t *testing.T) {
 	}
 }
 
+func TestP108B_S7_ResetPasswordOfflineContractStatic(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	resetDispatch := strings.Index(text, "if *resetPw || *resetPwStdin")
+	loggerInit := strings.Index(text, "logger.Init(")
+	if resetDispatch < 0 || loggerInit < 0 || resetDispatch > loggerInit {
+		t.Fatalf("reset dispatch must precede runtime/logger initialization: reset=%d logger=%d", resetDispatch, loggerInit)
+	}
+	for _, phrase := range []string{"Offline operation", "gateway must be stopped", "restart required"} {
+		if !strings.Contains(text, phrase) {
+			t.Fatalf("reset help is missing offline contract phrase %q", phrase)
+		}
+	}
+	if strings.Contains(strings.ToLower(text), "verifies the gateway is stopped") {
+		t.Fatal("reset help must not claim cross-process stopped-state verification")
+	}
+
+	resetSource, err := os.ReadFile("reset_password.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetText := strings.ToLower(string(resetSource))
+	if !strings.Contains(resetText, "password reset completed") || !strings.Contains(resetText, "restart gateway before use") {
+		t.Fatal("reset success output must state completion and restart requirement")
+	}
+}
+
 func assertS21CurrentTriggerStartupFails(t *testing.T, triggerNames ...string) {
 	t.Helper()
 	db, dbPath, _ := newS2MigratedDB(t)

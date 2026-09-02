@@ -184,6 +184,6 @@ func runResetAdminPasswordWithAuditDBOpener(configPath string, readPassword func
 	}); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "Admin password has been reset")
+	fmt.Fprintln(stdout, "Password reset completed. Restart gateway before use.")
 	return nil
 }
