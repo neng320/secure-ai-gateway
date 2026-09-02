@@ -185,6 +185,20 @@ paths; they do not create a cross-storage transaction or a power-loss proof.
 
 ### Credentials, login, capture, and reset
 
+The capture-read contract is:
+
+~~~text
+capture exists
+→ audit REQUEST_BODY_CAPTURE_READ
+→ re-check capture
+→ disclose only if still available
+~~~
+
+If the capture expires during the audit operation, the HTTP result is 404,
+BODY_DISCLOSED=false, and AUDIT_EVENT_REMAINS=true. The event proves that the
+privileged read crossed the audit boundary; it does not guarantee that the body
+was ultimately disclosed. The audit event contains no request body.
+
 Credential generation uses one crypto/rand-backed bounded generator. Session
 secret and Prometheus password generation errors are fail closed: config,
 runtime state, and audit history remain unchanged, and no success output is

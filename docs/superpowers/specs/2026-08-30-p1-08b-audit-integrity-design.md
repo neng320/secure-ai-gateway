@@ -1,6 +1,6 @@
 # P1-08B Audit Integrity Enforcement Design
 
-**Status:** approved design for implementation
+**Status:** implemented; delivery verifying
 
 **Baseline:** `develop@ce2b85480500a898b282dac079375260b29ba52f`
 
@@ -161,7 +161,7 @@ REQUEST_LOG_SCRUB_STARTED
 REQUEST_LOG_SCRUB
 ```
 
-Admin HTTP actions derive actor identity from the authenticated server-side session/configuration boundary. They never accept actor fields from form, query, headers, or request JSON. CLI actions use `ActorType=CLI` or `ActorType=SYSTEM` with a deterministic safe identifier. Failed login attempts remain non-persistent and rate-limited to avoid unauthenticated audit write amplification; the ADR records this deliberate policy.
+Admin HTTP actions derive actor identity from the authenticated server-side session/configuration boundary. They never accept actor fields from form, query, headers, or request JSON. CLI management and maintenance actions use `ActorType=cli` with a deterministic safe ActorID. No SYSTEM actor is claimed by this design. Failed login attempts remain non-persistent and rate-limited to avoid unauthenticated audit write amplification; the ADR records this deliberate policy.
 
 Each successful action is appended exactly once. Failed operations do not append success events.
 
@@ -215,6 +215,20 @@ file, renames it, and fsyncs its containing directory; a post-rename directory
 sync failure enters compensation, including an explicit restore-failure error.
 
 ## Privacy boundary
+
+The capture-read contract is:
+
+~~~text
+capture exists
+→ audit REQUEST_BODY_CAPTURE_READ
+→ re-check capture
+→ disclose only if still available
+~~~
+
+If the capture expires during the audit operation, the HTTP result is 404,
+BODY_DISCLOSED=false, and AUDIT_EVENT_REMAINS=true. The event proves that the
+privileged read crossed the audit boundary; it does not guarantee that the body
+was ultimately disclosed. The audit event contains no request body.
 
 Audit rows contain only bounded metadata and reason. They never contain plaintext or hashed API keys, provider/master secrets, Authorization, cookies, sessions, CSRF tokens, prompts, responses, request bodies/headers, config dumps, arbitrary payloads, or raw upstream errors. Diagnostic capture reads record only actor/action/safe target/timestamp, never the captured body. Secret canaries scan database rows and raw database files.
 

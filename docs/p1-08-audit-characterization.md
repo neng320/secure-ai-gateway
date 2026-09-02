@@ -189,6 +189,20 @@ must not be reported as an unqualified success.
 
 ### Privacy and lifecycle contracts
 
+The capture-read contract is:
+
+~~~text
+capture exists
+→ audit REQUEST_BODY_CAPTURE_READ
+→ re-check capture
+→ disclose only if still available
+~~~
+
+If the capture expires during the audit operation, the HTTP result is 404,
+BODY_DISCLOSED=false, and AUDIT_EVENT_REMAINS=true. The event proves that the
+privileged read crossed the audit boundary; it does not guarantee that the body
+was ultimately disclosed. The audit event contains no request body.
+
 Failed login attempts remain deliberately non-persistent. Captured request bodies
 remain memory-only and are never copied into audit events. Credential generation
 is shared and fail-closed on entropy errors; no success output precedes
