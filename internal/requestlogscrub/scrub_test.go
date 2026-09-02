@@ -276,6 +276,15 @@ func assertRequestLogBytes(t *testing.T, f *scrubFixture, want []byte) {
 	}
 }
 
+func phaseIndex(phases []string, want string) int {
+	for index, phase := range phases {
+		if phase == want {
+			return index
+		}
+	}
+	return -1
+}
+
 func TestP108B_S7_LegacyAuditPrerequisiteAndCompletion(t *testing.T) {
 	f := newScrubFixture(t)
 	f.seedLegacyRows(t, false)
@@ -311,6 +320,54 @@ func TestP108B_S7_LegacyAuditPrerequisiteAndCompletion(t *testing.T) {
 		t.Fatalf("completed scrub left invalid audit chain: %v", err)
 	}
 	closeGormTestDB(t, db)
+}
+
+func TestP108B_S7_WALCheckpointRunsAfterExclusiveOwnership(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, true)
+	competitor, err := sql.Open("sqlite3", f.dbPath+"?_busy_timeout=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer competitor.Close()
+	assertBlocked := func() error {
+		conn, err := competitor.Conn(context.Background())
+		if err != nil {
+			return nil
+		}
+		defer conn.Close()
+		if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err == nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			return errors.New("competitor acquired ownership")
+		}
+		return nil
+	}
+	res, err := runWithHooks(Options{ConfigPath: f.cfgPath}, scrubHooks{
+		afterExclusive: func(*sql.Conn) error { return assertBlocked() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exclusive := phaseIndex(res.Phases, "EXCLUSIVE")
+	checkpoint := phaseIndex(res.Phases, "WAL-CHECKPOINT")
+	if exclusive < 0 || checkpoint < 0 || exclusive >= checkpoint {
+		t.Fatalf("WAL checkpoint did not follow exclusive ownership: phases=%v", res.Phases)
+	}
+}
+
+func TestP108B_S7_ProductionPhysicalVerifyPrecedesLogicalAndSuccess(t *testing.T) {
+	f := newScrubFixture(t)
+	f.seedLegacyRows(t, false)
+	res, err := Run(Options{ConfigPath: f.cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vacuum := phaseIndex(res.Phases, "VACUUM")
+	physical := phaseIndex(res.Phases, "PHYSICAL-VERIFIED")
+	success := phaseIndex(res.Phases, "SUCCESS")
+	if vacuum < 0 || physical < 0 || success < 0 || !(vacuum < physical && physical < success) {
+		t.Fatalf("production physical verification ordering mismatch: phases=%v", res.Phases)
+	}
 }
 
 func TestP108B_S7_CurrentAuditEventCorruptionFailsBeforeScrub(t *testing.T) {
@@ -469,6 +526,14 @@ func TestP108B_S7_VerificationFailureLeavesPendingStarted(t *testing.T) {
 	events := f.maintenanceEvents(t)
 	if len(events) != 1 || events[0].Action != audit.ActionRequestLogScrubStarted {
 		t.Fatalf("verification failure must leave pending STARTED: %+v", events)
+	}
+	firstTarget := events[0].TargetID
+	if _, err := Run(Options{ConfigPath: f.cfgPath}); err != nil {
+		t.Fatalf("rerun after verification failure failed: %v", err)
+	}
+	events = f.maintenanceEvents(t)
+	if len(events) != 2 || events[0].TargetID != firstTarget || events[1].TargetID != firstTarget || events[1].Action != audit.ActionRequestLogScrub {
+		t.Fatalf("verification failure rerun did not reuse target and complete: %+v", events)
 	}
 }
 

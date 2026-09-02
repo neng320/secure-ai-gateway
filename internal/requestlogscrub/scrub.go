@@ -16,9 +16,12 @@
 package requestlogscrub
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -46,6 +49,7 @@ type Result struct {
 }
 
 type scrubHooks struct {
+	afterExclusive    func(*sql.Conn) error
 	beforeMaintenance func(*sql.Conn) error
 	vacuum            func(*sql.Conn) error
 	verify            func(*sql.Conn) error
@@ -105,18 +109,22 @@ func runWithHooks(opts Options, hooks scrubHooks) (*Result, error) {
 		return nil, fmt.Errorf("scrub: read journal_mode: %w", err)
 	}
 	isWAL := strings.EqualFold(journalMode, "wal")
+	if err := pinned.AcquireExclusive(); err != nil {
+		return nil, fmt.Errorf("scrub: database is in use (exclusive lock unavailable) — "+
+			"stop the gateway / close other connections and retry: %w (REQUEST_LOG_SCRUB_OFFLINE_REQUIRED)", err)
+	}
+	res.Phases = append(res.Phases, "EXCLUSIVE")
+	if hooks.afterExclusive != nil {
+		if err := hooks.afterExclusive(pinned.Conn); err != nil {
+			return nil, err
+		}
+	}
 	if isWAL {
 		if err := walCheckpointTruncate(pinned.Conn); err != nil {
 			return nil, err // 含 OFFLINE_REQUIRED 语义
 		}
 		res.Phases = append(res.Phases, "WAL-CHECKPOINT")
 	}
-
-	if err := pinned.AcquireExclusive(); err != nil {
-		return nil, fmt.Errorf("scrub: database is in use (exclusive lock unavailable) — "+
-			"stop the gateway / close other connections and retry: %w (REQUEST_LOG_SCRUB_OFFLINE_REQUIRED)", err)
-	}
-	res.Phases = append(res.Phases, "EXCLUSIVE")
 
 	// schema checks are read-only, but happen after ownership is established so
 	// no unlocked DB handle exists in the maintenance path.
@@ -211,11 +219,15 @@ func runWithHooks(opts Options, hooks scrubHooks) (*Result, error) {
 	}
 	res.Phases = append(res.Phases, "VACUUM")
 
+	if err := verifyPhysicalScrubState(pinned.Conn, dbPath); err != nil {
+		return nil, err
+	}
 	if hooks.verify != nil {
 		if err := hooks.verify(pinned.Conn); err != nil {
 			return nil, err
 		}
 	}
+	res.Phases = append(res.Phases, "PHYSICAL-VERIFIED")
 	remain, err := queryCountConn(pinned.Conn, "SELECT count(*) FROM request_logs WHERE request_body != '' OR error_message != ''")
 	if err != nil {
 		return nil, fmt.Errorf("scrub: verify: %w", err)
@@ -298,6 +310,54 @@ func queryCountTx(tx *gorm.DB, query string) (int64, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+func verifyPhysicalScrubState(conn *sql.Conn, dbPath string) error {
+	var journalMode string
+	if err := conn.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		return fmt.Errorf("scrub: physical verify journal mode: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "delete") {
+		return fmt.Errorf("scrub: physical verify requires DELETE journal mode, got %q", journalMode)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(dbPath + suffix); err == nil {
+			return fmt.Errorf("scrub: physical verify found residual %s sidecar", suffix)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("scrub: physical verify sidecar check: %w", err)
+		}
+	}
+	if err := verifyInactiveJournal(dbPath + "-journal"); err != nil {
+		return err
+	}
+	var integrity string
+	if err := conn.QueryRowContext(context.Background(), "PRAGMA integrity_check").Scan(&integrity); err != nil {
+		return fmt.Errorf("scrub: physical verify integrity check: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(integrity), "ok") {
+		return fmt.Errorf("scrub: physical verify integrity check failed")
+	}
+	return nil
+}
+
+func verifyInactiveJournal(path string) error {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("scrub: physical verify sidecar check: %w", err)
+	}
+	defer file.Close()
+	header := make([]byte, 8)
+	read, err := io.ReadFull(file, header)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("scrub: physical verify journal header: %w", err)
+	}
+	if read > 0 && !bytes.Equal(header[:read], make([]byte, read)) {
+		return fmt.Errorf("scrub: physical verify found active -journal sidecar")
+	}
+	return nil
 }
 
 func tableExistsConn(conn *sql.Conn, table string) (bool, error) {
