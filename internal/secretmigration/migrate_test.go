@@ -998,16 +998,110 @@ func TestP108B_S7_MaintenanceAuditPrivacyCanary(t *testing.T) {
 	f := newFixture(t)
 	f.addGlobal(t, "openai", canaryGlobal, "")
 	f.addClient(t, "client-a", canaryClientA, "")
+	masterKeyCanary := []byte("P108B_MASTER_KEY_CANARY_12345678")
+	if len(masterKeyCanary) != secrets.KeySize {
+		t.Fatalf("master key canary length=%d, want %d", len(masterKeyCanary), secrets.KeySize)
+	}
 	backupDir := filepath.Join(f.dir, "backups")
-	if _, err := Run(s7OptionsWithKey(t, f, backupDir)); err != nil {
+	if _, err := Run(Options{
+		ConfigPath: f.cfgPath,
+		BackupDir:  backupDir,
+		MasterKey:  masterKeyCanary,
+		Now:        func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	}); err != nil {
 		t.Fatal(err)
 	}
-	for _, event := range s7ProviderEvents(t, f.db) {
-		serialized := strings.Join([]string{event.EventID, event.Action, event.ActorType, event.ActorID, event.TargetType, event.TargetID, event.Reason, event.CreatedAt.String(), event.ChainVersion, event.PrevHash, event.EventHash}, "|")
-		for _, secret := range []string{canaryGlobal, canaryClientA, testMasterKeyB64, f.cfgPath, backupDir} {
+	cfg := reloadConfig(t, f)
+	actualGlobalEnvelope := cfg.Providers["openai"].APIKeyEncrypted
+	_, actualClientEnvelope := s7ClientSecrets(t, f, "client-a")
+	if actualGlobalEnvelope == "" || !secrets.IsEncryptedEnvelope(actualGlobalEnvelope) {
+		t.Fatalf("missing actual global envelope: %q", actualGlobalEnvelope)
+	}
+	if actualClientEnvelope == "" || !secrets.IsEncryptedEnvelope(actualClientEnvelope) {
+		t.Fatalf("missing actual client envelope: %q", actualClientEnvelope)
+	}
+
+	// Preserve the model-level assertion: exactly one trusted STARTED/SUCCESS pair.
+	modelEvents := s7ProviderEvents(t, f.db)
+	if len(modelEvents) != 2 || modelEvents[0].Action != audit.ActionProviderSecretMigrationStarted || modelEvents[1].Action != audit.ActionProviderSecretMigration {
+		t.Fatalf("unexpected provider maintenance pair: %+v", modelEvents)
+	}
+	for _, event := range modelEvents {
+		if event.Reason != "" || event.ActorType != "cli" || event.ActorID != "migrate-provider-secrets" || event.TargetType != "maintenance-operation" || event.TargetID == "" {
+			t.Fatalf("unexpected trusted maintenance identity: %+v", event)
+		}
+	}
+	if modelEvents[0].TargetID != modelEvents[1].TargetID {
+		t.Fatalf("maintenance pair TargetID mismatch: %+v", modelEvents)
+	}
+
+	// Read the persisted audit columns directly, including all chain fields.
+	type persistedProviderAuditRow struct {
+		EventID      string
+		Action       string
+		ActorType    string
+		ActorID      string
+		TargetType   string
+		TargetID     string
+		Reason       string
+		CreatedAt    string
+		ChainVersion string
+		PrevHash     string
+		EventHash    string
+	}
+	rows, err := f.db.Raw(`SELECT event_id, action, actor_type, actor_id, target_type, target_id, reason, created_at, chain_version, prev_hash, event_hash
+		FROM audit_events
+		WHERE action IN (?, ?)
+		ORDER BY id ASC`, audit.ActionProviderSecretMigrationStarted, audit.ActionProviderSecretMigration).Rows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var persisted []persistedProviderAuditRow
+	for rows.Next() {
+		var row persistedProviderAuditRow
+		if err := rows.Scan(&row.EventID, &row.Action, &row.ActorType, &row.ActorID, &row.TargetType, &row.TargetID, &row.Reason, &row.CreatedAt, &row.ChainVersion, &row.PrevHash, &row.EventHash); err != nil {
+			t.Fatal(err)
+		}
+		persisted = append(persisted, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 2 {
+		t.Fatalf("persisted provider audit row count=%d, want 2", len(persisted))
+	}
+	for i, row := range persisted {
+		if row.Action != modelEvents[i].Action || row.EventID != modelEvents[i].EventID || row.ActorType != modelEvents[i].ActorType || row.ActorID != modelEvents[i].ActorID || row.TargetType != modelEvents[i].TargetType || row.TargetID != modelEvents[i].TargetID || row.Reason != modelEvents[i].Reason || row.ChainVersion != modelEvents[i].ChainVersion || row.PrevHash != modelEvents[i].PrevHash || row.EventHash != modelEvents[i].EventHash {
+			t.Fatalf("raw persisted row %d does not match model event: row=%+v model=%+v", i, row, modelEvents[i])
+		}
+		serialized := strings.Join([]string{row.EventID, row.Action, row.ActorType, row.ActorID, row.TargetType, row.TargetID, row.Reason, row.CreatedAt, row.ChainVersion, row.PrevHash, row.EventHash}, "|")
+		for _, secret := range []string{canaryGlobal, canaryClientA, actualGlobalEnvelope, actualClientEnvelope, string(masterKeyCanary), f.cfgPath, backupDir} {
 			if strings.Contains(serialized, secret) {
-				t.Fatalf("maintenance audit event leaked sensitive value %q: %+v", secret, event)
+				t.Fatalf("persisted maintenance audit row leaked sensitive value %q: %+v", secret, row)
 			}
+		}
+	}
+
+	// Whole-file SQLite scan excludes only values that cannot legitimately live in
+	// the database. Client ciphertext is intentionally not included here: it is a
+	// valid clients-table value and is covered by the persisted audit-row scan above.
+	rawDB, err := os.ReadFile(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []struct {
+		name  string
+		value string
+	}{
+		{name: "master key", value: string(masterKeyCanary)},
+		{name: "config path", value: f.cfgPath},
+		{name: "backup path", value: backupDir},
+		{name: "global plaintext", value: canaryGlobal},
+		{name: "global envelope", value: actualGlobalEnvelope},
+	} {
+		if bytes.Contains(rawDB, []byte(secret.value)) {
+			t.Fatalf("raw SQLite file contains forbidden %s canary %q", secret.name, secret.value)
 		}
 	}
 }
