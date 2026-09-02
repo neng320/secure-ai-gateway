@@ -142,7 +142,7 @@ Normal startup runs audit schema migration/backfill, trigger installation, and c
 
 ## Management audit coverage and actor policy
 
-The fixed action constants will cover the six existing lifecycle actions plus:
+The implementation covers the six existing lifecycle actions plus:
 
 ```text
 CLIENT_SETTINGS_UPDATED
@@ -155,11 +155,23 @@ SETUP_COMPLETED
 REQUEST_BODY_CAPTURE_READ
 ADMIN_PASSWORD_RESET
 GLOBAL_PROVIDER_SECRET_CHANGED
+PROVIDER_SECRET_MIGRATION_STARTED
+PROVIDER_SECRET_MIGRATION
+REQUEST_LOG_SCRUB_STARTED
+REQUEST_LOG_SCRUB
 ```
 
 Admin HTTP actions derive actor identity from the authenticated server-side session/configuration boundary. They never accept actor fields from form, query, headers, or request JSON. CLI actions use `ActorType=CLI` or `ActorType=SYSTEM` with a deterministic safe identifier. Failed login attempts remain non-persistent and rate-limited to avoid unauthenticated audit write amplification; the ADR records this deliberate policy.
 
 Each successful action is appended exactly once. Failed operations do not append success events.
+
+Provider-secret migration and request-log scrub use a durable STARTED event and
+a terminal operation event. The actor is trusted CLI context, and the target is
+a server-generated UUID of type maintenance-operation; the target is never
+supplied by a user. Pending lookup, the resume/new decision, and the STARTED
+append are performed inside the operation's authoritative serialization
+boundary. Multiple pending operations fail closed, while a rerun resumes the
+existing target instead of creating a second operation.
 
 ## Atomicity
 
@@ -177,13 +189,38 @@ capture prior config bytes/state
 
 A config persistence failure produces no success event. Tests inject both post-write audit failure and config-write failure.
 
+Provider-secret migration has the following durable ordering:
+
+~~~text
+audit schema and integrity prerequisite
+→ committed PROVIDER_SECRET_MIGRATION_STARTED
+→ recovery backup containing the current database/audit state
+→ prepare and verify provider mutations
+→ final config persistence plus SQLite client finalization
+→ committed PROVIDER_SECRET_MIGRATION success
+~~~
+
+The backup is not created if the integrity prerequisite or STARTED append
+fails. A backup failure may leave a pending STARTED operation; a later run
+reuses its target ID and fails closed unless recovery can complete. The SQLite
+and configuration/backup steps are not one cross-storage transaction, so crash
+windows are represented by pending state and compensation rather than a false
+claim of atomicity.
+
+Request-log scrub obtains offline exclusive SQLite ownership, appends
+REQUEST_LOG_SCRUB_STARTED and commits the logical scrub, then performs VACUUM
+and physical/logical verification before appending the terminal event. The
+destructive scrub is not reversible. Configuration AtomicReplace fsyncs the
+file, renames it, and fsyncs its containing directory; a post-rename directory
+sync failure enters compensation, including an explicit restore-failure error.
+
 ## Privacy boundary
 
 Audit rows contain only bounded metadata and reason. They never contain plaintext or hashed API keys, provider/master secrets, Authorization, cookies, sessions, CSRF tokens, prompts, responses, request bodies/headers, config dumps, arbitrary payloads, or raw upstream errors. Diagnostic capture reads record only actor/action/safe target/timestamp, never the captured body. Secret canaries scan database rows and raw database files.
 
 ## Viewer
 
-`GET /admin/audit` is Admin-authenticated, read-only, `Cache-Control: no-store`, and uses bounded pagination with a maximum page size of 100. Filters are typed safe fields only: action, actor, target type/id, and before/after timestamps. No SQL-like filter, mutation route, clear/delete/update control, or non-schema payload is exposed.
+`GET /admin/audit` is Admin-authenticated, read-only, `Cache-Control: no-store`, and uses bounded keyset pagination with a maximum page size of 100. The only filters are the exact typed fields `before_id`, `limit`, `action`, `actor_type`, `actor_id`, `target_type`, and `target_id`; timestamp filters are not exposed. No SQL-like filter, mutation route, clear/delete/update control, or non-schema payload is exposed.
 
 ## Slice sequence
 
@@ -195,7 +232,9 @@ All slices remain one `TASK_ID=P1-08B`, one branch, and one PR. A slice may have
 4. Config-backed mutation protocol, exact restoration, and fault injection.
 5. Login/logout/setup/capture-read, password stdin/TTY, and privacy canaries.
 6. Read-only Admin viewer and static regression gates.
-7. ADR-010, characterization resolution, scope truthfulness, full verification, one PR merge, fresh clone, and final annotated tag.
+7. ADR-010, characterization resolution, scope truthfulness, and full local
+   verification. Delivery review, PR/CI, merge, fresh-clone verification, and
+   the final annotated tag are separate authorized closure steps.
 
 ## Stop conditions
 

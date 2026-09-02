@@ -394,6 +394,67 @@ internal/
 
 ---
 
+## Audit Integrity and Maintenance Operations
+
+P1-08B audit events are bounded metadata, not an application data dump. The v1
+SHA-256 chain binds each event to its predecessor and to the singleton chain
+head. Database UPDATE and DELETE triggers protect the event rows during normal
+operation. The chain detects in-scope edits and broken links, but it does not
+protect against a root or database owner who can replace the database, alter its
+schema, or remove the triggers.
+
+Normal startup verifies the audit schema and chain before binding any listener.
+For a read-only offline check, use:
+
+~~~bash
+./ai-gateway -verify-audit-log -config /path/to/config.yaml
+~~~
+
+This command never migrates or repairs the database. An unmigrated database
+returns an explicit audit schema/migration required failure. Do not expose its
+output as event content.
+
+### Admin audit viewer
+
+Authenticated administrators can use GET /admin/audit. It is read-only,
+no-store, HTML-escaped, and limited to 100 rows per page. Supported typed
+filters are before_id, limit, action, actor_type, actor_id, target_type, and
+target_id. There are no timestamp filters and no delete, clear, update, prune,
+or export endpoint.
+
+### Provider-secret migration
+
+Provider-secret migration is an offline maintenance operation. Its protocol
+records a trusted CLI STARTED event, creates a recovery backup containing the
+current database/audit state, prepares and verifies the mutation, then
+finalizes configuration and SQLite state with terminal success evidence. The
+audit prerequisite and STARTED event occur before the backup. A backup failure
+may leave pending STARTED evidence; rerunning resumes the same operation ID.
+Multiple pending operations fail closed. Secrets are never placed in audit
+events. SQLite, configuration, and backup files do not share one transaction,
+so power-loss atomicity is not claimed.
+
+### Request-log scrub
+
+Legacy request-body scrub is an offline, destructive operation. It holds
+exclusive SQLite ownership through the logical update and its verification
+boundary, then VACUUMs and records terminal success. The scrub is irreversible;
+there is no online gateway-stop proof, so the operator must keep the gateway
+offline for the complete operation. Reruns resume the existing maintenance
+operation rather than creating a second one.
+
+### Password reset and credentials
+
+Password reset is offline-only: the gateway must be stopped, and it must be
+restarted before the new password is used. Hot reload is unsupported. The
+implementation does not claim to enforce or prove a separately running
+process's stop state. Credential generation fails closed on entropy errors;
+configuration, runtime state, and audit history remain unchanged on failure.
+
+Audit retention is indefinite in v1. There is intentionally no audit deletion,
+clear, prune, or export API. Any future archive or retention feature requires
+a separate design and integrity review.
+
 ## License
 
 MIT

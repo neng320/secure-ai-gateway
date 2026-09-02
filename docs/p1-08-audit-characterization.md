@@ -116,6 +116,93 @@ At this baseline, “append-only” means an application convention:
 
 There are no `audit_events` immutability triggers, hash-chain columns, canonical event digest, trusted chain-head record, startup verification, offline verification, or retention controls. The database integrity boundary is therefore explicitly incomplete and remains a P1-08B acceptance item.
 
+## P1-08B resolution / implementation evidence
+
+The preceding sections are the immutable P1-08A characterization: they describe
+the behavior at the P1-07B baseline and intentionally do not retroactively claim
+that P1-08B controls existed there. This section records the implementation that
+resolved those findings on the P1-08B task branch.
+
+### Management-action coverage
+
+| Action | P1-08A baseline | P1-08B resolution | Evidence boundary |
+|---|---|---|---|
+| Client lifecycle (create, rotate, suspend, resume, revoke, delete) | Six events existed | Preserved; each mutation and event remains one SQLite transaction | P1-05C lifecycle tests plus audit-chain tests |
+| Client settings update | Missing | Dedicated bounded update and one metadata event | Handler/service audit tests |
+| Client provider secret set/clear | Missing | Dedicated metadata-only event; secret material is excluded | Secret/privacy canaries and rollback tests |
+| Client models update | Missing | Bounded update and one metadata event | Models/update tests |
+| Server tools update | Missing | Config mutation audit with compensation | Config audit tests |
+| Admin login success / logout | Missing | Successful session operations are audited | Handler audit tests |
+| Failed admin login | Missing | Deliberately non-persistent; rate limiting remains the abuse control | Login privacy characterization |
+| Setup completed | Missing | Successful setup is audited after durable persistence | Setup audit tests |
+| Diagnostic capture read | Missing | Successful privileged read is audited; body is never included | Capture-read privacy tests |
+| Admin password reset | Missing | Offline CLI audit with config compensation | Reset contract and corruption tests |
+| Global provider secret set/replace | Missing | Config-backed metadata-only audit with entropy fail-closed behavior | Provisioning tests |
+| Provider-secret migration | Missing | STARTED plus terminal maintenance event, trusted CLI actor, recovery target, and resume protocol | Migration recovery/rollback tests |
+| Request-log scrub | Missing | STARTED plus terminal maintenance event under offline exclusive ownership | Scrub ownership/VACUUM tests |
+
+Provider migration and request-log scrub use the fixed actions
+PROVIDER_SECRET_MIGRATION_STARTED, PROVIDER_SECRET_MIGRATION,
+REQUEST_LOG_SCRUB_STARTED, and REQUEST_LOG_SCRUB. Each maintenance target is a
+server-generated UUID of type maintenance-operation. It is correlation data, not
+user input, and audit rows contain no provider secret, config bytes, request body,
+or other arbitrary payload.
+
+### Integrity and verification resolution
+
+P1-08B adds the v1 canonical SHA-256 event chain, singleton chain-state head,
+SQLite writer serialization before reading the head, deterministic ID-ascending
+legacy backfill, and database UPDATE/DELETE guards. Migration accepts only a
+fully unchained legacy history or a fully valid chained history; mixed/partial or
+corrupt states fail closed. Verification checks both every event link and the
+chain-state head.
+
+Normal startup completes the dedicated audit migration and verification before
+listener construction. The read-only verify-audit-log command uses a separate
+read-only open path and returns an audit schema/migration-required failure for an
+unmigrated legacy database; it never migrates or repairs data.
+
+The Admin audit viewer is read-only, Admin-authenticated, no-store, HTML-escaped,
+and bounded to 100 rows. Its exact filters are before_id, limit, action,
+actor_type, actor_id, target_type, and target_id. It has no timestamp filters and
+no delete, clear, update, export, or retention mutation surface.
+
+### Atomicity and operational limits
+
+SQLite-backed mutations retain same-transaction audit semantics. Config-file
+mutations use exact-byte compensation because filesystem writes cannot join a
+SQLite transaction. AtomicReplace fsyncs the file, renames it, and fsyncs the
+containing directory; a post-rename directory-sync failure enters compensation,
+and restore failure is reported as a stable fail-closed error.
+
+Provider migration orders audit integrity prerequisite, committed STARTED event,
+recovery backup, prepare/verify, final config/SQLite mutation, and terminal
+success evidence. A backup failure may leave pending STARTED evidence; reruns
+reuse its target ID. Scrub obtains offline exclusive SQLite ownership, commits
+the logical scrub, then VACUUMs and verifies physical/logical state before
+terminal success. Scrub is irreversible.
+
+These protocols provide explicit compensation and recovery states, not a single
+cross-storage transaction or a power-loss atomicity guarantee. A crash between
+SQLite and filesystem commit points is represented as pending/recovery state and
+must not be reported as an unqualified success.
+
+### Privacy and lifecycle contracts
+
+Failed login attempts remain deliberately non-persistent. Captured request bodies
+remain memory-only and are never copied into audit events. Credential generation
+is shared and fail-closed on entropy errors; no success output precedes
+persistence. Password reset is an offline CLI operation: the gateway must be
+stopped, a restart is required, hot reload is unsupported, and the implementation
+does not claim cross-process stop proof. Audit retention is indefinite for v1:
+there is no delete, clear, prune, or export API. The threat boundary does not
+claim protection from a root/database owner who can replace the database or alter
+its schema.
+
 ## P1-08B handoff
 
-P1-08B may use this document and the characterization tests as its baseline contract. It must define and test the database-level immutability/tamper-evidence design, complete management-action coverage, and verification/viewer behavior without introducing secret or request-body payloads into audit records. Any change to the six P1-05C lifecycle semantics requires a separate scope decision.
+P1-08B used this document and the characterization tests as its baseline
+contract. The resolution evidence above defines and tests the database-level
+immutability/tamper-evidence design, complete management-action coverage, and
+verification/viewer behavior without introducing secret or request-body payloads
+into audit records. The six P1-05C lifecycle semantics remain unchanged.

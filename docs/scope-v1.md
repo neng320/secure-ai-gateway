@@ -76,15 +76,24 @@ P1-07 overall：✅ COMPLETE
   P1-08 不在本任务范围内。
 ```
 
-### P1-08 Audit Logging 执行状态（2026-08-30）
+### P1-08 Audit Logging 执行状态（2026-09-02）
 
 ```text
 P1-08A Audit Logging Characterization ✅（当前分支；tests/docs only）
   固化 P1-05C 六个 lifecycle action、同事务 rollback、无 FK 保留、
   application-only append-only 边界，以及登录/配置/诊断/离线操作的审计缺口。
-P1-08B Audit Logging Enforcement ⛔ NOT STARTED
-P1-08 overall：🟡 VERIFYING（不得视为 COMPLETE）
+P1-08B implementation：✅ COMPLETE
+  完成：tamper-evident v1 hash chain、SQLite chain-state serialization、
+  deterministic legacy backfill、immutable UPDATE/DELETE guards、startup
+  verification、只读 -verify-audit-log、完整 management/maintenance audit
+  coverage、config compensation、offline scrub/migration protocol、只读 viewer。
+DELIVERY：🟡 VERIFYING
+P1-08 overall：🟡 VERIFYING（交付验收完成前不得视为 COMPLETE）
 ```
+
+P1-08B 的实现已在 task/p1-08b-audit-logging 完成；本状态块只记录实现
+完成，不宣称 Production Gate、PR/CI merge、fresh-clone 验证或最终 tag 已完成。
+PRODUCTION_RELEASE_REVIEW=REQUIRED 与 MAIN_RELEASE_FROZEN=true 继续有效。
 
 ### Hardening Backlog（非阻塞，SEC-002 保持 CLOSED）
 
