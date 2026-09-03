@@ -2918,12 +2918,13 @@ var adminTemplates = []byte(`
                 <form method="POST" action="/admin/server-tools">
                     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                     <div class="space-y-4">
-                        {{range .Data.Tools}}
+                        {{$page := .Data}}
+                        {{range $page.Tools}}
                         <div class="flex items-center p-4 bg-gray-900 rounded-lg border border-gray-700">
-                            <input type="checkbox" 
-                                   name="tool" 
-                                   value="{{.Name}}" 
-                                   {{if index (index .Data "EnabledTools") .Name}}checked{{end}}
+                            <input type="checkbox"
+                                   name="tool"
+                                   value="{{.Name}}"
+                                   {{if index (index $page "EnabledTools") .Name}}checked{{end}}
                                    class="w-5 h-5 rounded bg-gray-800 border-gray-600 text-blue-600 focus:ring-blue-500">
                             <div class="ml-4 flex-1">
                                 <h3 class="font-medium text-white">{{.Name}}</h3>
