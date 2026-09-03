@@ -74,6 +74,25 @@ func countMaintenanceActionForTest(t *testing.T, db *gorm.DB, action string) int
 	return int(count)
 }
 
+func nonCanonicalUUIDForTest(t *testing.T) string {
+	t.Helper()
+	canonical := uuid.NewString()
+	candidates := []string{
+		strings.ToUpper(canonical),
+		strings.ReplaceAll(canonical, "-", ""),
+		"{" + canonical + "}",
+		"urn:uuid:" + canonical,
+	}
+	for _, candidate := range candidates {
+		parsed, err := uuid.Parse(candidate)
+		if err == nil && parsed.String() != candidate {
+			return candidate
+		}
+	}
+	t.Fatal("uuid parser accepted no non-canonical representation")
+	return ""
+}
+
 func appendMaintenanceEventForTest(t *testing.T, db *gorm.DB, event models.AuditEvent) {
 	t.Helper()
 	if err := NewService(db).Record(event); err != nil {
@@ -114,8 +133,12 @@ func TestP108B_S7_MaintenanceBeginNewAndServerUUID(t *testing.T) {
 		operation.SuccessAction != ActionProviderSecretMigration {
 		t.Fatalf("unexpected provider operation identity: %+v", operation)
 	}
-	if _, err := uuid.Parse(operation.TargetID); err != nil {
+	parsed, err := uuid.Parse(operation.TargetID)
+	if err != nil {
 		t.Fatalf("target ID must be a server UUID: %q (%v)", operation.TargetID, err)
+	}
+	if operation.TargetID != parsed.String() {
+		t.Fatalf("generated target ID must be canonical: %q", operation.TargetID)
 	}
 	events := maintenanceEventsForTest(t, db)
 	if len(events) != 1 || events[0].TargetID != operation.TargetID || events[0].Action != ActionProviderSecretMigrationStarted {
@@ -399,6 +422,68 @@ func TestP108B_S7_MaintenancePendingCardinalityAndCorrelationFailClosed(t *testi
 			}
 			if _, err := beginMaintenanceForTest(t, db, MaintenanceKindProviderSecretMigration); !errors.Is(err, ErrAuditIntegrity) {
 				t.Fatalf("expected integrity failure, got %v", err)
+			}
+		})
+	}
+}
+
+func TestP108B_S7_MaintenanceCorrelationFailurePreservesState(t *testing.T) {
+	cases := []struct {
+		name     string
+		targetID string
+	}{
+		{name: "invalid UUID", targetID: "not-a-uuid"},
+		{name: "non-canonical UUID"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newAuditTestDB(t)
+			targetID := tc.targetID
+			if targetID == "" {
+				targetID = nonCanonicalUUIDForTest(t)
+			}
+			appendMaintenanceEventForTest(t, db, models.AuditEvent{
+				Action:     ActionRequestLogScrubStarted,
+				ActorType:  "cli",
+				ActorID:    "scrub-request-log-content",
+				TargetType: "maintenance-operation",
+				TargetID:   targetID,
+			})
+
+			beforeCount := countMaintenanceActionForTest(t, db, ActionRequestLogScrubStarted)
+			var beforeState models.AuditChainState
+			if err := db.First(&beforeState, 1).Error; err != nil {
+				t.Fatal(err)
+			}
+			var beforePending models.AuditEvent
+			if err := db.Where("action = ? AND target_id = ?", ActionRequestLogScrubStarted, targetID).Take(&beforePending).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := beginMaintenanceForTest(t, db, MaintenanceKindRequestLogScrub); !errors.Is(err, ErrAuditIntegrity) {
+				t.Fatalf("correlation %q must fail closed, got %v", targetID, err)
+			}
+
+			afterCount := countMaintenanceActionForTest(t, db, ActionRequestLogScrubStarted)
+			if afterCount != beforeCount {
+				t.Fatalf("failed correlation appended an audit event: before=%d after=%d", beforeCount, afterCount)
+			}
+			var afterState models.AuditChainState
+			if err := db.First(&afterState, 1).Error; err != nil {
+				t.Fatal(err)
+			}
+			if afterState.HeadHash != beforeState.HeadHash {
+				t.Fatalf("failed correlation changed chain head: before=%q after=%q", beforeState.HeadHash, afterState.HeadHash)
+			}
+			var afterPending models.AuditEvent
+			if err := db.Where("action = ? AND target_id = ?", ActionRequestLogScrubStarted, targetID).Take(&afterPending).Error; err != nil {
+				t.Fatal(err)
+			}
+			if afterPending.ID != beforePending.ID ||
+				afterPending.EventHash != beforePending.EventHash ||
+				afterPending.PrevHash != beforePending.PrevHash ||
+				afterPending.TargetID != beforePending.TargetID {
+				t.Fatalf("pending row changed after rejection: before=%+v after=%+v", beforePending, afterPending)
 			}
 		})
 	}
