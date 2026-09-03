@@ -2866,6 +2866,33 @@ var adminTemplates = []byte(`
 </html>
 {{end}}
 
+{{define "sidebar"}}
+<aside class="fixed inset-y-0 left-0 z-50 w-64 bg-gray-800 border-r border-gray-700 p-6">
+    <div class="flex items-center space-x-3 mb-10">
+        <div class="w-8 h-8 bg-gradient-to-br from-blue-500 to-blue-700 rounded-lg flex items-center justify-center">
+            <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+            </svg>
+        </div>
+        <span class="text-xl font-bold text-white">AI Gateway</span>
+    </div>
+    <nav class="space-y-2">
+        <a href="/admin/dashboard" class="block rounded-lg px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-white">Dashboard</a>
+        <a href="/admin/clients" class="block rounded-lg px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-white">Clients</a>
+        <a href="/admin/stats" class="block rounded-lg px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-white">Stats</a>
+        <a href="/admin/server-tools" class="block rounded-lg bg-gray-700 px-4 py-3 font-medium text-white">Server Tools</a>
+        <a href="/admin/audit" class="block rounded-lg px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-white">Audit Log</a>
+    </nav>
+    <div class="absolute inset-x-6 bottom-6">
+        <p class="mb-3 truncate text-sm text-gray-400">Signed in as {{.User}}</p>
+        <form method="POST" action="/admin/logout">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <button type="submit" class="w-full rounded-lg px-4 py-3 text-left text-gray-300 hover:bg-gray-700 hover:text-white">Sign out</button>
+        </form>
+    </div>
+</aside>
+{{end}}
+
 {{define "server_tools.html"}}
 <!DOCTYPE html>
 <html lang="en">

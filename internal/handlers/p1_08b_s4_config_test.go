@@ -79,6 +79,23 @@ func s4Post(t *testing.T, env *s4AdminEnv, token, target, form string) *httptest
 	return w
 }
 
+func TestP108B_ServerToolsPageRenders(t *testing.T) {
+	env := newS4AdminEnv(t)
+	token := s4Session(t, env)
+	req := httptest.NewRequest(http.MethodGet, "/admin/server-tools", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: token})
+	w := httptest.NewRecorder()
+
+	env.admin.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("server tools page status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Server Tools") {
+		t.Fatalf("server tools page did not render its title: %s", w.Body.String())
+	}
+}
+
 func s4AuditState(t *testing.T, db *gorm.DB) (int64, string) {
 	t.Helper()
 	var count int64
